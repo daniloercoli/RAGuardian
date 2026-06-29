@@ -1,0 +1,196 @@
+import os
+import re
+from typing import Callable, Optional
+
+from config import Config
+from utils.document_identity import source_hash
+from utils.logging_config import CHROMA_LOGGER as log
+from utils.providers import EmbeddingFactory
+from .base import VectorStore
+
+
+# Cert SSL config (caricato prima di qualsiasi import problematico)
+cert_path = os.getenv("CA_CERT_PATH")
+if cert_path and os.path.exists(cert_path):
+    os.environ["SSL_CERT_FILE"] = cert_path
+    os.environ["REQUESTS_CA_BUNDLE"] = cert_path
+    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+try:
+    import chromadb
+except ImportError:
+    chromadb = None
+
+
+def _default_chroma_client():
+    if chromadb is None:
+        raise RuntimeError("chromadb non installato. Installa le dipendenze runtime con requirements.txt.")
+    return chromadb.PersistentClient(path=Config.paths.chroma_persist_dir)
+
+
+def _default_embedding_provider():
+    return EmbeddingFactory.get_provider()
+
+
+class ChromaPersistentVectorStore(VectorStore):
+    backend = "chroma_persistent"
+    collection_name = "documents"
+
+    def __init__(
+        self,
+        client_factory: Optional[Callable] = None,
+        embedding_provider_factory: Optional[Callable] = None,
+        collection_name: Optional[str] = None,
+    ):
+        self._client_factory = client_factory or _default_chroma_client
+        self._embedding_provider_factory = embedding_provider_factory or _default_embedding_provider
+        self.collection_name = collection_name or self.collection_name
+
+    def add_documents(self, documents):
+        if not documents:
+            log.warning("Nessun documento da aggiungere")
+            return None
+
+        log.info(f"Aggiungo {len(documents)} documenti a Chroma...")
+        collection = self._collection()
+
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        ids = [document_chunk_id(doc.metadata, i) for i, doc in enumerate(documents)]
+
+        embeddings = self._embedding_provider().encode_documents(texts)
+
+        collection.add(documents=texts, metadatas=metadatas, ids=ids, embeddings=embeddings)
+        log.info(f"{len(documents)} documenti aggiunti. DB contiene {collection.count()} documenti totali")
+        return collection
+
+    def delete_by_source(self, source: str) -> int:
+        collection = self._collection()
+        existing = collection.get(where={"source": source})
+        ids = existing.get("ids", []) if existing else []
+        if not ids:
+            log.info(f"Nessun chunk Chroma da cancellare per source={source}")
+            return 0
+
+        collection.delete(ids=ids)
+        log.info(f"Cancellati {len(ids)} chunk Chroma per source={source}")
+        return len(ids)
+
+    def find_document_by_id(self, document_id: str, exclude_source: Optional[str] = None) -> Optional[dict]:
+        collection = self._collection()
+        existing = collection.get(where={"document_id": document_id}, include=["metadatas"])
+        ids = existing.get("ids", []) if existing else []
+        metadatas = existing.get("metadatas", []) if existing else []
+        for chunk_id, metadata in zip(ids, metadatas):
+            metadata = metadata or {}
+            source = metadata.get("source")
+            if exclude_source and source == exclude_source:
+                continue
+            return {
+                "document_id": document_id,
+                "source": source,
+                "chunk_id": chunk_id,
+                "chunks": len(ids),
+            }
+        return None
+
+    def query(self, query: str, k: Optional[int] = None):
+        k = k or Config.rag.query_k
+        log.info(f"Query: '{query}' (top {k})")
+
+        collection = self._collection()
+        query_emb = self._embedding_provider().encode_query(query)
+
+        results = collection.query(query_embeddings=[query_emb], n_results=k, include=["documents", "metadatas"])
+        docs = []
+
+        if results.get("documents"):
+            from langchain_core.documents import Document
+
+            metadatas = results.get("metadatas") or [[]]
+            for doc, meta in zip(results["documents"][0], metadatas[0]):
+                docs.append(Document(page_content=str(doc), metadata=meta))
+
+        log.info(f"Trovati {len(docs)} risultati")
+        return docs
+
+    def query_with_rerank(
+        self,
+        query: str,
+        k: int = 5,
+        top_n: int = 20,
+        reranker=None,
+        score_threshold: float = 0.0,
+    ):
+        from utils.reranker import DummyReranker
+
+        if reranker is None:
+            reranker = DummyReranker()
+
+        log.info(f"Query con ReRanker: '{query}' (recupero {top_n}, finale {k})")
+
+        docs = self.query(query, k=top_n)
+        log.info(f"ReRanker: recuperati {len(docs)} documenti dal vector DB")
+
+        reranked_docs = reranker.rerank(query, docs, k)
+        if score_threshold > 0:
+            before_filter = len(reranked_docs)
+            reranked_docs = [
+                doc for doc in reranked_docs
+                if _reranker_score(doc) is None or _reranker_score(doc) >= score_threshold
+            ]
+            log.info(
+                f"ReRanker: soglia {score_threshold} applicata "
+                f"({before_filter} -> {len(reranked_docs)} documenti)"
+            )
+        log.info(f"ReRanker: {len(docs)} -> {len(reranked_docs)} documenti finali")
+
+        return reranked_docs
+
+    def reset_collection(self):
+        client = self._client()
+        try:
+            client.delete_collection(name=self.collection_name)
+            log.info("Collection Chroma 'documents' cancellata")
+        except Exception as e:
+            message = str(e).lower()
+            if "does not exist" not in message and "not found" not in message:
+                raise
+            log.info("Collection Chroma 'documents' non presente; verra' creata")
+        return client.get_or_create_collection(name=self.collection_name, embedding_function=None)
+
+    def status(self) -> dict:
+        collection = self._collection()
+        return {
+            "vector_store_backend": self.backend,
+            "collection": self.collection_name,
+            "documents_count": collection.count(),
+        }
+
+    def _client(self):
+        return self._client_factory()
+
+    def _collection(self):
+        return self._client().get_or_create_collection(name=self.collection_name, embedding_function=None)
+
+    def _embedding_provider(self):
+        return self._embedding_provider_factory()
+
+
+def document_chunk_id(metadata: dict, fallback_index: int) -> str:
+    document_id = str(metadata.get("document_id") or metadata.get("source") or "document")
+    source_id = str(metadata.get("source_id") or source_hash(str(metadata.get("source") or document_id)))
+    chunk_id = metadata.get("chunk_id", fallback_index)
+    safe_document_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", document_id).strip("-") or "document"
+    safe_source_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", source_id).strip("-") or "source"
+    return f"{safe_source_id}:{safe_document_id}:chunk:{chunk_id}"
+
+
+def _reranker_score(doc) -> Optional[float]:
+    try:
+        score = doc.metadata.get("reranker_score")
+        if score is None:
+            return None
+        return float(score)
+    except (AttributeError, TypeError, ValueError):
+        return None

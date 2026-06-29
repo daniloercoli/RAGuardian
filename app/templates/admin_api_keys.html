@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Keys - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .raw-key-box input {
+            font-family: monospace;
+            font-size: 0.95em;
+            padding: 8px;
+            width: 55%;
+            background-color: #f5f5f5;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        .raw-key-box {
+            padding: 16px 10px;
+        }
+        .action-btn {
+            display: inline-block;
+            margin: 2px 4px;
+            padding: 4px 8px;
+            border: 1px solid #ccc;
+            background: #f9f9f9;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .action-btn:hover {
+            background: #eee;
+        }
+        .action-btn.danger {
+            background: #f8d7da;
+            border-color: #f5c6cb;
+        }
+        .action-btn.danger:hover {
+            background: #f1a5ab;
+        }
+    </style>
+</head>
+<body>
+    <div class="container wide">
+        <header class="page-header">
+            <h1>API Keys</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+                <a href="{{ url_for('admin_files') }}">RAG Files</a>
+                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
+                <a href="{{ url_for('admin_users') }}">Users</a>
+                <a href="{{ url_for('admin_api_keys') }}" class="active">API Keys</a>
+                <a href="{{ url_for('admin_config') }}">Config</a>
+                <form method="post" action="{{ url_for('admin_logout') }}">
+                    <button type="submit" class="link-button">Logout</button>
+                </form>
+            </nav>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+
+        {% if revealed_key %}
+        <section class="panel">
+            <h2>API Key Revealed</h2>
+            <div class="raw-key-box">
+                <p>API key per "<strong>{{ revealed_key.name }}</strong>"</p>
+                <input type="text" id="rawKeyInput" value="{{ revealed_key.key }}" readonly onclick="this.select()">
+                <button onclick="copyRawKey()">Copy</button>
+                <form method="post">
+                    <input type="hidden" name="action" value="clear_show_key">
+                    <button type="submit">Close</button>
+                </form>
+            </div>
+        </section>
+        {% endif %}
+        <script>
+            function copyRawKey() {
+                const input = document.getElementById('rawKeyInput');
+                input.select();
+                navigator.clipboard.writeText(input.value).catch(() => document.execCommand('copy'));
+            }
+        </script>
+
+        <section class="panel">
+            <h2>Create API Key</h2>
+            <form method="post" class="form-grid compact">
+                <input type="hidden" name="action" value="create">
+                <label>
+                    User
+                    <select name="user_id" required>
+                        {% for user in users %}
+                            <option value="{{ user.id }}">{{ user.email }} ({{ user.display_name }})</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" required placeholder="e.g. production, testing">
+                </label>
+                <label>
+                    Description
+                    <input type="text" name="description" placeholder="Optional description">
+                </label>
+                <label>
+                    Expires In
+                    <input type="text" name="expires_in" placeholder="e.g. 30d, 24h, 60m" value="{{ request.form.get('expires_in', '') }}" pattern="[0-9]+[dhm]">
+                    <small>Leave blank for never. Examples: 7d, 24h, 30m</small>
+                </label>
+                <label>
+                    Scopes
+                    <div>
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="scopes" value="query" checked>
+                            Query
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="scopes" value="ingest">
+                            Ingest
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="scopes" value="speech">
+                            Speech
+                        </label>
+                    </div>
+                </label>
+                <label>
+                    Status
+                    <select name="enabled">
+                        <option value="on" selected>Enabled</option>
+                        <option value="off">Disabled</option>
+                    </select>
+                </label>
+                <button type="submit">Create</button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Existing API Keys</h2>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Name</th>
+                            <th>Description</th>
+                            <th>Key</th>
+                            <th>Scopes</th>
+                            <th>Status</th>
+                            <th>Expires</th>
+                            <th>Created</th>
+                            <th>Last Used</th>
+                            <th>Count</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for key in all_keys %}
+                            <tr>
+                                <td>{{ key.user_email }}<br><span class="muted">{{ key.user_id }}</span></td>
+                                <td>{{ key.name }}</td>
+                                <td>{{ key.description or '' }}</td>
+                                <td><code>{{ key.masked_key or '***' }}</code></td>
+                                <td>
+                                    {% for scope in key.scopes %}
+                                        <span class="badge">{{ scope }}</span>
+                                    {% endfor %}
+                                </td>
+                            <td>{{ "enabled" if key.enabled else "disabled" }}</td>
+                            <td>{{ key.expires_at if key.get('expires_at') else "never" }}</td>
+                            <td>{{ key.created_at }}</td>
+                                <td>{{ key.last_used or "never" }}</td>
+                                <td>{{ key.usage_count or 0 }}</td>
+                                <td>
+                                    <form method="post" class="form-grid compact">
+                                        <input type="hidden" name="action" value="toggle">
+                                        <input type="hidden" name="user_id" value="{{ key.user_id }}">
+                                        <input type="hidden" name="key_name" value="{{ key.name }}">
+                                        <label class="checkbox-label">
+                                            <input type="checkbox" name="enabled" {% if key.enabled %}checked{% endif %}>
+                                            Enabled
+                                        </label>
+                                        <button type="submit" class="secondary">Toggle</button>
+                                    </form>
+                                    <form method="post" class="form-grid compact">
+                                        <input type="hidden" name="action" value="download">
+                                        <input type="hidden" name="user_id" value="{{ key.user_id }}">
+                                        <input type="hidden" name="key_name" value="{{ key.name }}">
+                                        <button type="submit" class="secondary">Show Key</button>
+                                    </form>
+                                    <form method="post" class="form-grid compact">
+                                        <input type="hidden" name="action" value="delete">
+                                        <input type="hidden" name="user_id" value="{{ key.user_id }}">
+                                        <input type="hidden" name="key_name" value="{{ key.name }}">
+                                        <button type="submit" class="danger" onclick="return confirm('Sei sicuro di voler eliminare la chiave "{{ key.name }}" di {{ key.user_email }}?')">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="11">No API keys yet. Create one above.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Usage Statistics</h2>
+            <p class="muted">
+                Showing the latest {{ usage_entry_limit }} API key usage entries.
+                {% if usage_log_exists %}
+                    <a href="{{ url_for('admin_api_key_usage_log_download') }}">Download full JSON log</a>
+                    <br><code>{{ usage_log_path }}</code>
+                {% else %}
+                    Usage log file will be created after the first API key request.
+                {% endif %}
+            </p>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>User</th>
+                            <th>Key</th>
+                            <th>Method</th>
+                            <th>Endpoint</th>
+                            <th>Status</th>
+                            <th>Duration</th>
+                            <th>Scopes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for entry in usage_entries %}
+                            <tr>
+                                <td>{{ entry.timestamp }}</td>
+                                <td>{{ entry.user_id }}</td>
+                                <td>{{ entry.api_key_name or entry.key_name }}</td>
+                                <td>{{ entry.method }}</td>
+                                <td><code>{{ entry.endpoint }}</code></td>
+                                <td>{{ entry.status_code or entry.response_code }}</td>
+                                <td>
+                                    {% if entry.duration_ms is not none %}
+                                        {{ entry.duration_ms }} ms
+                                    {% else %}
+                                        -
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% for scope in entry.scopes_used or [] %}
+                                        <span class="badge">{{ scope }}</span>
+                                    {% else %}
+                                        -
+                                    {% endfor %}
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="8">No API key usage logged yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+</body>
+</html>

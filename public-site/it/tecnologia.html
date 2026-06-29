@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="../favicon.ico">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <title>Tecnologia — Architettura RAGuardian</title>
+  <meta name="description" content="Architettura tecnica di RAGuardian. Multi-utente, workspace personali, ingestion email e Microsoft Drive, RAG pipeline, Redis, job queue, vector store adapter.">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="container">
+      <a href="index.html" class="logo">
+        <img class="logo-icon" src="../favicon.png" alt="RAGuardian">
+        RAGuardian
+      </a>
+      <div class="nav">
+        <button class="nav-toggle" aria-label="Menu">☰</button>
+        <ul class="nav-links">
+          <li><a href="index.html">Home</a></li>
+          <li><a href="vantaggi.html">Vantaggi</a></li>
+          <li><a href="provideri.html">Provider</a></li>
+          <li><a href="tecnologia.html" class="active">Tecnologia</a></li>
+          <li><a href="contatto.html">Contatto</a></li>
+        </ul>
+        <div class="lang-switch">
+          <a href="tecnologia.html" class="active">IT</a>
+          <a href="../en/technology.html">EN</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="vantaggi-hero">
+    <div class="container">
+      <h1>Architettura per l'enterprise</h1>
+      <p>Un sistema robusto, sicuro e scalabile: utenti locali, workspace personali, connettori dati e RAG isolato per ogni account.</p>
+    </div>
+  </div>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Architettura</span>
+        <h2>Pipeline RAG completa</h2>
+      </div>
+      <div class="arch-diagram">
+        <div class="arch-layers">
+          <div class="arch-layer">
+            <div class="arch-layer-label">Client</div>
+            <div class="arch-blocks">
+              <div class="arch-block blue">Web UI</div>
+              <div class="arch-block blue">WordPress Plugin</div>
+              <div class="arch-block blue">REST API</div>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <div class="arch-layer-label">Flask</div>
+            <div class="arch-blocks">
+              <div class="arch-block gray">Auth multi-utente</div>
+              <div class="arch-block gray">WorkspaceContext</div>
+              <div class="arch-block gray">SecretStore cifrato</div>
+              <div class="arch-block gray">API keys per workspace</div>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <div class="arch-layer-label">Ingestion</div>
+            <div class="arch-blocks">
+              <div class="arch-block gray">Email IMAP</div>
+              <div class="arch-block gray">Microsoft Drive</div>
+              <div class="arch-block gray">Rate limiting</div>
+              <div class="arch-block gray">RQ Jobs</div>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <div class="arch-layer-label">RAG</div>
+            <div class="arch-blocks">
+              <div class="arch-block green">Document Processing</div>
+              <div class="arch-block green">Collection per workspace</div>
+              <div class="arch-block green">Reranking</div>
+              <div class="arch-block green">Conversation Memory</div>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <div class="arch-layer-label">LLM</div>
+            <div class="arch-blocks">
+              <div class="arch-block purple">Regolo.ai</div>
+              <div class="arch-block purple">Mistral AI</div>
+              <div class="arch-block purple">Locale (Ollama, vLLM)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="background:var(--gray-50);">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Componenti</span>
+        <h2>Come funziona ogni componente</h2>
+      </div>
+      <div class="value-grid">
+        <div class="value-card fade-in">
+          <div class="value-icon blue">📄</div>
+          <h3>Document Processing</h3>
+          <p>PDF, TXT, Markdown e audio vengono chunkati automaticamente. Upload manuali e snapshot da connettori finiscono nel workspace corretto, con metadata di origine tracciati.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">🔍</div>
+          <h3>Retrieval + Reranking</h3>
+          <p>Similitudine vettoriale su collection Chroma dedicate per workspace. BGE reranker locale o Regolo remote reranking per precisione. Cache namespaced per evitare contaminazioni.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon purple">💬</div>
+          <h3>Conversation Memory</h3>
+          <p>Chat contestuali con auto-summary, namespaced per utente e conversazione. Quando la storia supera il threshold, i messaggi più vecchi vengono compressi in un summary.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon orange">🎙️</div>
+          <h3>Audio Pipeline</h3>
+          <p>Upload audio → STT (OpenAI-compatible) → indizzazione automatica. TTS per rispondere ad alta voce. Supporto MP3, WAV, M4A, WEBM, FLAC.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon blue">🔑</div>
+          <h3>Sicurezza</h3>
+          <p>Utenti locali con ruoli admin/user, password hash, API keys con scope per workspace, SecretStore cifrato per connector, rate limiting, input validation e sanitizzazione XSS.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">🚀</div>
+          <h3>Prestazioni</h3>
+          <p>Gunicorn async con thread pool, streaming real-time NDJSON, LRU cache per retrieval, embeddings caching, retry con backoff su provider failure.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Stack Tecnologico</span>
+        <h2>Codice che puoi leggere</h2>
+      </div>
+      <div style="max-width:640px;">
+        <div class="code-block">
+          <div class="flow-line"><span class="comment"># Stack principale</span></div>
+          <div class="flow-line"><span class="keyword">Backend:</span> Flask 3.1, Python 3.11+</div>
+          <div class="flow-line"><span class="keyword">Auth:</span> UserStore JSON + workspace personali</div>
+          <div class="flow-line"><span class="keyword">Vector DB:</span> ChromaDB (persistent)</div>
+          <div class="flow-line"><span class="keyword">Embedding:</span> sentence-transformers / Regolo cloud</div>
+          <div class="flow-line"><span class="keyword">Reranker:</span> BAAI bge-reranker / Regolo</div>
+          <div class="flow-line"><span class="keyword">LLM:</span> Regolo.ai, Mistral, OpenAI-compatible</div>
+          <div class="flow-line"><span class="keyword">Server:</span> Gunicorn (production)</div>
+          <div class="flow-line"><span class="keyword">Frontend:</span> Flask templates + Vanilla JS</div>
+          <div class="flow-line"><span class="keyword">Ingestion:</span> Email IMAP + Microsoft Graph</div>
+          <div class="flow-line"><span class="keyword">Plugin:</span> WordPress PHP + S2S API calls per workspace</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="background:var(--gray-50);">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">API</span>
+        <h2>REST API, streaming, e oltre</h2>
+      </div>
+      <div class="integration-grid">
+        <div class="integration-card">
+          <div class="integration-icon">📡</div>
+          <h3>Endpoints</h3>
+          <p><code>/api/v1/query</code>, <code>/api/v1/health</code>, <code>/api/v1/files</code>, <code>/api/v1/audio</code>, <code>/api/v1/tts</code>, <code>/api/v1/models</code></p>
+          <div class="tag-list">
+            <span class="tag">REST</span>
+            <span class="tag">JSON</span>
+            <span class="tag">OpenAPI</span>
+          </div>
+        </div>
+        <div class="integration-card">
+          <div class="integration-icon">🌊</div>
+          <h3>Streaming</h3>
+          <p>Streaming token-by-token in NDJSON. Meta events con model info, source references e token usage.</p>
+          <div class="tag-list">
+            <span class="tag">NDJSON</span>
+            <span class="tag">SSE</span>
+            <span class="tag">Real-time</span>
+          </div>
+        </div>
+        <div class="integration-card">
+          <div class="integration-icon">🔑</div>
+          <h3>Auth granulare</h3>
+          <p>API keys con scope: <code>query</code>, <code>ingest</code>, <code>speech</code>. Ogni key risolve sempre un utente e un workspace.</p>
+          <div class="tag-list">
+            <span class="tag">Scoped</span>
+            <span class="tag">API Keys</span>
+            <span class="tag">Session</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="background:var(--gray-50);">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Scalabilità</span>
+        <h2>Single-server robusto, pronto per crescere</h2>
+        <p>RAGuardian è progettato per scalare da un singolo worker Gunicorn a un runtime multi-process con Redis, mantenendo isolamento per utente, stesse API pubbliche e zero perdita di stato.</p>
+      </div>
+
+      <div class="value-grid" style="margin-bottom:40px;">
+        <div class="value-card fade-in">
+          <div class="value-icon blue">🗄️</div>
+          <h3>Stato condiviso con Redis</h3>
+          <p>Rate limiter, retrieval cache, conversation memory, job state e active lock passano su Redis. Fallback in-memory per sviluppo. Nessuna modifica agli endpoint pubblici: cambia solo dove vivono i dati.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">⚙️</div>
+          <h3>Job queue non-blocchante</h3>
+          <p>Rebuild dell'indice, upload PDF/audio e trascrizione diventano job asincroni (RQ su Redis). Le query utente non vengono mai bloccate dall'ingest. Admin mostra stato via polling; API restituisce <code>202 + job_id</code> in modalità <code>?async=true</code>.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon purple">🏎️</div>
+          <h3>Gunicorn scalabile</h3>
+          <p>Default produzione: <code>workers=1, threads=16</code>. Profilo avanzato: <code>2-4 workers, 8-16 threads</code> dopo load test. Multi-worker sicuro solo con Redis attivo: niente perdita di conversazioni o job.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon orange">🧠</div>
+          <h3>Vector store adapter</h3>
+          <p>Interfaccia <code>VectorStore</code> con implementazione Chroma PersistentClient. Pronto per Qdrant, Chroma HTTP o vettore gestito quando i load test lo richiedono. Zero refactoring al momento del switch.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon blue">📊</div>
+          <h3>Load test & osservabilità</h3>
+          <p>Suite Locust: 50 utenti concorrenti su query, streaming, ingester rebuild parallelo. Metriche: error rate, p50/p95/p99 latency, queue depth, job time, CPU/RAM, Chroma e LLM latency separate.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">🩺</div>
+          <h3>Health & readiness</h3>
+          <p><code>/api/v1/health</code> include: <code>redis_ready</code>, <code>queue_ready</code>, <code>queue_depth</code>, <code>active_jobs_count</code>. Il tuo orchestrate/monitoring sa sempre se il servizio è pronto e sovraccarico.</p>
+        </div>
+      </div>
+
+      <div class="highlight-box">
+        <h3 style="font-size:1.1rem;font-weight:700;color:var(--green-dark);margin-bottom:8px;">📐 Criterio decisionale</h3>
+        <p>Chroma locale resta il vector store iniziale. Il passaggio a Chroma server, Qdrant o vettore gestito avviene solo dopo load test reali che identificano il collo di bottiglia. Nessun premature optimization, solo decisioni basate sui dati.</p>
+      </div>
+
+      <div style="max-width:640px;margin:32px auto 0;">
+        <div class="code-block">
+          <div class="flow-line"><span class="comment"># Runtime in produzione</span></div>
+          <div class="flow-line">$ gunicorn -c gunicorn.conf.py wsgi:application</div>
+          <div class="flow-line">$ rq worker rag-default</div>
+          <div class="flow-line"><span class="comment"># Redis: required per scaling multi-worker</span></div>
+          <div class="flow-line"><span class="comment"># Fallback in-memory: OK per sviluppo/test</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta-section">
+    <div class="container">
+      <h2>Approfondisci</h2>
+      <p>Leggi il codice su GitHub, esplora la documentazione API e pianifica il deployment.</p>
+      <div class="cta-buttons">
+        <a href="https://github.com/daniloercoli/RAGuardian" class="btn btn-primary" target="_blank" rel="noopener">GitHub ↗</a>
+        <a href="contatto.html" class="btn btn-dark-outline">Richiedi una demo</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <div class="logo"><img class="logo-icon" src="../favicon.png" alt="RAGuardian">RAGuardian</div>
+          <p>RAG enterprise self-hosted con multi-provider, zero data retention e compliance europea.</p>
+        </div>
+        <div>
+          <h4>Prodotto</h4>
+          <ul class="footer-links">
+            <li><a href="vantaggi.html">Vantaggi</a></li>
+            <li><a href="provideri.html">Provider</a></li>
+            <li><a href="tecnologia.html">Tecnologia</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Risorse</h4>
+          <ul class="footer-links">
+            <li><a href="https://github.com/daniloercoli/RAGuardian" target="_blank" rel="noopener">GitHub</a></li>
+            <li><a href="contatto.html">Contatto</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Compliance</h4>
+          <ul class="footer-links">
+            <li><a href="privacy.html">Privacy &amp; GDPR</a></li>
+            <li><a href="provideri.html">Data Residency</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Ercoli Consulting srl. MIT License.</span>
+        <span>Open Source · Self-hosted · Made in RSM & Italy</span>
+      </div>
+    </div>
+  </footer>
+  <script src="../js/main.js"></script>
+</body>
+</html>

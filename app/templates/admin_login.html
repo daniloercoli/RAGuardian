@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Login - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container narrow">
+        <header class="page-header">
+            <h1>Admin</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+            </nav>
+        </header>
+
+        <section class="panel">
+            <h2>Sign In</h2>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="notice {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endwith %}
+            <form method="post" class="form-grid">
+                <label>
+                    Email
+                    <input type="email" name="email" placeholder="admin@example.local" autofocus>
+                </label>
+                <label>
+                    Password
+                    <input type="password" name="password" required>
+                </label>
+                <button type="submit">Sign In</button>
+            </form>
+        </section>
+    </div>
+</body>
+</html>

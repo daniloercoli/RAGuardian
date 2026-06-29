@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Missing Model Configuration - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container narrow">
+        <header class="page-header">
+            <h1>Configuration Required</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('admin_config') }}">Admin Config</a>
+            </nav>
+        </header>
+
+        <section class="panel">
+            <h2>Providers and Models Not Configured</h2>
+            <div class="notice error">{{ error }}</div>
+            <p class="muted">
+                The built-in providers file must be located here:
+                <code>{{ provider_config_path }}</code>
+            </p>
+            <p class="muted">
+                The JSON defines the built-in providers, models, endpoint URLs,
+                and API key environment variables used at startup.
+            </p>
+            <p class="muted">
+                After restoring the JSON, you can configure custom providers and runtime parameters at
+                <a href="{{ url_for('admin_config') }}">/admin/config</a>.
+            </p>
+        </section>
+    </div>
+</body>
+</html>

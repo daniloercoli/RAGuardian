@@ -1,0 +1,117 @@
+{
+  "description": "Built-in providers and models distributed with the project. Regolo and Mistral require their own API keys and are not free services included.",
+  "llm": [
+    {
+      "id": "regolo",
+      "name": "Regolo AI",
+      "type": "openai_compatible",
+      "base_url": "https://api.regolo.ai/v1",
+      "requires_api_key": true,
+      "api_key_env": "REGOLO_API_KEY",
+      "billing_note": "Requires an active Regolo AI API key. The service is not free and is not included in the project.",
+      "models": [
+        "gpt-oss-120b",
+        "gpt-oss-20b",
+        "Llama-3.3-70B-Instruct",
+        "gemma4-31b",
+        "qwen3.5-122b",
+        "qwen3.5-9b",
+        "qwen3.6-27b",
+        "qwen3-coder-next",
+        "apertus-70b",
+        "minimax-m2.5",
+        "mistral-small-4-119b",
+        "brick-v1-beta",
+        "Qwen-Image",
+        "deepseek-ocr-2"
+      ],
+      "default_model": "gpt-oss-120b"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral AI",
+      "type": "openai_compatible",
+      "base_url": "https://api.mistral.ai/v1",
+      "requires_api_key": true,
+      "api_key_env": "MISTRAL_API_KEY",
+      "billing_note": "Requires an active Mistral AI API key. The service is not free and is not included in the project.",
+      "models": [
+        "mistral-medium",
+        "mistral-small",
+        "mistral-large",
+        "mistral-tiny",
+        "codestral",
+        "mistral-large-latest"
+      ],
+      "default_model": "mistral-medium"
+    }
+  ],
+  "embedding": [
+    {
+      "id": "regolo",
+      "name": "Regolo Embeddings",
+      "type": "openai_compatible",
+      "base_url": "https://api.regolo.ai/v1",
+      "requires_api_key": true,
+      "api_key_env": "REGOLO_API_KEY",
+      "models": [
+        "Qwen3-Embedding-8B"
+      ],
+      "default_model": "Qwen3-Embedding-8B",
+      "dimensions": 1024,
+      "privacy_note": "Invia testo dei documenti e query a Regolo."
+    }
+  ],
+  "reranker": [
+    {
+      "id": "regolo",
+      "name": "Regolo Reranker",
+      "type": "openai_compatible",
+      "base_url": "https://api.regolo.ai/v1",
+      "requires_api_key": true,
+      "api_key_env": "REGOLO_API_KEY",
+      "reranker_mode": "rerank",
+      "models": [
+        "Qwen3-Reranker-4B"
+      ],
+      "default_model": "Qwen3-Reranker-4B"
+    }
+  ],
+  "voice": [
+    {
+      "id": "regolo",
+      "name": "Regolo Voice",
+      "type": "openai_compatible",
+      "requires_api_key": true,
+      "api_key_env": "REGOLO_API_KEY",
+      "base_url": "https://api.regolo.ai/v1",
+      "stt_model": "faster-whisper-large-v3",
+      "stt_language": "",
+      "tts_model": "",
+      "voice": "alloy",
+      "format": "mp3"
+    }
+  ],
+  "ocr": [
+    {
+      "id": "regolo",
+      "name": "Regolo OCR",
+      "type": "openai_compatible",
+      "base_url": "https://api.regolo.ai/v1",
+      "requires_api_key": true,
+      "api_key_env": "REGOLO_API_KEY",
+      "models": [
+        "deepseek-ocr-2"
+      ],
+      "default_model": "deepseek-ocr-2",
+      "ocr_mode": "vision_chat",
+      "input_types": [
+        "image",
+        "pdf"
+      ],
+      "output_format": "text",
+      "supports_layout": true,
+      "supports_tables": true
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+    "name": "raguardian-platform-integration",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "test:e2e": "echo 'E2E tests not configured yet'",
+        "test:unit": "echo 'Unit tests not configured yet'"
+    },
+    "devDependencies": {}
+}

@@ -1,0 +1,8 @@
+[project]
+name = "rag-service"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Local Flask RAG service with ChromaDB and configurable LLM providers."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node / browser test tooling
+node_modules/
+playwright-report/
+test-results/
+.wp-env/
+integrations/wordpress/rag-client/tests/fixtures/private/
+
+# ChromaDB (database vettoriale - opzionale)
+app/chroma_db/
+*.chroma
+
+# Runtime RAG data (contains secrets and local state)
+app/data/settings.json
+app/data/files.json
+app/data/users.json
+app/data/secrets.json
+app/data/api_keys_usage.json
+app/data/workspaces/
+.pytest_cache/
+
+# Uploads
+app/uploads/
+
+# Logs
+*.log
+logs/
+app/logs/*.log
+
+# Backups (compressed snapshots of ChromaDB)
+app/backups/
+
+public-site/.DS_Store
+.DS_Store
+
+# Composer
+composer/vendor/
+composer/composer.lock
+vendor/
+integrations/**/vendor/
+integrations/**/.phpunit.cache/
+integrations/**/dist/

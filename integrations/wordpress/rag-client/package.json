@@ -1,0 +1,27 @@
+{
+  "name": "raguardian-wordpress-client",
+  "private": true,
+  "version": "0.5.2",
+  "description": "Local WordPress test harness for the RAGuardian WordPress plugin.",
+  "scripts": {
+    "build:zip": "node scripts/build-plugin-zip.mjs",
+    "composer:install": "composer install",
+    "doctor": "node tests/support/check-e2e-env.mjs",
+    "wp:start": "wp-env start",
+    "wp:stop": "wp-env stop",
+    "wp:destroy": "wp-env destroy",
+    "wp:logs": "wp-env logs",
+    "wp:cli": "wp-env run cli wp",
+    "wp:setup": "wp-env run cli wp plugin activate rag-client",
+    "test": "npm run test:lint && npm run test:php",
+    "test:e2e": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test",
+    "test:e2e:headed": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test --headed",
+    "test:e2e:debug": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test --debug",
+    "test:php": "vendor/bin/phpunit",
+    "test:lint": "find . -name '*.php' -not -path './vendor/*' -exec php -l {} \\;"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.0",
+    "@wordpress/env": "^10.21.0"
+  }
+}

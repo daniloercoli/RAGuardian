@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Files - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container wide">
+        <header class="page-header">
+            <h1>RAG Files</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
+                {% if current_user and current_user.role == "admin" %}
+                    <a href="{{ url_for('admin_config') }}">Config</a>
+                    <a href="{{ url_for('admin_users') }}">Users</a>
+                    <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
+                {% endif %}
+                <form method="post" action="{{ url_for('admin_logout') }}">
+                    <button type="submit" class="link-button">Logout</button>
+                </form>
+            </nav>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+
+        <section class="panel">
+            <h2>Upload</h2>
+            <form method="post" enctype="multipart/form-data" id="ragUploadForm" class="rag-upload-form">
+                <label class="upload-dropzone" for="ragFileInput">
+                    <span class="upload-dropzone-title">Select files</span>
+                    <span class="upload-dropzone-copy">Choose multiple PDF, TXT, Markdown, CSV, or audio files at once.</span>
+                    <input id="ragFileInput" type="file" name="file" accept=".pdf,.txt,.md,.csv,.mp3,.wav,.m4a,.webm,.ogg,.flac" multiple>
+                </label>
+
+                <label class="upload-dropzone" for="ragFolderInput">
+                    <span class="upload-dropzone-title">Select a folder</span>
+                    <span class="upload-dropzone-copy">Upload supported files from a folder while preserving their relative paths.</span>
+                    <input id="ragFolderInput" type="file" name="folder" accept=".pdf,.txt,.md,.csv,.mp3,.wav,.m4a,.webm,.ogg,.flac" webkitdirectory directory multiple>
+                </label>
+
+                <div class="upload-command-row">
+                    <button type="submit" id="startUploadButton">Upload and Index</button>
+                </div>
+
+                <div id="uploadProgressPanel" class="upload-progress-panel" hidden>
+                    <div class="upload-progress-header">
+                        <div>
+                            <strong id="uploadProgressTitle">Uploading</strong>
+                            <span id="uploadProgressCount">0/0</span>
+                        </div>
+                        <progress id="uploadProgressBar" value="0" max="100"></progress>
+                    </div>
+
+                    <ol id="uploadQueueList" class="upload-queue-list"></ol>
+
+                    <div class="upload-cancel-row">
+                        <button type="button" id="cancelUploadButton" class="danger" hidden disabled>Cancel</button>
+                    </div>
+                </div>
+
+                <div id="uploadErrorPanel" class="upload-error-panel" hidden>
+                    <h3>Files with Errors</h3>
+                    <ul id="uploadErrorList"></ul>
+                </div>
+
+                <div id="uploadFinalStatus" class="upload-final-status" hidden></div>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Knowledge Base Status</h2>
+            {% if health.system_ready %}
+                <p class="demo-state ready">Ready: the knowledge base contains indexed documents and the index is aligned.</p>
+            {% elif index_status.needs_rebuild %}
+                <p class="demo-state warning">Almost ready: the index needs to be rebuilt because the RAG configuration has changed.</p>
+            {% elif index_status.indexed_count == 0 %}
+                <p class="demo-state warning">To prepare: upload PDF or audio documents and index them.</p>
+            {% else %}
+                <p class="demo-state warning">To verify: check providers, embeddings, and database.</p>
+            {% endif %}
+            <dl class="status-list">
+                <div>
+                    <dt>Database</dt>
+                    <dd>{{ "ready" if health.database_ready else "not ready" }}</dd>
+                </div>
+                <div>
+                    <dt>Indexed Files</dt>
+                    <dd>{{ index_status.indexed_count }}/{{ index_status.tracked_count }}</dd>
+                </div>
+                <div>
+                    <dt>Chroma Chunks</dt>
+                    <dd>{{ health.documents_count if health.documents_count is defined else "n/a" }}</dd>
+                </div>
+                <div>
+                    <dt>Index Alignment</dt>
+                    <dd>{{ "needs rebuild" if index_status.needs_rebuild else "aligned" }}</dd>
+                </div>
+            </dl>
+            {% if index_status.needs_rebuild %}
+                <div class="notice warning inline-notice">
+                    The vector index does not appear to be aligned with the current configuration for {{ index_status.stale_count }} indexed file(s).
+                    Rebuild the index after changes to embedding model, chunk size, or chunk overlap.
+                </div>
+            {% endif %}
+            {% if index_status.needs_rebuild %}
+                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}">
+                    <button type="button" id="startRebuildButton" data-rebuild-trigger>Rebuild Index</button>
+                    <p class="muted">
+                        Delete and recreate the vector collection using the files on disk.
+                        Current profile:
+                        <code>{{ index_status.current_profile.embedding_provider }}</code>,
+                        <code>{{ index_status.current_profile.embedding_model }}</code>,
+                        chunk <code>{{ index_status.current_profile.chunk_size }}</code>/<code>{{ index_status.current_profile.chunk_overlap }}</code>.
+                    </p>
+                </div>
+            {% else %}
+                <p class="muted inline-note">
+                    Index aligned to current profile:
+                    <code>{{ index_status.current_profile.embedding_provider }}</code>,
+                    <code>{{ index_status.current_profile.embedding_model }}</code>,
+                    chunk <code>{{ index_status.current_profile.chunk_size }}</code>/<code>{{ index_status.current_profile.chunk_overlap }}</code>.
+                </p>
+                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}"></div>
+            {% endif %}
+        </section>
+
+        <div id="rebuildModal" class="modal-backdrop" hidden>
+            <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="rebuildModalTitle">
+                <h2 id="rebuildModalTitle">Index Rebuild</h2>
+                <p id="rebuildModalMessage" class="muted">Preparing...</p>
+                <div class="upload-progress-header">
+                    <div>
+                        <strong id="rebuildCurrentFile">Waiting</strong>
+                        <span id="rebuildProgressCount">0/0</span>
+                    </div>
+                    <progress id="rebuildProgressBar" value="0" max="100"></progress>
+                </div>
+                <div id="rebuildErrorPanel" class="upload-error-panel" hidden>
+                    <h3>Files with Errors</h3>
+                    <ul id="rebuildErrorList"></ul>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" id="closeRebuildModalButton" disabled>Close</button>
+                </div>
+            </section>
+        </div>
+
+        <section class="panel">
+            <h2>Indexed Files</h2>
+            <p class="muted">
+                Note: This is not the RAG vector index. Vectors and queryable chunks are in ChromaDB, or the chosen DB.
+                This is just administrative metadata to know which files have been uploaded and with what result.
+            </p>
+            <div class="table-wrap">
+                <table class="indexed-files-table">
+                    <thead>
+                        <tr>
+                            <th>File</th>
+                            <th>Type</th>
+                            <th>Chunks</th>
+                            <th>Status</th>
+                            <th>Updated</th>
+                            <th>Profile</th>
+                            <th>Error</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for file in files %}
+                            <tr>
+                                <td>
+                                    {{ file.filename }}
+                                    {% if file.transcript_path %}
+                                        <br><span class="muted">Transcript saved</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ file.source_type if file.source_type else "pdf" }}</td>
+                                <td>{{ file.chunks }}</td>
+                                <td><span class="status-pill {{ file.status }}">{{ file.status }}</span></td>
+                                <td>{{ file.updated_at }}</td>
+                                <td>
+                                    {% if file.index_profile %}
+                                        <code>{{ file.index_profile.embedding_provider }}</code><br>
+                                        <span class="muted">chunk {{ file.index_profile.chunk_size }}/{{ file.index_profile.chunk_overlap }}</span>
+                                    {% else %}
+                                        <span class="muted">n/a</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ file.error if file.error else "—" }}</td>
+                                <td class="table-actions">
+                                    {% if file.status == "indexed" %}
+                                        <a class="secondary-link" href="{{ url_for('admin_download_file', filename=file.filename) }}">Download</a>
+                                    {% endif %}
+                                    <form method="post" action="{{ url_for('admin_delete_file') }}">
+                                        <input type="hidden" name="filename" value="{{ file.filename }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="8">No indexed files.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Manual Maintenance</h2>
+            <p class="muted">
+                Use this when you want to force a full re-index even if the embedding configuration has not changed.
+                This is separate from the rebuild warning above, which appears only when the current index is stale.
+            </p>
+            <div class="rebuild-index-actions manual-rebuild-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}">
+                <button type="button" id="manualRebuildButton" class="secondary" data-rebuild-trigger>Force Re-index All Files</button>
+                <p class="muted">
+                    The current vector collection will be deleted and recreated from all tracked document/audio files on disk.
+                </p>
+            </div>
+        </section>
+
+        <section class="panel" id="backup-panel">
+            <h2>Backup &amp; Recovery</h2>
+            <p class="muted">
+                Create, restore, and manage snapshots of the vector index (ChromaDB + file index).
+                Backups are stored as compressed archives with SHA-256 integrity checksums.
+            </p>
+            <div class="backup-actions">
+                <form method="post" action="{{ url_for('admin_create_backup') }}" class="inline-form">
+                    <button type="submit" class="secondary" id="createBackupBtn">Create Backup</button>
+                </form>
+            </div>
+            <table class="files" id="backupTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Documents</th>
+                        <th>Size</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="backupTableBody">
+                    <tr><td colspan="5" class="muted">Loading...</td></tr>
+                </tbody>
+            </table>
+        </section>
+    </div>
+    <script src="{{ url_for('static', filename='admin_files.js') }}"></script>
+</body>
+</html>

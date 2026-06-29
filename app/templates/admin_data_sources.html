@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Sources - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container wide">
+        <header class="page-header">
+            <h1>Data Sources</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+                <a href="{{ url_for('admin_files') }}">RAG Files</a>
+                {% if current_user and current_user.role == "admin" %}
+                    <a href="{{ url_for('admin_config') }}">Config</a>
+                    <a href="{{ url_for('admin_users') }}">Users</a>
+                    <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
+                {% endif %}
+                <form method="post" action="{{ url_for('admin_logout') }}">
+                    <button type="submit" class="link-button">Logout</button>
+                </form>
+            </nav>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+
+        <section class="panel">
+            <h2>Email IMAP Source</h2>
+            <p class="muted">
+                Create or update an allowlisted source. Credentials are read from environment variables only.
+            </p>
+            <form method="post" class="form-grid compact">
+                <input type="hidden" name="plugin" value="email_imap">
+                <label>
+                    Source ID
+                    <input type="text" name="id" placeholder="legal-mailbox" required>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="Legal mailbox">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="enabled" checked>
+                    Enabled
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="sync_enabled">
+                    Periodic sync
+                </label>
+                <label>
+                    Sync interval minutes
+                    <input type="number" name="sync_interval_minutes" value="15" min="1" max="43200">
+                </label>
+                <label>
+                    Host
+                    <input type="text" name="host" placeholder="imap.gmail.com" required>
+                </label>
+                <label>
+                    Port
+                    <input type="number" name="port" value="993" min="1" max="65535">
+                </label>
+                <label>
+                    Username
+                    <input type="text" name="username" placeholder="name@example.com" required>
+                </label>
+                <label>
+                    Password
+                    <input type="password" name="password" placeholder="Saved encrypted for your user">
+                </label>
+                <label>
+                    Password Env
+                    <input type="text" name="password_env" placeholder="Optional admin-managed env variable">
+                </label>
+                <label>
+                    Folder
+                    <input type="text" name="folder" value="INBOX">
+                </label>
+                <label>
+                    From contains
+                    <input type="text" name="from_contains" placeholder="@example.com">
+                </label>
+                <label>
+                    Subject contains
+                    <input type="text" name="subject_contains" placeholder="contract">
+                </label>
+                <label>
+                    Since
+                    <input type="text" name="since" placeholder="2026-01-01T00:00:00+00:00">
+                </label>
+                <label>
+                    Max messages
+                    <input type="number" name="max_messages" value="25" min="1" max="500">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="use_ssl" checked>
+                    Use SSL
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="include_body" checked>
+                    Include email body
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="include_attachments" checked>
+                    Include supported attachments
+                </label>
+                <button type="submit">Save Data Source</button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Microsoft Drive Source</h2>
+            <p class="muted">
+                Uses Microsoft Graph with a Bearer token from an environment variable.
+                Leave Drive ID empty for <code>/me/drive</code>; set it for SharePoint or a specific drive.
+            </p>
+            <form method="post" class="form-grid compact">
+                <input type="hidden" name="plugin" value="microsoft_drive">
+                <label>
+                    Source ID
+                    <input type="text" name="id" placeholder="contracts-drive" required>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="Contracts Drive">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="enabled" checked>
+                    Enabled
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="sync_enabled">
+                    Periodic sync
+                </label>
+                <label>
+                    Sync interval minutes
+                    <input type="number" name="sync_interval_minutes" value="15" min="1" max="43200">
+                </label>
+                <label>
+                    Token Env
+                    <input type="text" name="token_env" placeholder="Optional admin-managed env variable">
+                </label>
+                <label>
+                    Graph Token
+                    <input type="password" name="token" placeholder="Saved encrypted for your user">
+                </label>
+                <label>
+                    Drive ID
+                    <input type="text" name="drive_id" placeholder="optional SharePoint/drive id">
+                </label>
+                <label>
+                    Folder Path
+                    <input type="text" name="folder_path" placeholder="Shared Documents/Contracts">
+                </label>
+                <label>
+                    Item ID
+                    <input type="text" name="item_id" placeholder="optional folder item id">
+                </label>
+                <label>
+                    Extensions
+                    <input type="text" name="include_extensions" value="pdf,txt,md">
+                </label>
+                <label>
+                    Max files
+                    <input type="number" name="max_files" value="50" min="1" max="1000">
+                </label>
+                <label>
+                    Max file size MB
+                    <input type="number" name="max_file_size_mb" value="10" min="1" max="100">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="recursive" checked>
+                    Recursive folders
+                </label>
+                <button type="submit">Save Data Source</button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Folder Watch Source</h2>
+            <p class="muted">
+                Monitor a local or UNC folder for files to index. Files are processed on sync.
+            </p>
+            <form method="post" class="form-grid compact">
+                <input type="hidden" name="plugin" value="folder_watch">
+                <label>
+                    Source ID
+                    <input type="text" name="id" placeholder="local-documents" required>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="Local Documents">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="enabled" checked>
+                    Enabled
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="sync_enabled">
+                    Periodic sync
+                </label>
+                <label>
+                    Sync interval minutes
+                    <input type="number" name="sync_interval_minutes" value="15" min="1" max="43200">
+                </label>
+                <label>
+                    Folder Path
+                    <input type="text" name="folder_path" placeholder="C:\Users\...\Documents" required>
+                </label>
+                <label>
+                    Extensions
+                    <input type="text" name="include_extensions" value="pdf,txt,md,csv">
+                </label>
+                <label>
+                    Exclude Patterns
+                    <input type="text" name="exclude_patterns" placeholder="*.tmp,*~">
+                </label>
+                <label>
+                    Max Files
+                    <input type="number" name="max_files" value="100" min="1" max="500">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="recursive">
+                    Recursive folders
+                </label>
+                <button type="submit">Save Data Source</button>
+            </form>
+        </section>
+
+        <section class="panel">
+            <h2>Configured Sources</h2>
+            <div id="dataSourceJobStatus" class="notice warning" hidden></div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Source</th>
+                            <th>Plugin</th>
+                            <th>Status</th>
+                            <th>Indexed</th>
+                            <th>Last Sync</th>
+                            <th>Next Sync</th>
+                            <th>Error</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for source in data_sources %}
+                            <tr>
+                                <td>
+                                    <strong>{{ source.name }}</strong><br>
+                                    <code>{{ source.id }}</code>
+                                </td>
+                                <td>{{ source.plugin_name }}</td>
+                                <td>
+                                    <span class="status-pill {{ 'indexed' if source.enabled else 'empty' }}">
+                                        {{ "enabled" if source.enabled else "disabled" }}
+                                    </span>
+                                </td>
+                                <td>{{ source.indexed_count }}</td>
+                                <td>
+                                    {{ source.last_sync if source.last_sync else "never" }}
+                                    {% if source.last_sync_status %}
+                                        <br><span class="muted">{{ source.last_sync_status }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if source.sync_enabled %}
+                                        {{ source.next_sync_at if source.next_sync_at else "due" }}
+                                        <br><span class="muted">every {{ (source.sync_interval_seconds // 60) if source.sync_interval_seconds else 0 }} min</span>
+                                    {% else %}
+                                        manual
+                                    {% endif %}
+                                </td>
+                                <td>{{ source.last_error if source.last_error else "—" }}</td>
+                                <td class="table-actions">
+                                    <button
+                                        type="button"
+                                        class="secondary"
+                                        data-sync-source="{{ source.id }}"
+                                        data-sync-disabled="{{ 'true' if not source.enabled else 'false' }}"
+                                        data-sync-url="{{ url_for('admin_sync_data_source', data_source_id=source.id) }}"
+                                        {% if not source.enabled %}disabled title="Enable this data source before syncing"{% endif %}
+                                    >{{ "Sync disabled" if not source.enabled else "Sync now" }}</button>
+                                    <button
+                                        type="button"
+                                        class="secondary toggle-btn"
+                                        data-toggle-source="{{ source.id }}"
+                                        data-toggle-enabled="{{ 'true' if not source.enabled else 'false' }}"
+                                        data-toggle-url="{{ url_for('admin_toggle_data_source', data_source_id=source.id) }}"
+                                    >{{ "Enable" if not source.enabled else "Disable" }}</button>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="8">No data sources configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+    <script src="{{ url_for('static', filename='admin_data_sources.js') }}"></script>
+</body>
+</html>

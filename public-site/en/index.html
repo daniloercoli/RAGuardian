@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="../favicon.ico">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <title>RAGuardian — Enterprise RAG with Data Sovereignty</title>
+  <meta name="description" content="Self-hosted multi-user enterprise RAG for personal and company knowledge bases. Email, Microsoft Drive, Multi-provider, zero data retention with Regolo.ai, GDPR compliant.">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="container">
+      <a href="index.html" class="logo">
+        <img class="logo-icon" src="../favicon.png" alt="RAGuardian">
+        RAGuardian
+      </a>
+      <div class="nav">
+        <button class="nav-toggle" aria-label="Menu">☰</button>
+        <ul class="nav-links">
+          <li><a href="index.html" class="active">Home</a></li>
+          <li><a href="advantages.html">Advantages</a></li>
+          <li><a href="providers.html">Providers</a></li>
+          <li><a href="technology.html">Technology</a></li>
+          <li><a href="contact.html">Contact</a></li>
+        </ul>
+        <div class="lang-switch">
+          <a href="../it/index.html">IT</a>
+          <a href="index.html" class="active">EN</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="container">
+      <div class="hero-content">
+        <div class="hero-badge">
+          <span class="dot"></span>
+          Open Source · MIT License
+        </div>
+        <h1>Your knowledge base.<br><span class="gradient-text">Your data. Your terms.</span></h1>
+        <p>Self-hosted, multi-user enterprise RAG with your choice of provider: Regolo.ai for full EU sovereignty, Mistral for leading European models, or a local model for total control. No vendor lock-in.</p>
+        <div class="hero-actions">
+          <a href="contact.html" class="btn btn-primary">Request a demo</a>
+          <a href="advantages.html" class="btn btn-outline">Why RAGuardian →</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="trust-bar">
+    <div class="container">
+      <p>Infrastructure & Compliance</p>
+      <div class="trust-logos">
+        <div class="trust-logo">
+          <span class="icon" style="background:#e8f5e9;color:#2e7d32;">🇪🇺</span>
+          EU Data residency
+        </div>
+        <div class="trust-logo">
+          <span class="icon" style="background:#e3f2fd;color:#1565c0;">🔒</span>
+          Zero data retention
+        </div>
+        <div class="trust-logo">
+          <span class="icon" style="background:#fff3e0;color:#e65100;">📋</span>
+          GDPR-ready
+        </div>
+        <div class="trust-logo">
+          <span class="icon" style="background:#f3e5f5;color:#7b1fa2;">🔑</span>
+          Multi-user
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Personal RAG</span>
+        <h2>For offices where one knowledge base is not enough</h2>
+        <p>Every employee gets isolated documents, email, Microsoft Drive, data sources, conversations, and more. The company keeps providers, policy, and deployment under control.</p>
+      </div>
+      <div class="value-grid">
+        <div class="value-card fade-in">
+          <div class="value-icon blue">👤</div>
+          <h3>Workspace per user</h3>
+          <p>Each account has dedicated uploads, FileIndex, data sources, conversations, and Chroma collection. Queries do not cross the user's boundary.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">✉️</div>
+          <h3>Personal email</h3>
+          <p>The IMAP connector indexes mailbox messages, threads, and supported attachments into the owning user's RAG. Credentials are encrypted or referenced through environment variables.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon purple">☁️</div>
+          <h3>Microsoft Drive</h3>
+          <p>The Microsoft Drive plugin reads PDF, TXT, and Markdown from OneDrive or SharePoint, materializes a workspace snapshot, and indexes it within the correct boundary.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon orange">🔑</div>
+          <h3>Workspace API keys</h3>
+          <p>WordPress plugins, portals, and server-to-server integrations use API keys tied to a specific user. One key cannot query another person's RAG.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Why us</span>
+        <h2>While others offer a chatbot, we offer infrastructure</h2>
+        <p>RAGuardian is not just an LLM wrapper. It's a complete RAG infrastructure, designed for companies that can't afford to compromise data security.</p>
+      </div>
+      <div class="value-grid">
+        <div class="value-card fade-in">
+          <div class="value-icon blue">🏛️</div>
+          <h3>Data sovereignty</h3>
+          <p>With Regolo.ai, every inference runs on European infrastructure. Your prompts and outputs are never saved. Zero data retention means zero data leakage risk.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon green">🔄</div>
+          <h3>Switch providers in a click</h3>
+          <p>Today Regolo.ai, tomorrow Mistral, the day after a local model. No code changes. Your team chooses the right balance between privacy, cost and performance.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon purple">🎙️</div>
+          <h3>Audio-native</h3>
+          <p>Not just PDFs. Upload meeting recordings, internal podcasts or sales calls. They're transcribed and indexed automatically. Employees can query the knowledge base by speaking.</p>
+        </div>
+        <div class="value-card fade-in">
+          <div class="value-icon orange">🔌</div>
+          <h3>Integration-ready</h3>
+          <p>WordPress plugin with chatbot, article sync &amp; shortcode, versioned REST API, workspace API keys with granular scopes, NDJSON streaming. We integrate with your stack, not the other way around.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section wordpress-section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">WordPress Plugin</span>
+        <h2>Turn any site into a RAG-powered experience</h2>
+        <p>Our open-source WordPress plugin connects your public site to a dedicated RAGuardian workspace. Server-to-server only. The API key never reaches the browser.</p>
+      </div>
+      <div class="value-grid">
+        <div class="value-card wordpress-card fade-in">
+          <div class="value-icon blue">💬</div>
+          <h3>Floating chatbot &amp; inline shortcode</h3>
+          <p>Fully customizable chat widget (position, colors, avatar, CSS) or inline <code>[rag_chat]</code> shortcode with per-page overrides. TTS button, audio upload, source visibility — all configurable.</p>
+        </div>
+        <div class="value-card wordpress-card fade-in">
+          <div class="value-icon green">📰</div>
+          <h3>Article ingestion &amp; live sync</h3>
+          <p>Import your public articles from a WXR export, then keep them synchronized. Every publish, update or delete flows to RAGuardian automatically. No manual re-indexing.</p>
+        </div>
+        <div class="value-card wordpress-card fade-in">
+          <div class="value-icon purple">🔒</div>
+          <h3>Zero key exposure</h3>
+          <p>Server-side PHP client. The API key lives in WordPress options, used only for authenticated calls. AJAX requests are proxied through PHP — never exposed to JavaScript.</p>
+        </div>
+        <div class="value-card wordpress-card fade-in">
+          <div class="value-icon orange">🧪</div>
+          <h3>Production-grade</h3>
+          <p>Health checks, server-side rate limiting, client context (page title, URL, locale), exponential backoff retry. Full E2E test suite with Playwright. MIT licensed.</p>
+        </div>
+      </div>
+      <div class="wordpress-actions">
+        <a href="https://github.com/daniloercoli/RAGuardian/tree/main/integrations/wordpress/rag-client" class="btn btn-outline" target="_blank" rel="noopener">View plugin source →</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="background:var(--gray-50);">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">The market</span>
+        <h2>What's different</h2>
+      </div>
+      <div class="vs-comparison">
+        <div class="vs-card">
+          <h3>Generic chatbots</h3>
+          <ul class="vs-list">
+            <li><span class="icon-red">✗</span> Vendor lock-in on LLM provider</li>
+            <li><span class="icon-red">✗</span> Data sent to third-party servers</li>
+            <li><span class="icon-red">✗</span> Text only, no audio support</li>
+            <li><span class="icon-red">✗</span> Closed or proprietary APIs</li>
+            <li><span class="icon-red">✗</span> Mandatory SaaS</li>
+          </ul>
+        </div>
+        <div class="vs-divider">VS</div>
+        <div class="vs-card highlight">
+          <h3>RAGuardian</h3>
+          <ul class="vs-list">
+            <li><span class="icon-green">✓</span> Multi-provider: Regolo, Mistral, local</li>
+            <li><span class="icon-green">✓</span> Zero data retention, EU compute</li>
+            <li><span class="icon-green">✓</span> PDF + audio with STT & TTS</li>
+            <li><span class="icon-green">✓</span> Open-source REST API</li>
+            <li><span class="icon-green">✓</span> Multi-user and full self-hosting</li>
+          </ul>
+        </div>
+      </div>
+      <div style="text-align:center;margin-top:24px;">
+        <a href="advantages.html" class="btn btn-primary">See all advantages →</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Use cases</span>
+        <h2>Who uses it and why</h2>
+      </div>
+      <div class="use-case-grid">
+        <div class="use-case-card fade-in">
+          <h4>🏦 Insurance</h4>
+          <p>Query internal contracts and policies. Fully self-hosted, zero exposure of customer data to third parties.</p>
+        </div>
+        <div class="use-case-card fade-in">
+          <h4>🏥 Healthcare</h4>
+          <p>Search clinical protocols and medical literature with GDPR/HIPAA compliance. Local models for sensitive data.</p>
+        </div>
+        <div class="use-case-card fade-in">
+          <h4>⚖️ Legal</h4>
+          <p>Contract and case law analysis with full audit trail. Sources cited, zero hallucinations with contextual RAG.</p>
+        </div>
+        <div class="use-case-card fade-in">
+          <h4>🏭 Manufacturing</h4>
+          <p>Technical manuals, SOPs and maintenance guides. Operators query the knowledge base from the field.</p>
+        </div>
+        <div class="use-case-card fade-in">
+          <h4>🏢 HR & Compliance</h4>
+          <p>Company policies, employee handbooks and internal FAQs. WordPress plugin for the company portal.</p>
+        </div>
+        <div class="use-case-card fade-in">
+          <h4>🔧 IT Support</h4>
+          <p>Technical knowledge base for your IT team. Contextual answers with source citation and TTS for the field.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta-section">
+    <div class="container">
+      <h2>Ready to take control of your data?</h2>
+      <p>RAGuardian is open-source and self-hosted. You deploy it, configure it, own it. No third-party dependencies on your data.</p>
+      <div class="cta-buttons">
+        <a href="contact.html" class="btn btn-primary">Request a demo</a>
+        <a href="https://github.com/daniloercoli/RAGuardian" class="btn btn-dark-outline" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <div class="logo"><img class="logo-icon" src="../favicon.png" alt="RAGuardian">RAGuardian</div>
+          <p>Self-hosted, multi-user enterprise RAG with personal connectors, zero data retention and European compliance.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul class="footer-links">
+            <li><a href="advantages.html">Advantages</a></li>
+            <li><a href="providers.html">Providers</a></li>
+            <li><a href="technology.html">Technology</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Resources</h4>
+          <ul class="footer-links">
+            <li><a href="https://github.com/daniloercoli/RAGuardian" target="_blank" rel="noopener">GitHub</a></li>
+            <li><a href="technology.html">Architecture</a></li>
+            <li><a href="contact.html">Contact</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Compliance</h4>
+          <ul class="footer-links">
+            <li><a href="privacy.html">Privacy &amp; GDPR</a></li>
+            
+            <li><a href="providers.html">Data Residency</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Ercoli Consulting srl. MIT License.</span>
+        <span>Open Source · Self-hosted · Made in RSM & Italy</span>
+      </div>
+    </div>
+  </footer>
+  <script src="../js/main.js"></script>
+</body>
+</html>

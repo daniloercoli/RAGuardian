@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configuration - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container wide">
+        <header class="page-header">
+            <h1>Configuration</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+                <a href="{{ url_for('admin_files') }}">RAG Files</a>
+                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
+                <a href="{{ url_for('admin_users') }}">Users</a>
+                <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
+                <form method="post" action="{{ url_for('admin_logout') }}">
+                    <button type="submit" class="link-button">Logout</button>
+                </form>
+            </nav>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+
+        <nav class="config-tabs" aria-label="Configuration categories">
+            <button type="button" class="secondary active" data-config-tab="overview">Overview</button>
+            <button type="button" class="secondary" data-config-tab="rag">RAG</button>
+            <button type="button" class="secondary" data-config-tab="media">Media Input</button>
+            <button type="button" class="secondary" data-config-tab="providers">Providers</button>
+        </nav>
+
+        {% if model_config_error %}
+            <section class="panel" data-config-category="overview">
+                <h2>Model Configuration Required</h2>
+                <div class="notice error">{{ model_config_error }}</div>
+                <p class="muted">
+                    Expected file: <code>{{ provider_config_path }}</code>.
+                    Built-in providers and API key environment variables are loaded from this file.
+                </p>
+            </section>
+        {% endif %}
+
+        <section class="panel" data-config-category="overview">
+            <h2>Service Status</h2>
+            <p class="muted">
+                Check these items before using the chat: if they are green, you can proceed to the Documents page and then to the chat.
+            </p>
+            <div class="setup-check-grid">
+                <div class="setup-check {{ 'ready' if models else 'warning' }}">
+                    <span>LLM</span>
+                    <strong>{{ settings.rag.default_provider }} / {{ settings.rag.default_model }}</strong>
+                    <p>{{ "Model available" if models else "Configure at least one model" }}</p>
+                </div>
+                <div class="setup-check ready">
+                    <span>Embeddings</span>
+                    <strong>{{ settings.rag.embedding_provider }}</strong>
+                    <p>{{ settings.rag.embedding_model }}</p>
+                </div>
+                <div class="setup-check {{ 'ready' if health.system_ready else 'warning' }}">
+                    <span>Knowledge base</span>
+                    <strong>{{ index_status.indexed_count }} files / {{ health.documents_count if health.documents_count is defined else 0 }} chunks</strong>
+                    <p>{{ "Ready" if health.system_ready else "Upload PDFs or rebuild index" }}</p>
+                </div>
+                <div class="setup-check {{ 'ready' if setup_status.users_configured else 'warning' }}">
+                    <span>Users</span>
+                    <strong>{{ "Configured" if setup_status.users_configured else "No users" }}</strong>
+                    <p>{{ "User management active" if setup_status.users_configured else "Create users via the Users page" }}</p>
+                </div>
+                <div class="setup-check {{ 'ready' if setup_status.api_key_configured else 'warning' }}">
+                    <span>API</span>
+                    <strong>{{ "Key present" if setup_status.api_key_configured else "Key missing" }}</strong>
+                    <p>{{ "Ready for integrations" if setup_status.api_key_configured else "Not required for chat demo" }}</p>
+                </div>
+                <div class="setup-check {{ 'warning' if index_status.needs_rebuild else 'ready' }}">
+                    <span>Index</span>
+                    <strong>{{ "Needs rebuild" if index_status.needs_rebuild else "Aligned" }}</strong>
+                    <p>{{ index_status.stale_count }} stale files</p>
+                </div>
+            </div>
+        </section>
+
+        <div class="section-heading" data-config-category="rag">
+            <h2>Essential Configuration</h2>
+            <p class="muted">Parameters to check for the demo. The following sections remain available for advanced setups.</p>
+        </div>
+
+        <section class="panel" data-config-category="rag">
+            <h2>LLM Parameters</h2>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_rag">
+                <label>
+                    <span class="field-label">
+                        Default Provider
+                        <button type="button" class="help-trigger" aria-label="Help on Default Provider" data-help-title="Default Provider" data-help-body="Provider used when a request does not explicitly specify one. Built-in providers come from the default provider file; custom providers are configured below.">?</button>
+                    </span>
+                    <select name="default_provider">
+                        {% for provider in llm_providers %}
+                            <option value="{{ provider.id }}" {% if provider.id == settings.rag.default_provider %}selected{% endif %}>{{ provider.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label class="span-2">
+                    <span class="field-label">
+                        Default Model
+                        <button type="button" class="help-trigger" aria-label="Help on Default Model" data-help-title="Default Model" data-help-body="Model used when the UI or an API client does not send one. It must belong to the list of available models for configured providers.">?</button>
+                    </span>
+                    <select name="default_model">
+                        {% for model in models %}
+                            <option value="{{ model.id }}" {% if model.id == settings.rag.default_model %}selected{% endif %}>{{ model.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span class="field-label">
+                        Temperature
+                        <button type="button" class="help-trigger" aria-label="Help on Temperature" data-help-title="Temperature" data-help-body="Controls the variability of the model response. 0 makes responses more deterministic; values close to 1 produce more creative but less stable responses.">?</button>
+                    </span>
+                    <input type="number" name="temperature" min="0" max="1" step="0.05" value="{{ settings.rag.temperature }}">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="use_internal_knowledge" {% if settings.rag.use_internal_knowledge %}checked{% endif %}>
+                    <span class="field-label">
+                        Use Internal Knowledge
+                        <button type="button" class="help-trigger" aria-label="Help on internal knowledge" data-help-title="Use Internal Knowledge" data-help-body="If enabled, the model can complement the RAG context with its general knowledge. If disabled, it must respond only with information retrieved from documents.">?</button>
+                    </span>
+                </label>
+                <h3 class="span-2">Document Indexing</h3>
+                <label>
+                    <span class="field-label">
+                        Chunk Size
+                        <button type="button" class="help-trigger" aria-label="Help on Chunk Size" data-help-title="Chunk Size" data-help-body="Maximum number of characters per chunk extracted from PDFs. Larger chunks give more context to the model, but can reduce retrieval precision.">?</button>
+                    </span>
+                    <input type="number" name="chunk_size" min="100" max="10000" value="{{ settings.rag.chunk_size }}">
+                </label>
+                <label>
+                    <span class="field-label">
+                        Chunk Overlap
+                        <button type="button" class="help-trigger" aria-label="Help on Chunk Overlap" data-help-title="Chunk Overlap" data-help-body="Number of characters repeated between consecutive chunks. Helps not to lose information at the boundary between two chunks, but increases redundancy and indexing cost.">?</button>
+                    </span>
+                    <input type="number" name="chunk_overlap" min="0" max="500" value="{{ settings.rag.chunk_overlap }}">
+                </label>
+                <h3 class="span-2">Retrieval</h3>
+                <label>
+                    <span class="field-label">
+                        Retrieval Results (k)
+                        <button type="button" class="help-trigger" aria-label="Help on retrieval results" data-help-title="Retrieval Results (k)" data-help-body="Number of final chunks passed to the LLM. Without ReRanking: chunks retrieved directly from ChromaDB. With ReRanking enabled: after retrieving 'Documents for ReRanking' documents from ChromaDB, the reranker sorts them by relevance and returns the top k most relevant chunks.">?</button>
+                    </span>
+                    <input type="number" name="query_k" min="1" max="50" value="{{ settings.rag.query_k }}">
+                </label>
+                <label class="span-2">
+                    <span class="field-label">
+                        Embeddings Model
+                        <button type="button" class="help-trigger" aria-label="Help on Embeddings Model" data-help-title="Embeddings Model" data-help-body="Model used to generate embeddings. Includes both the provider and the specific model. Changing model requires reindexing documents. With Regolo or a custom provider, document chunks are sent to the configured provider.">?</button>
+                    </span>
+                    <select name="embedding_model" id="embeddingModel">
+                        {% for provider in embedding_providers %}
+                            {% for model in provider.models %}
+                                {% set full_value = provider.id + '/' + model %}
+                                {% set is_selected = (settings.rag.embedding_provider == provider.id and settings.rag.embedding_model == model) %}
+                                <option value="{{ full_value }}" {% if is_selected %}selected{% endif %}>{{ provider.name }} — {{ model }}</option>
+                            {% endfor %}
+                        {% endfor %}
+                    </select>
+                    <p class="muted"> Note: After updating or changing the embedding model, and save the changes, you must reindex the knowledge base for the changes to take effect. You can do this using the "Reindex" button in the RAG section.</p>
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="enable_cache" {% if settings.rag.enable_cache %}checked{% endif %}>
+                    <span class="field-label">
+                        Cache Enabled
+                        <button type="button" class="help-trigger" aria-label="Help on Cache Enabled" data-help-title="Cache Enabled" data-help-body="Enables an in-memory cache for retrieval results. Reduces repeated work on identical queries, but does not replace the persistent ChromaDB index.">?</button>
+                    </span>
+                </label>
+                <label>
+                    <span class="field-label">
+                        Cache TTL Seconds
+                        <button type="button" class="help-trigger" aria-label="Help on Cache TTL" data-help-title="Cache TTL Seconds" data-help-body="Duration in seconds of the retrieval results cache. Within this time, identical queries can reuse already retrieved chunks. The cache is cleared after a new PDF upload.">?</button>
+                    </span>
+                    <input type="number" name="cache_ttl" min="60" max="86400" value="{{ settings.rag.cache_ttl }}">
+                </label>
+                <button type="submit">Save RAG Parameters</button>
+            </form>
+        </section>
+
+        <section class="panel" data-config-category="rag">
+            <h2>ReRanking</h2>
+            <form method="post" class="form-grid" id="rerankerForm">
+                <input type="hidden" name="action" value="save_reranker">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="reranker_enabled" {% if settings.rag.reranker_enabled %}checked{% endif %}>
+                    <span class="field-label">
+                        ReRanking Enabled
+                        <button type="button" class="help-trigger" aria-label="Help on ReRanking Enabled" data-help-title="ReRanking Enabled" data-help-body="Enables the ReRanking system to improve the quality of retrieved results.">?</button>
+                    </span>
+                </label>
+                <label>
+                    <span class="field-label">
+                        ReRanking Model
+                        <button type="button" class="help-trigger" aria-label="Help on ReRanking Model" data-help-title="ReRanking Model" data-help-body="Model used for ReRanking. Options come from the built-in provider file plus custom OpenAI-compatible providers configured below.">?</button>
+                    </span>
+                    <select name="reranker_model" id="rerankerModel">
+                        {% for provider in reranker_providers %}
+                            {% for model in provider.models %}
+                                {% set full_value = provider.id + '/' + model %}
+                                {% set legacy_local = provider.id == 'local' and settings.rag.reranker_model == model %}
+                                <option value="{{ full_value }}" {% if settings.rag.reranker_model == full_value or legacy_local %}selected{% endif %}>{{ provider.name }} — {{ model }}</option>
+                            {% endfor %}
+                        {% endfor %}
+                    </select>
+                </label>
+                <label id="rerankerApiKeyLabel" style="display: none;">
+                    <span class="field-label">
+                        ReRanking API Key Override
+                        <button type="button" class="help-trigger" aria-label="Help on ReRanking API Key" data-help-title="ReRanking API Key Override" data-help-body="Optional override for the selected built-in ReRanking provider. If empty, the provider's api_key_env from the configuration file is used.">?</button>
+                    </span>
+                    <input type="password" id="rerankerApiKey" name="reranker_api_key" placeholder="Empty keeps existing override or env key">
+                </label>
+                <label>
+                    <span class="field-label">
+                        Documents for ReRanking (top_n)
+                        <button type="button" class="help-trigger" aria-label="Help on Documents for ReRanking" data-help-title="Documents for ReRanking (top_n)" data-help-body="Number of documents retrieved from ChromaDB and submitted to ReRanking. The reranker sorts these documents by relevance. Higher values (50-100) provide more context to the reranker.">?</button>
+                    </span>
+                    <input type="number" name="reranker_top_n" min="1" max="200" value="{{ settings.rag.reranker_top_n }}">
+                </label>
+                <label>
+                    <span class="field-label">
+                        ReRanking Threshold
+                        <button type="button" class="help-trigger" aria-label="Help on ReRanking Threshold" data-help-title="ReRanking Threshold" data-help-body="Minimum relevance threshold to filter documents. Documents with lower scores are discarded. 0 = no filtering.">?</button>
+                    </span>
+                    <input type="number" name="reranker_threshold" min="0" max="10" step="0.1" value="{{ settings.rag.reranker_threshold }}">
+                </label>
+                 <p class="muted  span-2">Note: With ReRanking enabled, the final documents passed to the LLM are controlled by the "Retrieval Results (k)" parameter above. The reranker retrieves documents here, sorts them by relevance, and returns the top k.</p>
+                <button type="submit">Save ReRanking</button>
+            </form>
+        </section>
+
+        <section class="panel" data-config-category="media">
+            <h2>Voice &amp; Audio</h2>
+            <p class="muted">
+                Select an OpenAI-compatible speech provider for audio transcription and text-to-speech responses.
+                Built-in defaults come from the provider file; custom providers can be added below.
+            </p>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_voice">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="voice_enabled" {% if settings.voice.enabled %}checked{% endif %}>
+                    Voice provider enabled
+                </label>
+                <label>
+                    Voice Provider
+                    <select name="voice_provider" id="voiceProvider">
+                        {% for provider in voice_providers %}
+                            <option
+                                value="{{ provider.id }}"
+                                data-base-url="{{ provider.base_url }}"
+                                data-requires-api-key="{{ '1' if provider.requires_api_key else '0' }}"
+                                data-stt-model="{{ provider.stt_model }}"
+                                data-stt-language="{{ provider.stt_language }}"
+                                data-tts-model="{{ provider.tts_model }}"
+                                data-voice="{{ provider.voice }}"
+                                data-format="{{ provider.format }}"
+                                {% if provider.id == settings.voice.provider %}selected{% endif %}
+                            >
+                                {{ provider.name }}
+                            </option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" id="voiceBaseUrl" name="voice_base_url" placeholder="https://api.example.com/v1" value="{{ settings.voice.base_url }}">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="voice_api_key" placeholder="Empty keeps existing key">
+                </label>
+                <label class="checkbox-label">
+                    <input type="hidden" name="voice_requires_api_key" value="0">
+                    <input type="checkbox" id="voiceRequiresApiKey" name="voice_requires_api_key" value="1" {% if settings.voice.requires_api_key %}checked{% endif %}>
+                    Requires API key
+                </label>
+                <label>
+                    STT Model
+                    <input type="text" id="voiceSttModel" name="voice_stt_model" placeholder="faster-whisper-large-v3" value="{{ settings.voice.stt_model }}">
+                </label>
+                <label>
+                    STT Language
+                    <input type="text" id="voiceSttLanguage" name="voice_stt_language" placeholder="auto-detect" value="{{ settings.voice.stt_language }}">
+                </label>
+                <label>
+                    TTS Model
+                    <input type="text" id="voiceTtsModel" name="voice_tts_model" placeholder="tts-1" value="{{ settings.voice.tts_model }}">
+                </label>
+                <label>
+                    Default Voice
+                    <input type="text" id="voiceDefaultVoice" name="voice_default_voice" placeholder="alloy" value="{{ settings.voice.voice }}">
+                </label>
+                <label>
+                    Default Format
+                    <select name="voice_format" id="voiceFormat">
+                        {% for format in ["mp3", "wav", "opus", "aac", "flac"] %}
+                            <option value="{{ format }}" {% if settings.voice.format == format %}selected{% endif %}>{{ format }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <div class="notice info span-2">
+                    STT is used by <code>POST /api/v1/audio</code>. TTS is used by <code>POST /api/v1/tts</code>.
+                    Leave STT Language empty for provider autodetect, or set an ISO code such as <code>it</code> to force transcription language.
+                    Audio endpoints require API keys with <code>ingest</code> or <code>speech</code> scope.
+                </div>
+                <button type="submit">Save Voice Settings</button>
+            </form>
+        </section>
+
+        <section class="panel" data-config-category="media">
+            <h2>OCR</h2>
+            <p class="muted">
+                OCR is used for images and as fallback when uploaded PDFs cannot be parsed into text.
+                Regolo OCR with deepseek-ocr-2 is available by default; add custom providers below when needed.
+            </p>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_ocr">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_enabled" {% if settings.ocr.enabled %}checked{% endif %}>
+                    OCR enabled
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_auto_on_empty_pdf" {% if settings.ocr.auto_on_empty_pdf %}checked{% endif %}>
+                    Use OCR when PDF parsing is empty
+                </label>
+                <label>
+                    OCR Provider
+                    <select name="ocr_provider" id="ocrProvider">
+                        <option value="" {% if not settings.ocr.provider %}selected{% endif %}>No OCR provider configured</option>
+                        {% for provider in ocr_providers %}
+                            <option
+                                value="{{ provider.id }}"
+                                data-base-url="{{ provider.base_url }}"
+                                data-requires-api-key="{{ '1' if provider.requires_api_key else '0' }}"
+                                data-default-model="{{ provider.default_model }}"
+                                data-ocr-mode="{{ provider.ocr_mode }}"
+                                data-input-types="{{ provider.input_types|join(',') }}"
+                                data-output-format="{{ provider.output_format }}"
+                                {% if provider.id == settings.ocr.provider %}selected{% endif %}
+                            >
+                                {{ provider.name }}
+                            </option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" id="ocrBaseUrl" name="ocr_base_url" placeholder="https://api.example.com/v1" value="{{ settings.ocr.base_url }}">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="ocr_api_key" placeholder="Empty keeps existing key">
+                </label>
+                <label class="checkbox-label">
+                    <input type="hidden" name="ocr_requires_api_key" value="0">
+                    <input type="checkbox" id="ocrRequiresApiKey" name="ocr_requires_api_key" value="1" {% if settings.ocr.requires_api_key %}checked{% endif %}>
+                    Requires API key
+                </label>
+                <label>
+                    OCR Model
+                    <input type="text" id="ocrDefaultModel" name="ocr_default_model" placeholder="ocr-model" value="{{ settings.ocr.default_model }}">
+                </label>
+                <label>
+                    OCR Mode
+                    <select name="ocr_mode" id="ocrMode">
+                        <option value="vision_chat" {% if settings.ocr.ocr_mode == "vision_chat" %}selected{% endif %}>Vision chat completions</option>
+                    </select>
+                </label>
+                <label>
+                    Output Format
+                    <input type="text" id="ocrOutputFormat" name="ocr_output_format" value="{{ settings.ocr.output_format or 'text' }}">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_input_types" value="image" {% if "image" in settings.ocr.input_types %}checked{% endif %}>
+                    Accept images
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_input_types" value="pdf" {% if "pdf" in settings.ocr.input_types %}checked{% endif %}>
+                    Accept PDFs
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_supports_layout" {% if settings.ocr.supports_layout %}checked{% endif %}>
+                    Supports layout
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_supports_tables" {% if settings.ocr.supports_tables %}checked{% endif %}>
+                    Supports tables
+                </label>
+                <div class="notice info span-2">
+                    OCR fallback runs only after normal PDF parsing returns no text. Image uploads from chat use OCR directly.
+                </div>
+                <button type="submit">Save OCR Settings</button>
+            </form>
+        </section>
+
+        <div class="section-heading" data-config-category="providers">
+            <h2>Custom Providers</h2>
+            <p class="muted">
+                Configure separate OpenAI-compatible endpoints for different steps of the RAG flow.
+                Provider and model policy is global and admin-managed; users keep separate files,
+                data sources, conversations, and API keys in their own workspaces.
+            </p>
+        </div>
+
+        <section class="panel" data-config-category="providers">
+            <h2>Custom LLM Providers</h2>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_provider">
+                <label>
+                    Provider ID
+                    <input type="text" name="provider_id" placeholder="openrouter">
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="provider_name" placeholder="OpenRouter">
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" name="base_url" placeholder="https://api.example.com/v1">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="provider_api_key" placeholder="Optional; empty keeps existing">
+                </label>
+                <label class="span-2">
+                    Models
+                    <textarea name="models" rows="4" placeholder="model-a&#10;model-b"></textarea>
+                </label>
+                <label>
+                    Default Model
+                    <input type="text" name="provider_default_model" placeholder="model-a">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="provider_enabled" checked>
+                    Provider Enabled
+                </label>
+                <button type="submit">Save Provider</button>
+            </form>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Base URL</th>
+                            <th>Models</th>
+                            <th>Key</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for provider in settings.custom_providers %}
+                            <tr>
+                                <td>{{ provider.id }}</td>
+                                <td>{{ provider.base_url }}</td>
+                                <td>{{ provider.models|join(", ") }}</td>
+                                <td><code>{{ provider.api_key }}</code></td>
+                                <td>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="delete_provider">
+                                        <input type="hidden" name="provider_id" value="{{ provider.id }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="5">No custom providers configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel" data-config-category="providers">
+            <h2>OpenAI-Compatible Embeddings Providers</h2>
+            <p class="muted">
+                Add custom embedding endpoints from the configuration UI. They will appear in the Embeddings Model selector after saving.
+            </p>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_embedding_provider">
+                <label>
+                    Provider ID
+                    <input type="text" name="embedding_provider_id" placeholder="voyage">
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="embedding_provider_name" placeholder="Voyage Embeddings">
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" name="embedding_base_url" placeholder="https://api.example.com/v1">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="embedding_provider_api_key" placeholder="Optional; empty keeps existing">
+                </label>
+                <label>
+                    API Key Env
+                    <input type="text" name="embedding_provider_api_key_env" placeholder="EMBEDDING_API_KEY">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="embedding_provider_requires_api_key" checked>
+                    Requires API key
+                </label>
+                <label class="span-2">
+                    Embeddings Models
+                    <textarea name="embedding_models" rows="4" placeholder="text-embedding-model-a&#10;vendor/text-embedding-model-b"></textarea>
+                </label>
+                <label>
+                    Default Model
+                    <input type="text" name="embedding_provider_default_model" placeholder="text-embedding-model-a">
+                </label>
+                <label>
+                    Vector Dimensions
+                    <input type="number" name="embedding_dimensions" min="0" placeholder="0 = not specified">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="embedding_provider_enabled" checked>
+                    Provider Enabled
+                </label>
+                <button type="submit">Save Embeddings Provider</button>
+            </form>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Base URL</th>
+                            <th>Models</th>
+                            <th>Dimensions</th>
+                            <th>Auth</th>
+                            <th>Key</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for provider in settings.embedding_providers %}
+                            <tr>
+                                <td>{{ provider.id }}</td>
+                                <td>{{ provider.base_url }}</td>
+                                <td>{{ provider.models|join(", ") }}</td>
+                                <td>{{ provider.dimensions if provider.dimensions else "n/a" }}</td>
+                                <td>{{ "required" if provider.requires_api_key else "optional" }}</td>
+                                <td><code>{{ provider.api_key }}</code></td>
+                                <td>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="delete_embedding_provider">
+                                        <input type="hidden" name="embedding_provider_id" value="{{ provider.id }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="7">No custom embeddings providers configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel" data-config-category="providers">
+            <h2>Custom ReRanking Providers</h2>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_reranker_provider">
+                <label>
+                    Provider ID
+                    <input type="text" name="reranker_provider_id" placeholder="jina">
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="reranker_provider_name" placeholder="Jina Reranker">
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" name="reranker_base_url" placeholder="https://api.example.com/v1">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="reranker_provider_api_key" placeholder="Optional; empty keeps existing">
+                </label>
+                <label class="span-2">
+                    ReRanking Models
+                    <textarea name="reranker_models" rows="4" placeholder="rerank-model-a&#10;rerank-model-b"></textarea>
+                </label>
+                <label>
+                    Default Model
+                    <input type="text" name="reranker_provider_default_model" placeholder="rerank-model-a">
+                </label>
+                <label>
+                    API Mode
+                    <select name="reranker_mode">
+                        <option value="chat_completions" selected>OpenAI chat completions</option>
+                        <option value="rerank">Dedicated /rerank endpoint</option>
+                        <option value="auto">Auto detect from model name</option>
+                    </select>
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="reranker_provider_enabled" checked>
+                    Provider Enabled
+                </label>
+                <button type="submit">Save ReRanking Provider</button>
+            </form>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Base URL</th>
+                            <th>Models</th>
+                            <th>Mode</th>
+                            <th>Key</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for provider in settings.reranker_providers %}
+                            <tr>
+                                <td>{{ provider.id }}</td>
+                                <td>{{ provider.base_url }}</td>
+                                <td>{{ provider.models|join(", ") }}</td>
+                                <td>{{ provider.reranker_mode|default("chat_completions") }}</td>
+                                <td><code>{{ provider.api_key }}</code></td>
+                                <td>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="delete_reranker_provider">
+                                        <input type="hidden" name="reranker_provider_id" value="{{ provider.id }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="6">No custom ReRanking providers configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel" data-config-category="providers">
+            <h2>OpenAI-Compatible Voice Providers</h2>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_voice_provider">
+                <label>
+                    Provider ID
+                    <input type="text" name="voice_provider_id" placeholder="openai-voice">
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="voice_provider_name" placeholder="OpenAI Voice">
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" name="voice_provider_base_url" placeholder="https://api.example.com/v1">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="voice_provider_api_key" placeholder="Optional; empty keeps existing">
+                </label>
+                <label>
+                    STT Model
+                    <input type="text" name="voice_provider_stt_model" placeholder="whisper-1">
+                </label>
+                <label>
+                    TTS Model
+                    <input type="text" name="voice_provider_tts_model" placeholder="tts-1">
+                </label>
+                <label>
+                    Default Voice
+                    <input type="text" name="voice_provider_default_voice" placeholder="alloy">
+                </label>
+                <label>
+                    Default Format
+                    <select name="voice_provider_format">
+                        {% for format in ["mp3", "wav", "opus", "aac", "flac"] %}
+                            <option value="{{ format }}" {% if format == "mp3" %}selected{% endif %}>{{ format }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label class="checkbox-label">
+                    <input type="hidden" name="voice_provider_requires_api_key" value="0">
+                    <input type="checkbox" name="voice_provider_requires_api_key" checked>
+                    Requires API key
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="voice_provider_enabled" checked>
+                    Provider Enabled
+                </label>
+                <button type="submit">Save Voice Provider</button>
+            </form>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Base URL</th>
+                            <th>STT</th>
+                            <th>TTS</th>
+                            <th>Format</th>
+                            <th>Key</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for provider in settings.voice_providers %}
+                            <tr>
+                                <td>{{ provider.id }}</td>
+                                <td>{{ provider.base_url }}</td>
+                                <td>{{ provider.stt_model or "n/a" }}</td>
+                                <td>{{ provider.tts_model or "n/a" }}</td>
+                                <td>{{ provider.format }}</td>
+                                <td><code>{{ provider.api_key }}</code></td>
+                                <td>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="delete_voice_provider">
+                                        <input type="hidden" name="voice_provider_id" value="{{ provider.id }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="7">No custom Voice providers configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel" data-config-category="providers">
+            <h2>OpenAI-Compatible OCR Providers</h2>
+            <p class="muted">
+                OCR providers extract text from images or scanned PDFs. They are only used when OCR is enabled in Media Input.
+            </p>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="save_ocr_provider">
+                <label>
+                    Provider ID
+                    <input type="text" name="ocr_provider_id" placeholder="vision-ocr">
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="ocr_provider_name" placeholder="Vision OCR">
+                </label>
+                <label class="span-2">
+                    Base URL
+                    <input type="url" name="ocr_provider_base_url" placeholder="https://api.example.com/v1">
+                </label>
+                <label class="span-2">
+                    API Key
+                    <input type="password" name="ocr_provider_api_key" placeholder="Optional; empty keeps existing">
+                </label>
+                <label>
+                    API Key Env
+                    <input type="text" name="ocr_provider_api_key_env" placeholder="OCR_API_KEY">
+                </label>
+                <label class="checkbox-label">
+                    <input type="hidden" name="ocr_provider_requires_api_key" value="0">
+                    <input type="checkbox" name="ocr_provider_requires_api_key" checked>
+                    Requires API key
+                </label>
+                <label class="span-2">
+                    OCR Models
+                    <textarea name="ocr_models" rows="4" placeholder="ocr-model-a&#10;vision-model-b"></textarea>
+                </label>
+                <label>
+                    Default Model
+                    <input type="text" name="ocr_provider_default_model" placeholder="ocr-model-a">
+                </label>
+                <label>
+                    OCR Mode
+                    <select name="ocr_provider_mode">
+                        <option value="vision_chat" selected>Vision chat completions</option>
+                    </select>
+                </label>
+                <label>
+                    Output Format
+                    <input type="text" name="ocr_provider_output_format" value="text">
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_provider_input_types" value="image" checked>
+                    Accept images
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_provider_input_types" value="pdf" checked>
+                    Accept PDFs
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_provider_supports_layout">
+                    Supports layout
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_provider_supports_tables">
+                    Supports tables
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="ocr_provider_enabled" checked>
+                    Provider Enabled
+                </label>
+                <button type="submit">Save OCR Provider</button>
+            </form>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Base URL</th>
+                            <th>Models</th>
+                            <th>Mode</th>
+                            <th>Inputs</th>
+                            <th>Key</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for provider in settings.ocr_providers %}
+                            <tr>
+                                <td>{{ provider.id }}</td>
+                                <td>{{ provider.base_url }}</td>
+                                <td>{{ provider.models|join(", ") }}</td>
+                                <td>{{ provider.ocr_mode }}</td>
+                                <td>{{ provider.input_types|join(", ") }}</td>
+                                <td><code>{{ provider.api_key }}</code></td>
+                                <td>
+                                    <form method="post">
+                                        <input type="hidden" name="action" value="delete_ocr_provider">
+                                        <input type="hidden" name="ocr_provider_id" value="{{ provider.id }}">
+                                        <button type="submit" class="danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr><td colspan="7">No custom OCR providers configured.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    </div>
+    <script src="{{ url_for('static', filename='admin_config.js') }}"></script>
+</body>
+</html>

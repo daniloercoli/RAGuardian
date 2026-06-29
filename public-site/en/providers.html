@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/x-icon" href="../favicon.ico">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <title>Providers — Regolo, Mistral, Local — RAGuardian</title>
+  <meta name="description" content="Compare supported LLM providers: Regolo.ai for EU compliance, Mistral AI for European open-weight, or local models for maximum control.">
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="container">
+      <a href="index.html" class="logo"><img class="logo-icon" src="../favicon.png" alt="RAGuardian">RAGuardian</a>
+      <div class="nav">
+        <button class="nav-toggle" aria-label="Menu">☰</button>
+        <ul class="nav-links">
+          <li><a href="index.html">Home</a></li>
+          <li><a href="advantages.html">Advantages</a></li>
+          <li><a href="providers.html" class="active">Providers</a></li>
+          <li><a href="technology.html">Technology</a></li>
+          <li><a href="contact.html">Contact</a></li>
+        </ul>
+        <div class="lang-switch">
+          <a href="../it/provideri.html">IT</a>
+          <a href="providers.html" class="active">EN</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="provider-page-hero">
+    <div class="container">
+      <h1>The right provider for every scenario</h1>
+      <p>RAGuardian supports three LLM deployment modes. Choose based on your risk level, compliance requirements and budget — and switch later without effort.</p>
+    </div>
+  </div>
+
+  <section class="section">
+    <div class="container">
+      <!-- Regolo -->
+      <div class="provider-detail">
+        <h3>Regolo.ai <span class="badge green">RECOMMENDED</span></h3>
+        <p style="color:var(--gray-500);margin-bottom:16px;">European AI inference provider with zero data retention. Inference runs on EU infrastructure, with a strong focus on Italy, aligning with European data sovereignty requirements.</p>
+        <div class="provider-detail-grid">
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Data residency</strong> <span>EU infrastructure with a strong focus on Italy, reducing cross-border transfer concerns</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Zero retention</strong> <span>Prompts and outputs handled in-memory only, zero persistence</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>No training</strong> <span>Your data is not used for training or fine-tuning</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Compliance</strong> <span>Simpler, auditable story for European data sovereignty requirements</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Cloud embedding</strong> <span>Cloud embedding with Qwen3-Embedding-8B model</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Reranking</strong> <span>Remote reranking for more precise results</span></div>
+          </div>
+        </div>
+        <div class="provider-detail-grid" style="margin-top:16px;">
+          <div class="provider-detail-item">
+            <div>
+              <strong>Available models:</strong><br>
+              <code style="font-size:0.8rem;color:var(--gray-500);">gpt-oss-120b · gpt-oss-20b · Llama-3.3-70B · qwen3.5-122b · qwen3-coder-next · mistral-small-4-119b · more...</code>
+            </div>
+          </div>
+        </div>
+        <div class="highlight-box" style="margin-top:16px;">
+          <p><strong style="color:var(--green-dark);">Enterprise controls:</strong> Customer prompts and outputs are handled in memory by the inference layer and are not persisted. Regolo does not use customer request content to train or fine-tune shared models. Logging and monitoring are designed to avoid storing full payloads, while operational access is limited to what is necessary for reliability and support under clear contractual terms.</p>
+        </div>
+      </div>
+
+      <!-- Mistral -->
+      <div class="provider-detail">
+        <h3>Mistral AI</h3>
+        <p style="color:var(--gray-500);margin-bottom:16px;">Leading French open-weight AI provider. EU data residency, transparent data usage policies.</p>
+        <div class="provider-detail-grid">
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Infrastructure</strong> <span>Data centers in Europe</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--blue);">ℹ</span>
+            <div><strong>Data usage</strong> <span>Data stored in the EU. Does not use customer data for training, except under specific conditions (feedback, moderation, free tier).</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Open-weight</strong> <span>Open-source models of European excellence</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Compliance</strong> <span>Clear, auditable policies</span></div>
+          </div>
+        </div>
+        <div class="provider-detail-grid" style="margin-top:16px;">
+          <div class="provider-detail-item">
+            <div>
+              <strong>Available models:</strong><br>
+              <code style="font-size:0.8rem;color:var(--gray-500);">mistral-medium · mistral-large · mistral-small · mistral-tiny · codestral</code>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Local -->
+      <div class="provider-detail">
+        <h3>Local Model</h3>
+        <p style="color:var(--gray-500);margin-bottom:16px;">Run LLMs on your server. No data ever leaves your network. Maximum privacy, zero external dependencies.</p>
+        <div class="provider-detail-grid">
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Total privacy</strong> <span>Zero data transfer: data never leaves your datacenter</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Air-gapped mode</strong> <span>Works without internet connection</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>OpenAI-compatible</strong> <span>Connect Ollama, LM Studio, vLLM or any compatible endpoint</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--orange);">⚠</span>
+            <div><strong>Hardware</strong> <span>Requires GPU for a quality model. Local embedding needs ~2GB RAM minimum.</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Cost</strong> <span>No API costs: once configured, costs are only infrastructure</span></div>
+          </div>
+          <div class="provider-detail-item">
+            <span class="icon" style="color:var(--green);">✓</span>
+            <div><strong>Local embedding</strong> <span>sentence-transformers: no cloud dependency for embeddings</span></div>
+          </div>
+        </div>
+        <div class="highlight-box" style="margin-top:16px;">
+          <p><strong style="color:var(--green-dark);">Example config:</strong> Ollama with Qwen 3.5 122B on your server. Local embedding with sentence-transformers. No data ever leaves your network. Maximum compliance.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section comparison-section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Comparison</span>
+        <h2>Choose your scenario</h2>
+      </div>
+      <div class="comparison-table-wrapper">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th class="highlight-col th-header">Regolo.ai</th>
+              <th>Mistral AI</th>
+              <th>Local Model</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Data residency</strong></td>
+              <td class="highlight-col"><span class="check">✓</span> European</td>
+              <td><span class="check">✓</span> European</td>
+              <td><span class="check">✓</span> Your datacenter</td>
+            </tr>
+            <tr>
+              <td><strong>Zero data retention</strong></td>
+              <td class="highlight-col"><span class="check">✓</span> Yes, guaranteed</td>
+              <td><span class="check">✓</span> Yes, with conditions*</td>
+              <td><span class="check">✓</span> Zero transfer</td>
+            </tr>
+            <tr>
+              <td><strong>No training on data</strong></td>
+              <td class="highlight-col"><span class="check">✓</span> Guaranteed</td>
+              <td><span class="check">✓</span> Except specific cases</td>
+              <td><span class="check">✓</span> Impossible</td>
+            </tr>
+            <tr>
+              <td><strong>GDPR compliance</strong></td>
+              <td class="highlight-col"><span class="check">✓</span> By design</td>
+              <td><span class="check">✓</span> Compliant</td>
+              <td><span class="check">✓</span> Total</td>
+            </tr>
+            <tr>
+              <td><strong>Operating costs</strong></td>
+              <td class="highlight-col">Pay-per-use API</td>
+              <td>Pay-per-use API</td>
+              <td>GPU infrastructure</td>
+            </tr>
+            <tr>
+              <td><strong>Hardware required</strong></td>
+              <td class="highlight-col">None</td>
+              <td>None</td>
+              <td>GPU with 16GB+</td>
+            </tr>
+            <tr>
+              <td><strong>Air-gapped mode</strong></td>
+              <td class="highlight-col"><span class="cross">✗</span></td>
+              <td><span class="cross">✗</span></td>
+              <td><span class="check">✓</span> Yes</td>
+            </tr>
+            <tr>
+              <td><strong>Cloud embedding</strong></td>
+              <td class="highlight-col"><span class="check">✓</span> Qwen3-Embedding</td>
+              <td><span class="cross">✗</span></td>
+              <td><span class="check">✓</span> sentence-transformers</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="text-align:center;color:var(--gray-400);font-size:0.85rem;margin-top:16px;">* See <a href="https://legal.mistral.ai/" target="_blank" rel="noopener">Mistral AI Data Usage Policy</a> for full details.</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-label">Configuration</span>
+        <h2>Change provider in 30 seconds</h2>
+      </div>
+      <div class="use-case-grid">
+        <div class="use-case-card">
+          <h4>1. Open admin dashboard</h4>
+          <p>Go to /admin/config, select the provider and model for the instance. This acts as the central policy for all workspaces.</p>
+        </div>
+        <div class="use-case-card">
+          <h4>2. Set server credentials</h4>
+          <p>For Regolo: <code>REGOLO_API_KEY</code>. For Mistral: <code>MISTRAL_API_KEY</code>. For local: <code>OPENAI_BASE_URL=localhost:11434</code>. Individual user API keys remain separate.</p>
+        </div>
+        <div class="use-case-card">
+          <h4>3. Done</h4>
+          <p>Chats and connectors keep using each user's personal workspace. No data migration needed.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta-section">
+    <div class="container">
+      <h2>Need help choosing?</h2>
+      <p>Our team can help evaluate the best scenario for your use case, compliance requirements and budget.</p>
+      <div class="cta-buttons">
+        <a href="contact.html" class="btn btn-primary">Talk to us →</a>
+        <a href="technology.html" class="btn btn-dark-outline">Technical architecture</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <div class="logo"><img class="logo-icon" src="../favicon.png" alt="RAGuardian">RAGuardian</div>
+          <p>Self-hosted enterprise RAG with multi-provider, zero data retention and European compliance.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul class="footer-links">
+            <li><a href="advantages.html">Advantages</a></li>
+            <li><a href="providers.html">Providers</a></li>
+            <li><a href="technology.html">Technology</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Resources</h4>
+          <ul class="footer-links">
+            <li><a href="https://github.com/daniloercoli/RAGuardian" target="_blank" rel="noopener">GitHub</a></li>
+            <li><a href="contact.html">Contact</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Compliance</h4>
+          <ul class="footer-links">
+            <li><a href="privacy.html">Privacy &amp; GDPR</a></li>
+            <li><a href="providers.html">Data Residency</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Ercoli Consulting srl. MIT License.</span>
+        <span>Open Source · Self-hosted · Made in RSM & Italy</span>
+      </div>
+    </div>
+  </footer>
+  <script src="../js/main.js"></script>
+</body>
+</html>
