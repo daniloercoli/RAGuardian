@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Prompts - RAG Service</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .prompt-card {
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .prompt-card:hover {
+            border-color: #d1d5db;
+        }
+        .prompt-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .prompt-name {
+            font-weight: 600;
+            font-size: 1.05em;
+        }
+        .prompt-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: 500;
+        }
+        .badge-shared {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        .badge-personal {
+            background: #dcfce7;
+            color: #166534;
+        }
+        .prompt-content {
+            font-family: ui-monospace, monospace;
+            font-size: 0.88em;
+            white-space: pre-wrap;
+            word-break: break-word;
+            background: #f3f4f6;
+            padding: 10px;
+            border-radius: 6px;
+            max-height: 200px;
+            overflow: auto;
+            margin-bottom: 8px;
+        }
+        .prompt-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .prompt-actions .secondary {
+            font-size: 0.88em;
+            padding: 4px 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container wide">
+        <header class="page-header">
+            <h1>System Prompts</h1>
+            <nav class="top-nav">
+                <a href="{{ url_for('index') }}">Chat</a>
+                <a href="{{ url_for('admin_my_prompts') }}">My Prompts</a>
+                <a href="{{ url_for('admin_files') }}">RAG Files</a>
+                <a href="{{ url_for('admin_config') }}">Config</a>
+                <a href="{{ url_for('admin_prompts') }}">All Prompts</a>
+                <form method="post" action="{{ url_for('admin_logout') }}">
+                    <button type="submit" class="link-button">Logout</button>
+                </form>
+            </nav>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+
+        <section class="panel">
+            <h2>Create New Prompt</h2>
+            <p class="muted">
+                System prompts are prepended to every LLM call as instructions for how to behave.
+            </p>
+            <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-bottom:16px;">
+                <strong style="font-size:0.9em;">Template Variables</strong>
+                <p class="muted" style="margin:4px 0 0;">Use these placeholders in the content. They are replaced at runtime.</p>
+                <table style="border-collapse:collapse;margin-top:8px;width:100%;font-size:0.88em;">
+                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;UTENTE&#125;&#125;</code></td><td>User email</td></tr>
+                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;NOME_UTENTE&#125;&#125;</code></td><td>User display name</td></tr>
+                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;DATA_ODOIERNO&#125;&#125;</code></td><td>Today's date (YYYY-MM-DD)</td></tr>
+                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;ORA&#125;&#125;</code></td><td>Current time (HH:MM UTC)</td></tr>
+                </table>
+            </div>
+            <form id="createPromptForm" class="form-grid compact">
+                <label>
+                    Name
+                    <input type="text" id="promptName" required maxlength="500">
+                </label>
+                <label>
+                    Content
+                    <textarea id="promptContent" rows="6" required
+                        placeholder="Sei un assistente tecnico specializzato in documentazione.
+Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;. Rispondi a &#123;&#123;NOME_UTENTE&#125;&#125; in modo chiaro e conciso."></textarea>
+                </label>
+                <div>
+                    <button type="submit" class="primary">Create</button>
+                    <button type="button" class="secondary" id="previewBtn">Preview (with variables resolved)</button>
+                </div>
+            </form>
+            <div id="previewResult" class="prompt-content" style="display:none; margin-top:12px;"></div>
+        </section>
+
+        <section>
+            <h2>My Prompts</h2>
+            <div id="promptsList">
+                {% if prompts|length == 0 %}
+                    <p class="muted">No prompts yet. Create your first one above.</p>
+                {% endif %}
+            </div>
+        </section>
+
+        <section>
+            <h2>Available Shared Prompts</h2>
+            <p class="muted">These prompts are created by administrators. You can use them in the chat.</p>
+            {# Rendered via JS from the API #}
+            <div id="sharedPrompts"></div>
+        </section>
+    </div>
+
+    <script>
+    document.addEventListener("DOMContentLoaded", () => {
+        const listEl = document.getElementById("promptsList");
+        const sharedEl = document.getElementById("sharedPrompts");
+        const previewResult = document.getElementById("previewResult");
+
+        const csrfMeta = document.querySelector("meta[name='csrf-token']");
+        function csrfHeaders() {
+            return {};
+        }
+
+        // Fetch and render personal prompts
+        fetch("/api/prompts")
+            .then(r => r.json())
+            .then(data => {
+                listEl.innerHTML = "";
+                (data.personal || []).forEach(p => {
+                    listEl.appendChild(renderPrompt(p, "personal"));
+                });
+                if (!data.personal || data.personal.length === 0) {
+                    listEl.innerHTML = '<p class="muted">No personal prompts yet. Create one above.</p>';
+                }
+            });
+
+        // Fetch and render shared prompts
+        fetch("/api/prompts/shared")
+            .then(r => r.json())
+            .then(data => {
+                sharedEl.innerHTML = "";
+                (data.prompts || []).forEach(p => {
+                    sharedEl.appendChild(renderPrompt(p, "shared"));
+                });
+                if (data.prompts && data.prompts.length === 0) {
+                    sharedEl.innerHTML = '<p class="muted">No shared prompts available.</p>';
+                }
+            });
+
+        // Create
+        document.getElementById("createPromptForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const name = document.getElementById("promptName").value.trim();
+            const content = document.getElementById("promptContent").value.trim();
+            if (!name || !content) return;
+            try {
+                const res = await fetch("/api/prompts", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ name, content }),
+                });
+                if (!res.ok) {
+                    const d = await res.json();
+                    alert(d.error || "Error saving prompt");
+                    return;
+                }
+                document.getElementById("promptName").value = "";
+                document.getElementById("promptContent").value = "";
+                previewResult.style.display = "none";
+                location.reload();
+            } catch (err) {
+                alert("Network error");
+            }
+        });
+
+        // Preview
+        document.getElementById("previewBtn").addEventListener("click", async () => {
+            const content = document.getElementById("promptContent").value.trim();
+            if (!content) return;
+            try {
+                const res = await fetch("/api/prompts/resolve", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ content }),
+                });
+                const d = await res.json();
+                previewResult.textContent = d.resolved || content;
+                previewResult.style.display = "block";
+            } catch (err) {
+                previewResult.textContent = content;
+                previewResult.style.display = "block";
+            }
+        });
+
+        function renderPrompt(p, scope) {
+            const card = document.createElement("div");
+            card.className = "prompt-card";
+
+            const header = document.createElement("div");
+            header.className = "prompt-header";
+
+            const nameDiv = document.createElement("span");
+            nameDiv.className = "prompt-name";
+            nameDiv.textContent = p.name;
+
+            const badge = document.createElement("span");
+            badge.className = `prompt-badge badge-${scope}`;
+            badge.textContent = scope === "shared" ? "admin-shared" : "personal";
+
+            header.append(nameDiv, badge);
+
+            const content = document.createElement("div");
+            content.className = "prompt-content";
+            content.textContent = p.content;
+
+            const actions = document.createElement("div");
+            actions.className = "prompt-actions";
+
+            if (scope === "personal") {
+                const editBtn = document.createElement("button");
+                editBtn.type = "button";
+                editBtn.className = "secondary";
+                editBtn.textContent = "Edit";
+                editBtn.addEventListener("click", () => openEditPrompt(p));
+                actions.appendChild(editBtn);
+            }
+
+            const delBtn = document.createElement("button");
+            delBtn.type = "button";
+            delBtn.className = "secondary";
+            delBtn.textContent = scope === "shared" ? "Remove" : "Delete";
+            const url = scope === "shared"
+                ? `/api/prompts/shared/${p.id}`
+                : `/api/prompts/${p.id}`;
+            delBtn.addEventListener("click", () => deletePrompt(url, card));
+            actions.appendChild(delBtn);
+
+            card.append(header, content, actions);
+            return card;
+        }
+
+        function openEditPrompt(p) {
+            const name = prompt("Name:", p.name);
+            if (name === null) return;
+            const content = prompt("Content:", p.content);
+            if (content === null) return;
+            fetch(`/api/prompts/${p.id}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: name.trim(), content: content.trim() }),
+            }).then(async r => {
+                if (!r.ok) {
+                    const d = await r.json();
+                    alert(d.error || "Error updating");
+                } else {
+                    location.reload();
+                }
+            });
+        }
+
+        function deletePrompt(url, card) {
+            const owner = url.includes("/shared/");
+            if (!confirm(`Delete this prompt${owner ? " (admin only — requires admin credentials)" : ""}?`)) return;
+            fetch(url, { method: "DELETE" }).then(async r => {
+                if (!r.ok) {
+                    const d = await r.json();
+                    alert(d.error || "Error deleting");
+                } else {
+                    card.remove();
+                }
+            });
+        }
+    });
+    </script>
+</body>
+</html>

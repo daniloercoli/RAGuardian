@@ -176,6 +176,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["SETTINGS_FILE"] = Config.paths.settings_file
     app.config["FILE_INDEX"] = Config.paths.file_index
     app.config["USERS_FILE"] = os.getenv("RAG_USERS_FILE", "app/data/users.json")
+    app.config["PROMPTS_DIR"] = os.getenv("RAG_PROMPTS_DIR", "app/data")
     app.config["SECRETS_FILE"] = os.getenv("RAG_SECRETS_FILE", "app/data/secrets.json")
     app.config["API_KEY_USAGE_FILE"] = os.getenv("RAG_API_KEY_USAGE_FILE", "app/data/api_keys_usage.json")
     app.config["WORKSPACE_DATA_DIR"] = os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
@@ -834,6 +835,166 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             result = {"status": "error", "error": str(e)}
         return jsonify(result)
 
+    # ---------------------------------------------------------------
+    # System Prompt Routes
+    # ---------------------------------------------------------------
+
+    @app.route("/my-prompts", methods=["GET"])
+    @require_login
+    def admin_my_prompts():
+        return render_template("my_prompts.html")
+
+    @app.route("/admin/prompts", methods=["GET"])
+    @require_admin
+    def admin_prompts():
+        return render_template("admin_prompts.html")
+
+    # Personal prompts CRUD
+    @app.route("/api/prompts", methods=["GET"])
+    @require_login
+    def api_list_prompts():
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        user_id = user["id"] if user else ""
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        return jsonify({"personal": ps.list_user_prompts(user_id)})
+
+    @app.route("/api/prompts", methods=["POST"])
+    @require_login
+    def api_create_prompt():
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        user_id = user["id"] if user else ""
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify(error="empty body"), 400
+        name = (data.get("name") or "").strip()
+        content = (data.get("content") or "").strip()
+        if not name or not content:
+            return jsonify(error="name and content required"), 400
+        try:
+            ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+            prompt = ps.create_user_prompt(user_id, name, content)
+            return jsonify(prompt), 201
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    @app.route("/api/prompts/<prompt_id>", methods=["PUT"])
+    @require_login
+    def api_update_prompt(prompt_id):
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        user_id = user["id"] if user else ""
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        content = data.get("content")
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        updated = ps.update_user_prompt(user_id, prompt_id, name=name, content=content)
+        if updated:
+            return jsonify(updated)
+        return jsonify(error="prompt not found"), 404
+
+    @app.route("/api/prompts/<prompt_id>", methods=["DELETE"])
+    @require_login
+    def api_delete_prompt(prompt_id):
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        user_id = user["id"] if user else ""
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        ok = ps.delete_user_prompt(user_id, prompt_id)
+        if ok:
+            return jsonify(ok=True)
+        return jsonify(error="prompt not found"), 404
+
+    # Shared (admin) prompts CRUD
+    @app.route("/api/prompts/shared", methods=["GET"])
+    @require_login
+    def api_list_shared_prompts():
+        from utils.prompt_store import PromptStore
+
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        user = current_user()
+        if not user or user.get("role") != "admin":
+            return jsonify({"prompts": ps.list_shared()})
+        all_prompts = ps.all_shared()
+        active = [p for p in all_prompts if p.get("is_active", True)]
+        inactive = [p for p in all_prompts if not p.get("is_active", True)]
+        return jsonify({"prompts": active + inactive})
+
+    @app.route("/api/prompts/shared", methods=["POST"])
+    @require_admin
+    def api_create_shared_prompt():
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        user_id = user["id"] if user else ""
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify(error="empty body"), 400
+        name = (data.get("name") or "").strip()
+        content = (data.get("content") or "").strip()
+        if not name or not content:
+            return jsonify(error="name and content required"), 400
+        try:
+            ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+            prompt = ps.create_shared(name, content, created_by=user_id)
+            return jsonify(prompt), 201
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    @app.route("/api/prompts/shared/<prompt_id>", methods=["PUT"])
+    @require_admin
+    def api_update_shared_prompt(prompt_id):
+        from utils.prompt_store import PromptStore
+
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        content = data.get("content")
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        updated = ps.update_shared(prompt_id, name=name, content=content)
+        if updated:
+            return jsonify(updated)
+        return jsonify(error="prompt not found"), 404
+
+    @app.route("/api/prompts/shared/<prompt_id>/toggle", methods=["POST"])
+    @require_admin
+    def api_toggle_shared_prompt(prompt_id):
+        from utils.prompt_store import PromptStore
+
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        result = ps.toggle_shared(prompt_id)
+        if result:
+            return jsonify(result)
+        return jsonify(error="prompt not found"), 404
+
+    @app.route("/api/prompts/shared/<prompt_id>", methods=["DELETE"])
+    @require_admin
+    def api_delete_shared_prompt(prompt_id):
+        from utils.prompt_store import PromptStore
+
+        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+        ok = ps.delete_shared(prompt_id)
+        if ok:
+            return jsonify(ok=True)
+        return jsonify(error="prompt not found"), 404
+
+    # Template resolution preview
+    @app.route("/api/prompts/resolve", methods=["POST"])
+    @require_login
+    def api_resolve_prompt():
+        from utils.prompt_store import PromptStore
+
+        user = current_user()
+        data = request.get_json(silent=True)
+        if not data or not data.get("content"):
+            return jsonify(error="content required"), 400
+        resolved = PromptStore.resolve_template(data["content"], user)
+        return jsonify(resolved=resolved)
+
     @app.route("/api/v1/health", methods=["GET"])
     @require_api_scope("query")
     def api_health():
@@ -950,6 +1111,7 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
         config = _workspace_config(current_app)
         raw_conversation_id = payload.get("conversation_id")
         conversation_id = _scoped_conversation_id(raw_conversation_id)
+        custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
         result = query_rag(
             payload["query"],
             model=payload.get("model"),
@@ -964,6 +1126,7 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             client_context=payload.get("client_context"),
             response_language=payload.get("response_language"),
             public=public,
+            custom_system_prompt=custom_system,
         )
         if isinstance(result, dict) and raw_conversation_id:
             result["conversation_id"] = raw_conversation_id
@@ -989,6 +1152,7 @@ def run_rag_query_events(payload: dict, public: bool = False):
     config = _workspace_config(current_app)
     raw_conversation_id = payload.get("conversation_id")
     conversation_id = _scoped_conversation_id(raw_conversation_id)
+    custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
     events = query_rag_stream_events(
         payload["query"],
         model=payload.get("model"),
@@ -1002,6 +1166,7 @@ def run_rag_query_events(payload: dict, public: bool = False):
         client_context=payload.get("client_context"),
         response_language=payload.get("response_language"),
         public=public,
+        custom_system_prompt=custom_system,
     )
 
     def encode_events():
@@ -1055,6 +1220,37 @@ def _scoped_conversation_id(conversation_id: str | None) -> str | None:
         return None
     config = _workspace_config(current_app)
     return f"{config['WORKSPACE_ID']}:{conversation_id}"
+
+
+def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
+    """Resolve a system_prompt_id into its runtime template content.
+
+    Looks up the prompt by ID (user personal first, then shared),
+    resolves template variables, and returns the final text.
+    Returns None when no prompt is selected or the ID is invalid.
+    """
+    if not system_prompt_id:
+        return None
+    system_prompt_id = str(system_prompt_id).strip()
+    if not system_prompt_id:
+        return None
+    user = current_user()
+    if not user:
+        api_key = getattr(request, "api_key", None)
+        api_user_id = api_key.get("user_id") if api_key else None
+        if api_user_id:
+            from utils.user_store import UserStore
+
+            user = UserStore(current_app.config.get("USERS_FILE")).get(api_user_id)
+    if not user:
+        return None
+    from utils.prompt_store import PromptStore
+
+    ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
+    prompt = ps.resolve(user["id"], system_prompt_id)
+    if not prompt:
+        return None
+    return PromptStore.resolve_template(prompt["content"], user)
 
 
 def _process_upload(app: Flask, config: dict | None = None) -> dict:
@@ -2409,6 +2605,7 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     conversation_id = validate_conversation_id(data.get("conversation_id"), required=False)
     client_context = _validate_client_context(data.get("client_context"))
     response_language = _validate_response_language(data.get("response_language"))
+    system_prompt_id = data.get("system_prompt_id") or None
     _validate_model_selection(model, provider, config=_workspace_config(current_app))
 
     return {
@@ -2422,6 +2619,7 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "stream_format": stream_format,
         "temperature": temperature,
         "k": k,
+        "system_prompt_id": system_prompt_id,
     }
 
 

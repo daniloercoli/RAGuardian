@@ -15,10 +15,12 @@
         <header class="page-header">
             <h1>RAGuardian | Enterprise RAG Service</h1>
             <nav class="top-nav">
+                <a href="{{ url_for('admin_my_prompts') }}">My Prompts</a>
                 <a href="{{ url_for('admin_files') }}">Documents</a>
                 <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
                 {% if current_user and current_user.role == "admin" %}
                     <a href="{{ url_for('admin_config') }}">Configuration</a>
+                    <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
                 {% endif %}
                 <form method="post" action="{{ url_for('admin_logout') }}">
                     <button type="submit" class="link-button">Logout</button>
@@ -58,6 +60,13 @@
                 <label for="modelSelect">Model</label>
                 <select id="modelSelect">
                     <option value="">Loading models...</option>
+                </select>
+            </div>
+
+            <div class="model-selector">
+                <label for="promptSelect">System Prompt</label>
+                <select id="promptSelect">
+                    <option value="">No system prompt</option>
                 </select>
             </div>
 

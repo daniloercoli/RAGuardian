@@ -126,6 +126,7 @@ See [Deployment](docs/DEPLOYMENT.md) for Redis, reverse proxy, logging, and prod
 - [API Reference](docs/API.md)
 - [OpenAPI Schema](docs/openapi.yaml)
 - [WordPress Plugin](integrations/wordpress/rag-client/README.md)
+- [Public Repository Snapshot Workflow](docs/PUBLICATION.md)
 
 ## Repository Map
 

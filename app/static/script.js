@@ -12,6 +12,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const userInput = document.getElementById("userInput");
     const sendButton = document.getElementById("sendButton");
     const modelSelect = document.getElementById("modelSelect");
+    const promptSelect = document.getElementById("promptSelect");
     const chatStatus = document.getElementById("chatStatus");
     const clearChatButton = document.getElementById("clearChatButton");
     const streamStatus = document.getElementById("streamStatus");
@@ -29,6 +30,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
+    const promptStorageKey = "ragSystemPromptId";
+    let systemPromptId = loadSystemPromptId();
+
     let healthState = null;
     let busy = false;
     const conversationStorageKey = "ragConversationId";
@@ -43,6 +47,13 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     userInput.addEventListener("input", resizeInput);
     modelSelect.addEventListener("change", () => updateChatStatus());
+    if (promptSelect) {
+        promptSelect.addEventListener("change", () => {
+            const selValue = promptSelect.value;
+            systemPromptId = selValue || "";
+            persistSystemPromptId(systemPromptId);
+        });
+    }
     if (clearChatButton) {
         clearChatButton.addEventListener("click", clearChat);
     }
@@ -258,7 +269,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 provider: selected ? selected.dataset.provider : undefined,
                 conversation_id: conversationId,
                 stream: true,
-                stream_format: "ndjson"
+                stream_format: "ndjson",
+                system_prompt_id: systemPromptId || undefined
             };
 
             const response = await fetch("/ask", {
@@ -702,7 +714,79 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    async function loadPrompts() {
+        if (!promptSelect) return;
+        try {
+            const response = await fetch("/api/prompts");
+            const data = await response.json();
+            promptSelect.innerHTML = "<option value=\"\">No system prompt</option>";
+            const personal = data.personal || [];
+            const personalGroup = document.createElement("optgroup");
+            personalGroup.label = "My Prompts";
+            personal.forEach(p => {
+                const opt = new Option(`[personal] ${p.name}`, p.id);
+                personalGroup.appendChild(opt);
+            });
+            if (personal.length > 0) {
+                promptSelect.appendChild(personalGroup);
+            }
+
+            const sharedResponse = await fetch("/api/prompts/shared");
+            const sharedData = await sharedResponse.json();
+            const shared = sharedData.prompts || [];
+            const sharedGroup = document.createElement("optgroup");
+            sharedGroup.label = "Shared (admin)";
+            shared.forEach(p => {
+                const opt = new Option(`[shared] ${p.name}`, p.id);
+                sharedGroup.appendChild(opt);
+            });
+            if (shared.length > 0) {
+                promptSelect.appendChild(sharedGroup);
+            }
+
+            if (personal.length === 0 && shared.length === 0) {
+                const opt = document.createElement("option");
+                opt.value = "";
+                opt.disabled = true;
+                opt.textContent = "No prompts available";
+                promptSelect.appendChild(opt);
+            }
+
+            const saved = loadSystemPromptId();
+            if (saved) {
+                for (const opt of promptSelect.options) {
+                    if (opt.value === saved) {
+                        opt.selected = true;
+                        systemPromptId = saved;
+                        break;
+                    }
+                }
+            }
+        } catch (error) {
+            console.warn("Prompts not available:", error);
+        }
+    }
+
+    function loadSystemPromptId() {
+        try {
+            return window.sessionStorage
+                ? (sessionStorage.getItem(promptStorageKey) || "")
+                : "";
+        } catch (e) {
+            return "";
+        }
+    }
+
+    function persistSystemPromptId(value) {
+        try {
+            if (window.sessionStorage) {
+                sessionStorage.setItem(promptStorageKey, value);
+            }
+        } catch (e) {/* noop */}
+    }
+
     loadModels();
+    loadPrompts();
     loadHealth();
     resizeInput();
 });

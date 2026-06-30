@@ -38,6 +38,7 @@ def query_rag(
     client_context: Optional[dict] = None,
     response_language: Optional[str] = None,
     public: bool = False,
+    custom_system_prompt: Optional[str] = None,
 ):
     if stream:
         return query_rag_stream(
@@ -53,6 +54,7 @@ def query_rag(
             client_context=client_context,
             response_language=response_language,
             public=public,
+            custom_system_prompt=custom_system_prompt,
         )
     return query_rag_non_stream(
         query,
@@ -67,6 +69,7 @@ def query_rag(
         client_context=client_context,
         response_language=response_language,
         public=public,
+        custom_system_prompt=custom_system_prompt,
     )
 
 
@@ -83,6 +86,7 @@ def query_rag_non_stream(
     client_context: Optional[dict] = None,
     response_language: Optional[str] = None,
     public: bool = False,
+    custom_system_prompt: Optional[str] = None,
 ) -> Dict[str, object]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -110,6 +114,7 @@ def query_rag_non_stream(
             conversation_context=conversation_context,
             client_context=client_context,
             response_language=effective_response_language,
+            custom_system_prompt=custom_system_prompt,
         )
     )
     _append_conversation_turn(
@@ -153,6 +158,7 @@ def query_rag_stream(
     client_context: Optional[dict] = None,
     response_language: Optional[str] = None,
     public: bool = False,
+    custom_system_prompt: Optional[str] = None,
 ) -> Generator[str, None, None]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -183,6 +189,7 @@ def query_rag_stream(
         conversation_context=conversation_context,
         client_context=client_context,
         response_language=effective_response_language,
+        custom_system_prompt=custom_system_prompt,
     ):
         answer_parts.append(chunk)
         yield chunk
@@ -211,6 +218,7 @@ def query_rag_stream_events(
     client_context: Optional[dict] = None,
     response_language: Optional[str] = None,
     public: bool = False,
+    custom_system_prompt: Optional[str] = None,
 ) -> Generator[Dict[str, object], None, None]:
     try:
         settings = _load_settings(settings_path)
@@ -258,6 +266,7 @@ def query_rag_stream_events(
             conversation_context=conversation_context,
             client_context=client_context,
             response_language=effective_response_language,
+            custom_system_prompt=custom_system_prompt,
         ):
             if not chunk:
                 continue
@@ -354,6 +363,7 @@ def generate_response(
     conversation_context: str = "",
     client_context: Optional[dict] = None,
     response_language: Optional[str] = None,
+    custom_system_prompt: Optional[str] = None,
 ):
     settings = settings or _load_settings()
     rag = settings["rag"]
@@ -388,6 +398,9 @@ def generate_response(
 - Usa il contesto conversazionale solo per capire riferimenti, preferenze e follow-up
 - Ammetti se il contesto � insufficiente
 - Mantieni le risposte concise ma complete"""
+
+    if custom_system_prompt:
+        system = f"{custom_system_prompt}\n\n{system}"
 
     conversation_block = conversation_context.strip() or "Nessun contesto conversazionale precedente."
     client_block = _client_context_block(client_context)

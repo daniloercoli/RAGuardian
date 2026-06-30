@@ -4,6 +4,7 @@ import json
 import sys
 import types
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ import pytest
 from app import create_app
 from app.utils.conversation_memory import get_conversation_store, reset_conversation_store
 from app.utils.file_index import FileIndex
+from app.utils.prompt_store import PromptStore
 from app.utils.settings_store import SettingsStore
 from app.utils.user_store import UserStore
 
@@ -30,6 +32,7 @@ def flask_app(tmp_path):
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
             "USERS_FILE": str(tmp_path / "users.json"),
+            "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
             "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace_uploads"),
@@ -63,6 +66,10 @@ def client(flask_app):
 
 def _login(client):
     return client.post("/admin/login", data={"password": "admin"})
+
+
+def _login_email(client, email, password="admin"):
+    return client.post("/admin/login", data={"email": email, "password": password})
 
 
 def _workspace_context(flask_app):
@@ -205,6 +212,84 @@ def test_legacy_ask_uses_shared_query_handler(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json()["answer"] == "Risposta mock"
+
+
+def test_prompt_templates_render_literal_variables(client):
+    _login_email(client, "admin@example.local")
+
+    my_response = client.get("/my-prompts")
+    admin_response = client.get("/admin/prompts")
+
+    assert my_response.status_code == 200
+    assert admin_response.status_code == 200
+    for response in (my_response, admin_response):
+        rendered = unescape(response.get_data(as_text=True))
+        assert "{{UTENTE}}" in rendered
+        assert "{{NOME_UTENTE}}" in rendered
+        assert "{{DATA_ODOIERNO}}" in rendered
+        assert "{{ORA}}" in rendered
+
+
+def test_shared_prompt_list_hides_inactive_from_non_admin(client, flask_app):
+    store = UserStore(flask_app.config["USERS_FILE"])
+    store.create_user(
+        email="user@example.local",
+        password="secret",
+        display_name="User",
+        role="user",
+        enabled=True,
+    )
+    admin = store.list()[0]
+    prompts = PromptStore(flask_app.config["PROMPTS_DIR"])
+    active = prompts.create_shared("Active", "Visible", created_by=admin["id"])
+    inactive = prompts.create_shared("Inactive", "Hidden", created_by=admin["id"])
+    prompts.deactivate_shared(inactive["id"])
+
+    _login_email(client, "user@example.local", "secret")
+    user_response = client.get("/api/prompts/shared")
+    _login_email(client, "admin@example.local")
+    admin_response = client.get("/api/prompts/shared")
+
+    assert user_response.status_code == 200
+    assert [p["id"] for p in user_response.get_json()["prompts"]] == [active["id"]]
+    assert admin_response.status_code == 200
+    assert [p["id"] for p in admin_response.get_json()["prompts"]] == [
+        active["id"],
+        inactive["id"],
+    ]
+
+
+def test_api_key_query_applies_user_system_prompt(client, flask_app, monkeypatch):
+    app_module = importlib.import_module("app.app")
+    rag_engine = importlib.import_module("utils.rag_engine")
+    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    prompt = PromptStore(flask_app.config["PROMPTS_DIR"]).create_user_prompt(
+        user["id"],
+        "API persona",
+        "Rispondi a {{NOME_UTENTE}}.",
+    )
+    captured = {}
+
+    def fake_query_rag(*args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "answer": "ok",
+            "context": [],
+            "sources": [],
+            "usage": None,
+        }
+
+    monkeypatch.setattr(app_module, "_validate_model_selection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query_rag)
+
+    response = client.post(
+        "/api/v1/query",
+        headers={"X-API-Key": "test-api-key"},
+        json={"query": "Domanda valida?", "system_prompt_id": prompt["id"]},
+    )
+
+    assert response.status_code == 200
+    assert captured["custom_system_prompt"] == "Rispondi a Admin."
 
 
 def test_legacy_ask_passes_conversation_id(client, monkeypatch):

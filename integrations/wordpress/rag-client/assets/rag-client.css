@@ -196,6 +196,11 @@
     font-weight: 500;
 }
 
+.ec-rag-download {
+    font-size: 10px;
+    letter-spacing: 0.02em;
+}
+
 .ec-rag-messages {
     display: flex;
     flex: 1;
