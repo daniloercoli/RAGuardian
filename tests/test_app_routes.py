@@ -1,6 +1,7 @@
 import importlib
 import io
 import json
+import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -228,6 +229,47 @@ def test_prompt_templates_render_literal_variables(client):
         assert "{{NOME_UTENTE}}" in rendered
         assert "{{DATA_ODOIERNO}}" in rendered
         assert "{{ORA}}" in rendered
+
+
+def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
+    UserStore(flask_app.config["USERS_FILE"]).create_user(
+        email="user@example.local",
+        password="secret",
+        display_name="User",
+        role="user",
+        enabled=True,
+    )
+
+    _login_email(client, "user@example.local", "secret")
+    user_prompts = client.get("/my-prompts").get_data(as_text=True)
+    user_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", user_prompts, re.S).group(1)
+    user_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', user_nav)
+    assert 'href="/my-prompts"' in user_nav
+    assert "System Prompts" in user_nav
+    assert 'href="/admin/prompts"' not in user_nav
+    assert 'href="/admin/config"' not in user_nav
+    assert user_links[-1] == ("/my-prompts", "System Prompts")
+
+    _login_email(client, "admin@example.local")
+    admin_home = client.get("/").get_data(as_text=True)
+    admin_files = client.get("/admin/files").get_data(as_text=True)
+    admin_home_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", admin_home, re.S).group(1)
+    admin_files_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", admin_files, re.S).group(1)
+    admin_home_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
+    admin_files_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
+    assert 'href="/my-prompts"' in admin_home
+    assert "System Prompts" in admin_home
+    assert 'href="/admin/prompts"' in admin_home
+    assert 'href="/my-prompts"' in admin_files
+    assert 'href="/admin/prompts"' in admin_files
+    assert admin_home_links[-2:] == [
+        ("/my-prompts", "System Prompts"),
+        ("/admin/prompts", "Shared Prompts"),
+    ]
+    assert admin_files_links[-2:] == [
+        ("/my-prompts", "System Prompts"),
+        ("/admin/prompts", "Shared Prompts"),
+    ]
 
 
 def test_shared_prompt_list_hides_inactive_from_non_admin(client, flask_app):

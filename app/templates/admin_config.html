@@ -19,6 +19,8 @@
                 <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
                 <a href="{{ url_for('admin_users') }}">Users</a>
                 <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
+                <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
+                <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
                 <form method="post" action="{{ url_for('admin_logout') }}">
                     <button type="submit" class="link-button">Logout</button>
                 </form>

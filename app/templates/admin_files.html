@@ -20,6 +20,10 @@
                     <a href="{{ url_for('admin_config') }}">Config</a>
                     <a href="{{ url_for('admin_users') }}">Users</a>
                     <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
+                    <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
+                {% else %}
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
                 {% endif %}
                 <form method="post" action="{{ url_for('admin_logout') }}">
                     <button type="submit" class="link-button">Logout</button>

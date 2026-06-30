@@ -15,12 +15,14 @@
         <header class="page-header">
             <h1>RAGuardian | Enterprise RAG Service</h1>
             <nav class="top-nav">
-                <a href="{{ url_for('admin_my_prompts') }}">My Prompts</a>
                 <a href="{{ url_for('admin_files') }}">Documents</a>
                 <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
                 {% if current_user and current_user.role == "admin" %}
                     <a href="{{ url_for('admin_config') }}">Configuration</a>
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
                     <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
+                {% else %}
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
                 {% endif %}
                 <form method="post" action="{{ url_for('admin_logout') }}">
                     <button type="submit" class="link-button">Logout</button>

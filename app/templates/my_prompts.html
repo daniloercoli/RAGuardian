@@ -72,10 +72,15 @@
             <h1>System Prompts</h1>
             <nav class="top-nav">
                 <a href="{{ url_for('index') }}">Chat</a>
-                <a href="{{ url_for('admin_my_prompts') }}">My Prompts</a>
                 <a href="{{ url_for('admin_files') }}">RAG Files</a>
-                <a href="{{ url_for('admin_config') }}">Config</a>
-                <a href="{{ url_for('admin_prompts') }}">All Prompts</a>
+                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
+                {% if current_user and current_user.role == "admin" %}
+                    <a href="{{ url_for('admin_config') }}">Config</a>
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
+                    <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
+                {% else %}
+                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
+                {% endif %}
                 <form method="post" action="{{ url_for('admin_logout') }}">
                     <button type="submit" class="link-button">Logout</button>
                 </form>
@@ -123,7 +128,7 @@ Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;. Rispondi a &#123;&#123;NOME_UT
         </section>
 
         <section>
-            <h2>My Prompts</h2>
+            <h2>Personal System Prompts</h2>
             <div id="promptsList">
                 {% if prompts|length == 0 %}
                     <p class="muted">No prompts yet. Create your first one above.</p>
