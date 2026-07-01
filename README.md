@@ -119,6 +119,7 @@ See [Deployment](docs/DEPLOYMENT.md) for Redis, reverse proxy, logging, and prod
 
 ## Documentation
 
+- [Start Here: practical guide from zero](docs/START_HERE.md)
 - [Setup](docs/SETUP.md)
 - [Multi-User Architecture](docs/MULTI_USER.md)
 - [Data Ingestion Plugins](docs/INGESTION.md)

@@ -1,0 +1,27 @@
+version: '3.8'
+services:
+  interpreter:
+    build:
+      context: .
+      dockerfile: Dockerfile.code-interpreter
+    image: code-interpreter:latest
+    container_name: code-interpreter
+    network_mode: none
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    volumes:
+      - ./app/uploads/chat_files:/data:ro
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512MiB
+          cpus: '1.0'
+    logging:
+      driver: json-file
+      options:
+        max-size: '1m'
+        max-file: '1'

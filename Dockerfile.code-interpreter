@@ -1,0 +1,46 @@
+# Code Interpreter Container - Transient execution environment
+# Based on minimal Python with data science packages
+FROM python:3.11-slim
+
+# Fixed UID for container user (matches the user param in code_interpreter.py)
+RUN groupadd -r -g 1000 appuser && useradd -r -u 1000 -g appuser appuser
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python science stack
+RUN pip install --no-cache-dir \
+    pandas==2.2.3 \
+    numpy==1.26.4 \
+    matplotlib==3.9.2 \
+    scipy==1.14.1 \
+    seaborn==0.13.2 \
+    openpyxl==3.1.5
+
+# Copy execution wrapper
+COPY app/utils/subprocess_wrapper.py /app/subprocess_wrapper.py
+
+# Set working directory
+WORKDIR /app
+
+# Create isolated execution directories
+RUN mkdir -p /app/run /app/output /tmp \
+    && chown -R appuser:appuser /app /tmp \
+    && chmod -R 0755 /app/run /app/output
+
+# Set non-root user
+USER appuser
+
+# Environment
+ENV PYTHONWARNINGS="ignore"
+ENV MPLBACKEND="Agg"
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD ["python", "-c", "exit(0)"]
+
+# Default command (override with execution)
+CMD ["tail", "-f", "/dev/null"]

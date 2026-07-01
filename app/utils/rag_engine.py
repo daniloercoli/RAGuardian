@@ -39,6 +39,7 @@ def query_rag(
     response_language: Optional[str] = None,
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
+    extra_context_docs: Optional[list] = None,
 ):
     if stream:
         return query_rag_stream(
@@ -55,6 +56,7 @@ def query_rag(
             response_language=response_language,
             public=public,
             custom_system_prompt=custom_system_prompt,
+            extra_context_docs=extra_context_docs,
         )
     return query_rag_non_stream(
         query,
@@ -70,6 +72,7 @@ def query_rag(
         response_language=response_language,
         public=public,
         custom_system_prompt=custom_system_prompt,
+        extra_context_docs=extra_context_docs,
     )
 
 
@@ -87,6 +90,7 @@ def query_rag_non_stream(
     response_language: Optional[str] = None,
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
+    extra_context_docs: Optional[list] = None,
 ) -> Dict[str, object]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -103,6 +107,7 @@ def query_rag_non_stream(
     conversation_context = _conversation_context(conversation_id)
     retrieval_query = _retrieval_query(query, conversation_id)
     context_docs = _get_context(retrieval_query, effective_k, selected_model, settings, collection_name=collection_name)
+    context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer = "".join(
         generate_response(
             query,
@@ -145,6 +150,54 @@ def query_rag_non_stream(
     return result
 
 
+def prepare_rag_context(
+    query: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    temperature: Optional[float] = None,
+    k: Optional[int] = None,
+    settings_path: Optional[str] = None,
+    collection_name: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    response_language: Optional[str] = None,
+    use_cache: bool = True,
+    extra_context_docs: Optional[list] = None,
+) -> Dict[str, object]:
+    """Resolve model settings and retrieve context without generating an answer."""
+    settings = _load_settings(settings_path)
+    rag = settings["rag"]
+    effective_response_language = _normalize_response_language(response_language)
+    provider_id, selected_model, provider_config = ProviderFactory.resolve(
+        model=model,
+        provider=provider,
+        settings=settings,
+    )
+    effective_k = k or rag["query_k"]
+    effective_temperature = temperature if temperature is not None else rag["temperature"]
+    conversation_context = _conversation_context(conversation_id)
+    retrieval_query = _retrieval_query(query, conversation_id)
+    context_docs = _get_context(
+        retrieval_query,
+        effective_k,
+        selected_model,
+        settings,
+        use_cache=use_cache,
+        collection_name=collection_name,
+    )
+    context_docs = _merge_context_docs(context_docs, extra_context_docs)
+    return {
+        "settings": settings,
+        "provider": provider_id,
+        "model": selected_model,
+        "provider_config": provider_config,
+        "temperature": effective_temperature,
+        "k": effective_k,
+        "response_language": effective_response_language,
+        "conversation_context": conversation_context,
+        "context_docs": context_docs,
+    }
+
+
 def query_rag_stream(
     query: str,
     model: Optional[str] = None,
@@ -159,6 +212,7 @@ def query_rag_stream(
     response_language: Optional[str] = None,
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
+    extra_context_docs: Optional[list] = None,
 ) -> Generator[str, None, None]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -177,6 +231,7 @@ def query_rag_stream(
         use_cache=False,
         collection_name=collection_name,
     )
+    context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer_parts = []
     for chunk in generate_response(
         query,
@@ -219,6 +274,7 @@ def query_rag_stream_events(
     response_language: Optional[str] = None,
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
+    extra_context_docs: Optional[list] = None,
 ) -> Generator[Dict[str, object], None, None]:
     try:
         settings = _load_settings(settings_path)
@@ -242,6 +298,7 @@ def query_rag_stream_events(
             use_cache=False,
             collection_name=collection_name,
         )
+        context_docs = _merge_context_docs(context_docs, extra_context_docs)
         provider_name = provider_config.get("name", provider_id)
         meta_event = {
             "type": "meta",
@@ -659,6 +716,29 @@ def _get_context(
     if use_cache and settings["rag"]["enable_cache"]:
         _cache.set(cache_query, context_docs, k, model)
     return context_docs
+
+
+def _merge_context_docs(context_docs, extra_context_docs: Optional[list] = None) -> list:
+    merged = list(context_docs or [])
+    seen = {
+        (
+            str(getattr(doc, "metadata", {}).get("source") or ""),
+            str(getattr(doc, "metadata", {}).get("chunk_id") or ""),
+            str(getattr(doc, "page_content", "") or "")[:120],
+        )
+        for doc in merged
+    }
+    for doc in extra_context_docs or []:
+        key = (
+            str(getattr(doc, "metadata", {}).get("source") or ""),
+            str(getattr(doc, "metadata", {}).get("chunk_id") or ""),
+            str(getattr(doc, "page_content", "") or "")[:120],
+        )
+        if key in seen:
+            continue
+        merged.append(doc)
+        seen.add(key)
+    return merged
 
 
 def _serialize_context(

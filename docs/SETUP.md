@@ -2,6 +2,10 @@
 
 This guide covers a clean local setup of RAGuardian.
 
+For a step-by-step operational guide that also covers Redis, Docker, chat attachments,
+code interpreter mode, API usage, and common troubleshooting, see
+[Start Here](START_HERE.md).
+
 ## Requirements
 
 - Python 3.11 or newer.

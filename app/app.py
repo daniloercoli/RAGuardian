@@ -163,6 +163,11 @@ _OCR_INDEX_PROFILE_KEYS = {
 }
 DOCUMENT_UPLOAD_EXTENSIONS = {"pdf", "txt", "md", "csv"}
 AUDIO_UPLOAD_EXTENSIONS = {"mp3", "wav", "m4a", "webm", "ogg", "flac"}
+CHAT_DATA_UPLOAD_EXTENSIONS = {"csv", "xlsx", "xls", "json", "parquet", "tsv", "zip"}
+CHAT_DISPLAY_UPLOAD_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "txt", "md"}
+CHAT_UPLOAD_EXTENSIONS = CHAT_DATA_UPLOAD_EXTENSIONS | CHAT_DISPLAY_UPLOAD_EXTENSIONS
+CHAT_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+CODE_IMAGE_PATTERN = re.compile(r"^[0-9a-f]{12}_[A-Za-z0-9._-]+\.png$")
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -385,6 +390,14 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
 
         try:
             payload = _parse_query_payload(require_json=True)
+            # Code interpreter mode
+            if payload.get("use_code_interpreter") and payload.get("attached_files"):
+                if payload["stream"] and payload["stream_format"] == "ndjson":
+                    return Response(
+                        run_code_interpreter_query_events(payload),
+                        mimetype="application/x-ndjson",
+                    )
+                return jsonify(run_code_interpreter_query(payload))
             if payload["stream"]:
                 if payload["stream_format"] == "ndjson":
                     return Response(
@@ -836,6 +849,65 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         return jsonify(result)
 
     # ---------------------------------------------------------------
+    # Code Interpreter Routes
+    # ---------------------------------------------------------------
+
+    @app.route("/upload-to-chat", methods=["POST"])
+    @require_login
+    def upload_to_chat():
+        """Upload file for code interpreter (no RAG indexing)."""
+        try:
+            if not _code_interpreter_enabled():
+                return jsonify(error="Code interpreter disabilitato", status="disabled"), 403
+            file = request.files.get("file")
+            if not file:
+                return jsonify(error="Nessun file"), 400
+            from utils.validators import validate_file
+            config = _workspace_config(app)
+            _cleanup_code_interpreter_files(config)
+            max_mb = int(os.getenv("CODE_INTERPRETER_MAX_FILE_MB", "50"))
+            validated = validate_file(
+                file=file, field_name="file",
+                allowed_extensions=sorted(CHAT_UPLOAD_EXTENSIONS),
+                max_size_mb=max_mb,
+            )
+            filename = secure_filename(validated.filename)
+            if not filename:
+                raise ValidationError("Nome file non valido", "file")
+            extension = filename.rsplit(".", 1)[1].lower()
+            if extension not in CHAT_UPLOAD_EXTENSIONS:
+                return jsonify(error="Formato file non supportato"), 400
+            file_id = uuid.uuid4().hex
+            scratch = _chat_upload_dir(config)
+            os.makedirs(scratch, exist_ok=True)
+            file_path = os.path.join(scratch, f"{file_id}_{filename}")
+            validated.save(file_path)
+            return jsonify({
+                "filename": filename,
+                "id": file_id,
+                "file_id": file_id,
+                "size": os.path.getsize(file_path),
+                "type": validated.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            })
+        except ValidationError as e:
+            return jsonify(e.to_dict()), 400
+        except Exception as e:
+            log.error(f"Errore upload-to-chat: {e}")
+            return jsonify(error=str(e), status="server_error"), 500
+
+    @app.route("/code_pics/<path:filename>")
+    @require_login
+    def serve_code_pic(filename):
+        """Serve generated code result images."""
+        config = _workspace_config(app)
+        if not CODE_IMAGE_PATTERN.match(filename):
+            return jsonify(error="Image not found"), 404
+        pic_path = _safe_join(_chat_pics_dir(config), filename)
+        if not os.path.exists(pic_path):
+            return jsonify(error="Image not found"), 404
+        from flask import send_file as _send_file
+        return _send_file(pic_path)
+
     # System Prompt Routes
     # ---------------------------------------------------------------
 
@@ -1112,6 +1184,7 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
         raw_conversation_id = payload.get("conversation_id")
         conversation_id = _scoped_conversation_id(raw_conversation_id)
         custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+        extra_context_docs = _temporary_attachment_context_docs(payload, config)
         result = query_rag(
             payload["query"],
             model=payload.get("model"),
@@ -1127,6 +1200,7 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             response_language=payload.get("response_language"),
             public=public,
             custom_system_prompt=custom_system,
+            extra_context_docs=extra_context_docs,
         )
         if isinstance(result, dict) and raw_conversation_id:
             result["conversation_id"] = raw_conversation_id
@@ -1153,6 +1227,7 @@ def run_rag_query_events(payload: dict, public: bool = False):
     raw_conversation_id = payload.get("conversation_id")
     conversation_id = _scoped_conversation_id(raw_conversation_id)
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+    extra_context_docs = _temporary_attachment_context_docs(payload, config)
     events = query_rag_stream_events(
         payload["query"],
         model=payload.get("model"),
@@ -1167,6 +1242,7 @@ def run_rag_query_events(payload: dict, public: bool = False):
         response_language=payload.get("response_language"),
         public=public,
         custom_system_prompt=custom_system,
+        extra_context_docs=extra_context_docs,
     )
 
     def encode_events():
@@ -1185,6 +1261,412 @@ def run_rag_query_events(payload: dict, public: bool = False):
             metrics.observe_query(duration=duration, status=status)
 
     return encode_events()
+
+
+def _temporary_attachment_context_docs(payload: dict, config: dict) -> list:
+    """Build ephemeral RAG context for chat attachments when Python mode is off."""
+    if payload.get("use_code_interpreter") or not payload.get("attached_files"):
+        return []
+    attachments = _resolve_chat_attachments(config, payload.get("attached_files") or [])
+    if not attachments:
+        return []
+    from utils.temporary_attachment_rag import retrieve_attachment_context
+
+    top_k = int(os.getenv("CHAT_ATTACHMENT_RAG_K", "4"))
+    return retrieve_attachment_context(
+        payload["query"],
+        attachments,
+        settings_path=config["SETTINGS_FILE"],
+        top_k=top_k,
+    )
+
+
+def run_code_interpreter_query(payload: dict) -> dict:
+    """Generate Python from query + RAG context, then execute it on attached files."""
+    from utils.metrics import get_metrics
+
+    metrics = get_metrics()
+    metrics.begin_query()
+    start = time.time()
+    status = "success"
+    try:
+        prepared = _prepare_code_interpreter_run(payload)
+        code = _generate_code_for_interpreter(prepared)
+        result = _execute_interpreter_code(prepared, code)
+        _append_code_interpreter_conversation_turn(payload, prepared, result)
+        return _code_interpreter_response(prepared, code, result)
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        metrics.end_query()
+        metrics.observe_query(duration=time.time() - start, status=status)
+
+
+def run_code_interpreter_query_events(payload: dict):
+    """NDJSON event stream for code interpreter mode."""
+    from utils.metrics import get_metrics
+
+    metrics = get_metrics()
+    metrics.begin_query()
+    start = time.time()
+    status = "success"
+
+    def encode(event: dict) -> str:
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
+    try:
+        prepared = _prepare_code_interpreter_run(payload)
+        yield encode(_code_interpreter_meta_event(prepared))
+        code = _generate_code_for_interpreter(prepared)
+        yield encode({"type": "code", "code": code})
+        result = _execute_interpreter_code(prepared, code)
+        yield encode({"type": "execution", "result": result})
+        _append_code_interpreter_conversation_turn(payload, prepared, result)
+        yield encode({"type": "done", **_code_interpreter_response(prepared, code, result)})
+    except Exception as exc:
+        status = "error"
+        log.error("Errore code interpreter: %s", exc)
+        yield encode({"type": "error", "error": str(exc), "status": "server_error"})
+    finally:
+        metrics.end_query()
+        metrics.observe_query(duration=time.time() - start, status=status)
+
+
+def _code_interpreter_enabled() -> bool:
+    value = os.getenv("CODE_INTERPRETER_ENABLED", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _chat_base_dir(config: dict) -> str:
+    return os.path.join(config["UPLOAD_FOLDER"], "chat_files")
+
+
+def _chat_upload_dir(config: dict) -> str:
+    return os.path.join(_chat_base_dir(config), "uploads")
+
+
+def _chat_pics_dir(config: dict) -> str:
+    return os.path.join(_chat_base_dir(config), "pics")
+
+
+def _chat_code_runs_dir(config: dict) -> str:
+    return os.path.join(_chat_base_dir(config), "code_runs")
+
+
+def _safe_join(root: str, *parts: str) -> str:
+    root_abs = os.path.abspath(root)
+    path = os.path.abspath(os.path.join(root_abs, *parts))
+    if path != root_abs and not path.startswith(root_abs + os.sep):
+        raise ValidationError("Path non valido", "path")
+    return path
+
+
+def _cleanup_code_interpreter_files(config: dict) -> None:
+    try:
+        ttl_hours = int(os.getenv("CODE_INTERPRETER_TTL_HOURS", "24"))
+    except ValueError:
+        ttl_hours = 24
+    if ttl_hours <= 0:
+        return
+    cutoff = time.time() - (ttl_hours * 3600)
+    for root in (_chat_upload_dir(config), _chat_pics_dir(config), _chat_code_runs_dir(config)):
+        if not os.path.isdir(root):
+            continue
+        for current_root, dirs, files in os.walk(root, topdown=False):
+            for filename in files:
+                path = os.path.join(current_root, filename)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError:
+                    pass
+            for dirname in dirs:
+                path = os.path.join(current_root, dirname)
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+
+
+def _resolve_chat_attachments(config: dict, attached_files: list[dict]) -> list[dict]:
+    upload_dir = _chat_upload_dir(config)
+    resolved = []
+    used_runtime_names: set[str] = set()
+    for index, item in enumerate(attached_files or []):
+        file_id = str(item.get("id") or item.get("file_id") or "").strip().lower()
+        if not CHAT_FILE_ID_PATTERN.match(file_id):
+            raise ValidationError(f"attached_files[{index}].id non valido", "attached_files")
+        if not os.path.isdir(upload_dir):
+            raise ValidationError("File allegato non trovato", "attached_files", "not_found")
+        prefix = f"{file_id}_"
+        matches = sorted(
+            name for name in os.listdir(upload_dir)
+            if name.startswith(prefix) and os.path.isfile(_safe_join(upload_dir, name))
+        )
+        if not matches:
+            raise ValidationError("File allegato non trovato", "attached_files", "not_found")
+
+        stored_name = matches[0]
+        original_name = stored_name[len(prefix):]
+        safe_name = secure_filename(original_name)
+        if not safe_name:
+            raise ValidationError("Nome file allegato non valido", "attached_files")
+        runtime_name = safe_name
+        if runtime_name in used_runtime_names:
+            runtime_name = f"{file_id[:8]}_{safe_name}"
+        used_runtime_names.add(runtime_name)
+        host_path = _safe_join(upload_dir, stored_name)
+        extension = safe_name.rsplit(".", 1)[1].lower() if "." in safe_name else ""
+        if extension not in CHAT_UPLOAD_EXTENSIONS:
+            raise ValidationError("Formato file allegato non supportato", "attached_files")
+        resolved.append(
+            {
+                "id": file_id,
+                "name": safe_name,
+                "type": mimetypes.guess_type(safe_name)[0] or item.get("type") or "application/octet-stream",
+                "path": host_path,
+                "runtime_name": runtime_name,
+                "container_path": f"/data/{runtime_name}",
+                "preview": _chat_file_preview(host_path, extension),
+                "size": os.path.getsize(host_path),
+            }
+        )
+    return resolved
+
+
+def _chat_file_preview(path: str, extension: str, max_chars: int = 4000) -> str:
+    if extension not in {"csv", "tsv", "json", "txt", "md"}:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(max_chars).strip()
+    except OSError:
+        return ""
+
+
+def _prepare_code_interpreter_run(payload: dict) -> dict:
+    if not _code_interpreter_enabled():
+        raise ValidationError("Code interpreter disabilitato", "use_code_interpreter", "disabled")
+
+    config = _workspace_config(current_app)
+    _cleanup_code_interpreter_files(config)
+    attached_files = _resolve_chat_attachments(config, payload.get("attached_files") or [])
+    if not attached_files:
+        raise ValidationError("Allega almeno un file dati", "attached_files")
+
+    from utils.prompt_templates import build_code_system_prompt
+    from utils.providers.provider_factory import ProviderFactory
+    from utils.rag_engine import (
+        _client_context_block,
+        _serialize_context,
+        _serialize_sources,
+        prepare_rag_context,
+    )
+    from utils.settings_store import SettingsStore
+
+    raw_conversation_id = payload.get("conversation_id")
+    conversation_id = _scoped_conversation_id(raw_conversation_id)
+    custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+    rag_error = ""
+    try:
+        rag_payload = prepare_rag_context(
+            payload["query"],
+            model=payload.get("model"),
+            provider=payload.get("provider"),
+            temperature=payload.get("temperature"),
+            k=payload.get("k"),
+            settings_path=config["SETTINGS_FILE"],
+            collection_name=config["CHROMA_COLLECTION"],
+            conversation_id=conversation_id,
+            response_language=payload.get("response_language"),
+            use_cache=False,
+        )
+    except Exception as exc:
+        log.warning("RAG context unavailable for code interpreter: %s", exc)
+        rag_error = str(exc)
+        settings = SettingsStore(config["SETTINGS_FILE"]).load()
+        provider_id, selected_model, provider_config = ProviderFactory.resolve(
+            model=payload.get("model"),
+            provider=payload.get("provider"),
+            settings=settings,
+        )
+        rag_payload = {
+            "settings": settings,
+            "provider": provider_id,
+            "model": selected_model,
+            "provider_config": provider_config,
+            "temperature": payload.get("temperature")
+            if payload.get("temperature") is not None
+            else settings["rag"]["temperature"],
+            "k": payload.get("k") or settings["rag"]["query_k"],
+            "response_language": payload.get("response_language") or "auto",
+            "conversation_context": "",
+            "context_docs": [],
+        }
+
+    context_docs = rag_payload["context_docs"]
+    system_prompt = build_code_system_prompt(
+        user_query=payload["query"],
+        data_files=attached_files,
+        rag_context=_rag_context_for_code_prompt(context_docs, rag_error=rag_error),
+        conversation_context=str(rag_payload.get("conversation_context") or ""),
+        client_context=_client_context_block(payload.get("client_context")),
+        custom_instructions=custom_system or "",
+        response_language=str(rag_payload.get("response_language") or "auto"),
+    )
+    return {
+        "query": payload["query"],
+        "config": config,
+        "attached_files": attached_files,
+        "system_prompt": system_prompt,
+        "settings": rag_payload["settings"],
+        "provider": rag_payload["provider"],
+        "model": rag_payload["model"],
+        "provider_name": rag_payload["provider_config"].get("name", rag_payload["provider"]),
+        "temperature": rag_payload["temperature"],
+        "response_language": rag_payload["response_language"],
+        "conversation_id": conversation_id,
+        "raw_conversation_id": raw_conversation_id,
+        "context_docs": context_docs,
+        "context": _serialize_context(
+            context_docs,
+            file_index_path=config["FILE_INDEX"],
+            include_downloads=True,
+        ),
+        "sources": _serialize_sources(context_docs),
+        "rag_error": rag_error,
+    }
+
+
+def _rag_context_for_code_prompt(context_docs, rag_error: str = "", max_chars: int = 12000) -> str:
+    if rag_error and not context_docs:
+        return f"Contesto RAG non disponibile: {rag_error}"
+    if not context_docs:
+        return "Nessun contesto documentale recuperato."
+
+    remaining = max_chars
+    blocks = []
+    for index, doc in enumerate(context_docs, start=1):
+        metadata = getattr(doc, "metadata", {}) or {}
+        source = os.path.basename(str(metadata.get("source") or "documento"))
+        text = " ".join(str(getattr(doc, "page_content", "") or "").split())
+        if not text:
+            continue
+        snippet = text[: max(0, min(len(text), remaining - 120))]
+        if not snippet:
+            break
+        blocks.append(f"[{index}] Fonte: {source}\n{snippet}")
+        remaining -= len(snippet)
+        if remaining <= 300:
+            break
+    return "\n\n".join(blocks) or "Nessun contesto documentale recuperato."
+
+
+def _generate_code_for_interpreter(prepared: dict) -> str:
+    from utils.providers.provider_factory import ProviderFactory
+
+    provider_instance = ProviderFactory.get_provider(
+        model=prepared["model"],
+        provider=prepared["provider"],
+        settings=prepared["settings"],
+    )
+    code_text = provider_instance.generate(
+        system=prepared["system_prompt"],
+        user=f"Genera codice Python per questa richiesta: {prepared['query']}",
+        model=prepared["model"],
+        temperature=0.0,
+    )
+    return _extract_code_block(code_text)
+
+
+def _execute_interpreter_code(prepared: dict, code: str) -> dict:
+    from utils.code_interpreter import CodeInterpreter
+
+    interpreter = CodeInterpreter({"upload_folder": prepared["config"]["UPLOAD_FOLDER"]})
+    return interpreter.execute(code, prepared["attached_files"])
+
+
+def _append_code_interpreter_conversation_turn(payload: dict, prepared: dict, result: dict) -> None:
+    from utils.rag_engine import _append_conversation_turn
+
+    answer = _code_interpreter_answer_summary(result)
+    _append_conversation_turn(
+        prepared.get("conversation_id"),
+        query=payload["query"],
+        answer=answer,
+        provider=prepared["provider"],
+        model=prepared["model"],
+        temperature=min(float(prepared.get("temperature") or 0.0), 0.2),
+        settings=prepared["settings"],
+    )
+
+
+def _code_interpreter_answer_summary(result: dict) -> str:
+    if result.get("success"):
+        text = str(result.get("text") or "").strip()
+        images = result.get("images") or []
+        summary = "Code interpreter eseguito con successo."
+        if text:
+            summary += f"\nOutput:\n{text[:4000]}"
+        if images:
+            summary += f"\nGrafici generati: {len(images)}"
+        return summary
+    return f"Code interpreter fallito: {str(result.get('error') or 'errore sconosciuto')[:4000]}"
+
+
+def _code_interpreter_meta_event(prepared: dict) -> dict:
+    event = {
+        "type": "meta",
+        "model": prepared["model"],
+        "provider": prepared["provider"],
+        "provider_name": prepared["provider_name"],
+        "response_language": prepared["response_language"],
+        "attachments": [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "type": item["type"],
+                "size": item["size"],
+                "container_path": item["container_path"],
+            }
+            for item in prepared["attached_files"]
+        ],
+        "context": prepared["context"],
+        "sources": prepared["sources"],
+    }
+    if prepared.get("raw_conversation_id"):
+        event["conversation_id"] = prepared["raw_conversation_id"]
+    return event
+
+
+def _code_interpreter_response(prepared: dict, code: str, result: dict) -> dict:
+    response = {
+        "type": "code_interpreter",
+        "code": code,
+        "result": result,
+        "model": prepared["model"],
+        "provider": prepared["provider"],
+        "provider_name": prepared["provider_name"],
+        "response_language": prepared["response_language"],
+        "attachments": [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "type": item["type"],
+                "size": item["size"],
+            }
+            for item in prepared["attached_files"]
+        ],
+        "context": prepared["context"],
+        "sources": prepared["sources"],
+        "usage": None,
+    }
+    if prepared.get("raw_conversation_id"):
+        response["conversation_id"] = prepared["raw_conversation_id"]
+    if prepared.get("rag_error"):
+        response["rag_warning"] = prepared["rag_error"]
+    return response
 
 
 def _api_key_expires_at_from_ttl(value: str) -> str | None:
@@ -2606,6 +3088,25 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     client_context = _validate_client_context(data.get("client_context"))
     response_language = _validate_response_language(data.get("response_language"))
     system_prompt_id = data.get("system_prompt_id") or None
+    use_code_interpreter = validate_boolean(
+        data.get("use_code_interpreter", False), field_name="use_code_interpreter"
+    )
+    attached_files = data.get("attached_files") or []
+    if attached_files:
+        if not isinstance(attached_files, list):
+            raise ValidationError("attached_files deve essere una lista", "attached_files")
+        for i, f in enumerate(attached_files):
+            if not isinstance(f, dict):
+                raise ValidationError(f"attached_files[{i}] deve essere un oggetto", "attached_files")
+            file_id = f.get("id") or f.get("file_id")
+            validate_string(
+                file_id,
+                f"attached_files[{i}].id",
+                max_length=32,
+                pattern=r"^[0-9a-f]{32}$",
+                required=True,
+            )
+            validate_string(f.get("name"), f"attached_files[{i}].name", required=False)
     _validate_model_selection(model, provider, config=_workspace_config(current_app))
 
     return {
@@ -2620,7 +3121,18 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "temperature": temperature,
         "k": k,
         "system_prompt_id": system_prompt_id,
+        "use_code_interpreter": use_code_interpreter,
+        "attached_files": attached_files,
     }
+
+
+def _extract_code_block(text: str) -> str:
+    """Extract Python code from a markdown code block."""
+    import re as _re
+    match = _re.search(r"```(?:python|py)?\n(.*?)```", text, _re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
 
 def _validate_language_hint(value) -> str:

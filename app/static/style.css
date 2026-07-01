@@ -1410,3 +1410,110 @@ th {
         gap: 4px;
     }
 }
+
+/* Code Interpreter Toggle */
+.input-extras {
+    display: flex;
+    gap: 12px;
+    margin: 12px 0 4px;
+}
+
+.toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #4a5568;
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 12px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #f7fafc;
+    transition: all 0.2s;
+}
+
+.toggle-label:hover {
+    background: #edf2f7;
+    border-color: #cbd5e0;
+}
+
+.toggle-label input[type="checkbox"] {
+    width: auto;
+    accent-color: #2563eb;
+}
+
+.toggle-label input[type="checkbox"]:checked + span {
+    color: #2563eb;
+    font-weight: 700;
+}
+
+/* Attached Files */
+.attached-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 8px 0 4px;
+    min-height: 0;
+}
+
+.attached-files:empty {
+    display: none;
+}
+
+.file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #1d4ed8;
+}
+
+.file-chip-name {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+.file-chip-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 50%;
+    transition: all 0.15s;
+}
+
+.file-chip-remove:hover {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+
+/* Code Interpreter Result Images */
+.bot-message img {
+    max-width: 100%;
+    border-radius: 8px;
+    margin: 8px 0;
+    border: 1px solid #e2e8f0;
+}
+
+/* Paperclip icon button */
+.icon-btn[data-active] {
+    background: #dbeafe;
+    color: #2563eb;
+    border-color: #bfdbfe;
+}

@@ -2089,6 +2089,175 @@ def test_admin_file_delete_route_uses_shared_delete_handler(client, monkeypatch)
     assert "/admin/files" in response.headers["Location"]
 
 
+def test_upload_to_chat_returns_file_id_not_host_path(client, flask_app):
+    app_module = importlib.import_module("app.app")
+    client.post("/admin/login", data={"password": "admin"})
+
+    response = client.post(
+        "/upload-to-chat",
+        data={"file": (io.BytesIO(b"a,b\n1,2\n"), "demo.csv")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert re.match(r"^[0-9a-f]{32}$", payload["file_id"])
+    assert "path" not in payload
+    config = _workspace_context(flask_app).as_config()
+    stored = Path(app_module._chat_upload_dir(config)) / f"{payload['file_id']}_demo.csv"
+    assert stored.read_text() == "a,b\n1,2\n"
+
+
+def test_resolve_chat_attachments_ignores_client_supplied_path(tmp_path):
+    app_module = importlib.import_module("app.app")
+    config = {"UPLOAD_FOLDER": str(tmp_path / "uploads")}
+    upload_dir = Path(app_module._chat_upload_dir(config))
+    upload_dir.mkdir(parents=True)
+    file_id = "a" * 32
+    stored = upload_dir / f"{file_id}_demo.csv"
+    stored.write_text("a,b\n1,2\n")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not read")
+
+    resolved = app_module._resolve_chat_attachments(
+        config,
+        [{"id": file_id, "name": "demo.csv", "path": str(secret)}],
+    )
+
+    assert resolved[0]["path"] == str(stored)
+    assert resolved[0]["container_path"] == "/data/demo.csv"
+
+
+def test_code_interpreter_prompt_includes_rag_context_and_data_path(client, flask_app, monkeypatch):
+    app_module = importlib.import_module("app.app")
+    rag_engine = importlib.import_module("utils.rag_engine")
+    provider_factory = importlib.import_module("utils.providers.provider_factory")
+    client.post("/admin/login", data={"password": "admin"})
+    upload = client.post(
+        "/upload-to-chat",
+        data={"file": (io.BytesIO(b"revenue\n10\n"), "report.csv")},
+        content_type="multipart/form-data",
+    )
+    file_id = upload.get_json()["file_id"]
+    captured = {}
+
+    context_docs = [
+        SimpleNamespace(
+            page_content="Regola aziendale: usa il margine netto nelle analisi executive.",
+            metadata={"source": "policy.pdf"},
+        )
+    ]
+
+    def fake_prepare_rag_context(*args, **kwargs):
+        return {
+            "settings": {"rag": {"temperature": 0.2, "query_k": 5, "enable_cache": False}},
+            "provider": "fake",
+            "model": "fake-model",
+            "provider_config": {"name": "Fake"},
+            "temperature": 0.2,
+            "k": 5,
+            "response_language": "it",
+            "conversation_context": "Turno precedente utile.",
+            "context_docs": context_docs,
+        }
+
+    class FakeProvider:
+        provider_name = "Fake"
+
+        def generate(self, system, user, model, temperature):
+            captured["system"] = system
+            captured["user"] = user
+            return "import pandas as pd\nprint(pd.read_csv('/data/report.csv').shape)"
+
+    monkeypatch.setattr(rag_engine, "prepare_rag_context", fake_prepare_rag_context)
+    monkeypatch.setattr(
+        provider_factory.ProviderFactory,
+        "get_provider",
+        staticmethod(lambda model=None, provider=None, settings=None: FakeProvider()),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_execute_interpreter_code",
+        lambda prepared, code: {"success": True, "text": "ok", "images": []},
+    )
+
+    response = client.post(
+        "/ask",
+        json={
+            "query": "Analizza il report",
+            "use_code_interpreter": True,
+            "attached_files": [{"id": file_id, "name": "report.csv"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "/data/report.csv" in captured["system"]
+    assert "revenue" in captured["system"]
+    assert "Regola aziendale" in captured["system"]
+    assert response.get_json()["context"][0]["metadata"]["source"] == "policy.pdf"
+
+
+def test_ask_with_attachment_and_code_interpreter_off_uses_ephemeral_rag(client, flask_app, monkeypatch):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    temp_rag = importlib.import_module("utils.temporary_attachment_rag")
+    client.post("/admin/login", data={"password": "admin"})
+    upload = client.post(
+        "/upload-to-chat",
+        data={"file": (io.BytesIO(b"temporary alpha attachment"), "notes.txt")},
+        content_type="multipart/form-data",
+    )
+    file_id = upload.get_json()["file_id"]
+    captured = {}
+    chroma_doc = SimpleNamespace(
+        page_content="Persistent Chroma context",
+        metadata={"source": "kb.pdf", "source_type": "pdf"},
+    )
+
+    class FakeEmbeddingProvider:
+        def encode_query(self, query):
+            return [1.0, 0.0]
+
+        def encode_documents(self, texts):
+            return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr(
+        temp_rag.EmbeddingFactory,
+        "get_provider",
+        staticmethod(lambda model_name=None: FakeEmbeddingProvider()),
+    )
+    monkeypatch.setattr(
+        rag_engine.ProviderFactory,
+        "resolve",
+        staticmethod(lambda model=None, provider=None, settings=None: ("fake", "fake-model", {"name": "Fake"})),
+    )
+    monkeypatch.setattr(rag_engine, "_get_context", lambda *args, **kwargs: [chroma_doc])
+
+    def fake_generate_response(query, context_docs, **kwargs):
+        captured["context_docs"] = context_docs
+        return iter(["Risposta con allegato"])
+
+    monkeypatch.setattr(rag_engine, "generate_response", fake_generate_response)
+
+    response = client.post(
+        "/ask",
+        json={
+            "query": "usa alpha",
+            "use_code_interpreter": False,
+            "attached_files": [{"id": file_id, "name": "notes.txt"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["answer"] == "Risposta con allegato"
+    assert any(doc.metadata.get("source") == "kb.pdf" for doc in captured["context_docs"])
+    assert any(
+        doc.metadata.get("source_type") == "temporary_attachment"
+        for doc in captured["context_docs"]
+    )
+    assert any(ctx["metadata"].get("temporary_attachment") is True for ctx in payload["context"])
+
+
 def test_missing_default_provider_file_is_visible_on_app_load(tmp_path, monkeypatch):
     missing = tmp_path / "missing-default-providers.json"
     monkeypatch.setenv("RAG_ADMIN_PASSWORD_HASH", "")

@@ -25,6 +25,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const uploadAudioButton = document.getElementById("uploadAudioButton");
     const uploadOcrButton = document.getElementById("uploadOcrButton");
     const ocrFileInput = document.getElementById("ocrFileInput");
+    const uploadFileButton = document.getElementById("uploadFileButton");
+    const codeInterpreterToggle = document.getElementById("codeInterpreterToggle");
+    const attachedFilesDiv = document.getElementById("attachedFiles");
 
     if (!chatbox || !userInput || !sendButton || !modelSelect) {
         return;
@@ -32,6 +35,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const promptStorageKey = "ragSystemPromptId";
     let systemPromptId = loadSystemPromptId();
+    let codeInterpreterEnabled = false;
+    const uploadedFiles = [];
 
     let healthState = null;
     let busy = false;
@@ -123,6 +128,28 @@ document.addEventListener("DOMContentLoaded", () => {
     if (uploadOcrButton && ocrFileInput) {
         uploadOcrButton.addEventListener("click", () => ocrFileInput.click());
         ocrFileInput.addEventListener("change", handleOcrUpload);
+    }
+
+    // File upload for code interpreter
+    if (uploadFileButton) {
+        uploadFileButton.addEventListener("click", () => {
+            const fileInput = document.createElement("input");
+            fileInput.type = "file";
+            fileInput.multiple = true;
+            fileInput.accept = ".csv,.xlsx,.xls,.json,.parquet,.tsv,.zip,.png,.jpg,.jpeg,.gif,.pdf,.txt,.md";
+            fileInput.addEventListener("change", handleFileUpload);
+            fileInput.click();
+        });
+    }
+
+    // Code interpreter toggle
+    if (codeInterpreterToggle) {
+        codeInterpreterToggle.addEventListener("change", () => {
+            codeInterpreterEnabled = codeInterpreterToggle.checked;
+            if (codeInterpreterEnabled) {
+                uploadFileButton.hidden = false;
+            }
+        });
     }
 
     async function submitRecording(chunks, mimeType) {
@@ -263,6 +290,43 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             const selected = modelSelect.selectedOptions[0];
+
+            // Code interpreter mode
+            if (codeInterpreterEnabled && uploadedFiles.length > 0) {
+                const ciBody = {
+                    query,
+                    model: selected ? selected.dataset.model : undefined,
+                    provider: selected ? selected.dataset.provider : undefined,
+                    conversation_id: conversationId,
+                    stream: true,
+                    stream_format: "ndjson",
+                    system_prompt_id: systemPromptId || undefined,
+                    use_code_interpreter: true,
+                    attached_files: uploadedFiles.map(f => ({
+                        id: f.id,
+                        file_id: f.id,
+                        name: f.name,
+                        type: f.type
+                    }))
+                };
+                const response = await fetch("/ask", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(ciBody)
+                });
+                if (!response.ok) {
+                    const data = await readErrorPayload(response);
+                    appendMessage(formatError(data, response.statusText), "bot-message");
+                } else {
+                    const messageDiv = appendBotMessage("Preparing analysis...");
+                    await renderCodeInterpreterStream(response, messageDiv);
+                }
+                // Clear uploaded files after sending
+                uploadedFiles.length = 0;
+                renderAttachedFiles();
+                return;
+            }
+
             const body = {
                 query,
                 model: selected ? selected.dataset.model : undefined,
@@ -270,8 +334,17 @@ document.addEventListener("DOMContentLoaded", () => {
                 conversation_id: conversationId,
                 stream: true,
                 stream_format: "ndjson",
-                system_prompt_id: systemPromptId || undefined
+                system_prompt_id: systemPromptId || undefined,
+                use_code_interpreter: false
             };
+            if (uploadedFiles.length > 0) {
+                body.attached_files = uploadedFiles.map(f => ({
+                    id: f.id,
+                    file_id: f.id,
+                    name: f.name,
+                    type: f.type
+                }));
+            }
 
             const response = await fetch("/ask", {
                 method: "POST",
@@ -285,6 +358,10 @@ document.addEventListener("DOMContentLoaded", () => {
             } else {
                 const messageDiv = appendBotMessage("");
                 await renderStreamingResponse(response, messageDiv);
+                if (uploadedFiles.length > 0) {
+                    uploadedFiles.length = 0;
+                    renderAttachedFiles();
+                }
             }
         } catch (error) {
             appendMessage(`**Connection error:** ${error.message}`, "bot-message");
@@ -292,6 +369,101 @@ document.addEventListener("DOMContentLoaded", () => {
             setBusy(false);
             userInput.focus();
         }
+    }
+
+    function renderCodeInterpreterResult(data) {
+        const messageDiv = appendBotMessage("");
+        const result = data.result || {};
+        renderCodeInterpreterPayload(messageDiv, data.code || "", result);
+        if (data.context) {
+            appendSources(data.context);
+        }
+    }
+
+    async function renderCodeInterpreterStream(response, messageDiv) {
+        const state = {code: "", result: null, hasError: false, status: "Preparing analysis..."};
+
+        const onEvent = (event) => {
+            if (!event || state.hasError) return;
+            if (event.type === "meta") {
+                updateConversationId(event.conversation_id);
+                state.status = "Generating Python...";
+                renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
+            } else if (event.type === "code") {
+                state.code = event.code || "";
+                state.status = "Executing Python...";
+                renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
+            } else if (event.type === "execution") {
+                state.result = event.result || {};
+                state.status = "";
+                renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
+            } else if (event.type === "done") {
+                updateConversationId(event.conversation_id);
+                state.code = event.code || state.code;
+                state.result = event.result || state.result || {};
+                state.status = "";
+                renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
+                appendSources(event.context);
+            } else if (event.type === "error") {
+                state.hasError = true;
+                renderBotAnswer(messageDiv, formatError(event, "Code interpreter interrupted"));
+            }
+        };
+
+        if (!response.body || !response.body.getReader) {
+            const text = await response.text();
+            parseNdjsonLines(text, onEvent);
+            return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, {stream: true});
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            parseNdjsonLines(lines.join("\n"), onEvent);
+        }
+        buffer += decoder.decode();
+        parseNdjsonLines(buffer, onEvent);
+    }
+
+    function renderCodeInterpreterPayload(messageDiv, code, result, statusText) {
+        result = result || {};
+
+        let content = "";
+        if (statusText) {
+            content += `_${statusText}_\n\n`;
+        }
+        if (code) {
+            content += "**Code:**\n\n```python\n" + escapeHtml(code) + "\n```\n\n";
+        }
+        if (result && Object.prototype.hasOwnProperty.call(result, "success")) {
+            if (result.success) {
+                if (result.text) {
+                    content += "**Output:**\n\n" + result.text;
+                }
+                if (result.images && result.images.length > 0) {
+                    content += "\n\n";
+                    result.images.forEach(img => {
+                        content += `![plot](${img})\n\n`;
+                    });
+                }
+            } else {
+                content += "**Execution error:**\n\n" + (result.error || "Unknown error");
+            }
+        }
+        if (!content) {
+            content = "_Preparing analysis..._";
+        }
+
+        messageDiv.innerHTML = window.marked
+            ? DOMPurify.sanitize(marked.parse(content))
+            : escapeHtml(content);
+        highlightCodeBlocks(messageDiv);
     }
 
     function setBusy(isBusy) {
@@ -599,6 +771,7 @@ document.addEventListener("DOMContentLoaded", () => {
         persistConversationId(conversationId);
         clearServerConversation(previousConversationId);
         chatbox.replaceChildren();
+        clearUploadedFiles();
         if (emptyState) {
             emptyState.hidden = false;
             chatbox.appendChild(emptyState);
@@ -783,6 +956,68 @@ document.addEventListener("DOMContentLoaded", () => {
                 sessionStorage.setItem(promptStorageKey, value);
             }
         } catch (e) {/* noop */}
+    }
+
+    async function handleFileUpload(event) {
+        const input = event.target;
+        const files = input.files;
+        if (!files || files.length === 0) return;
+
+        for (const file of files) {
+            const formData = new FormData();
+            formData.append("file", file);
+
+            try {
+                const response = await fetch("/upload-to-chat", {
+                    method: "POST",
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const data = await response.json();
+                    appendMessage(`**Upload failed:** ${data.error || "Unknown error"}`, "bot-message");
+                    continue;
+                }
+
+                const data = await response.json();
+                uploadedFiles.push({
+                    id: data.file_id || data.id,
+                    name: data.filename,
+                    type: data.type
+                });
+            } catch (err) {
+                appendMessage(`**Upload error:** ${err.message}`, "bot-message");
+            }
+        }
+        renderAttachedFiles();
+        input.value = "";
+    }
+
+    function renderAttachedFiles() {
+        if (!attachedFilesDiv) return;
+        attachedFilesDiv.innerHTML = "";
+        if (uploadedFiles.length === 0) return;
+
+        uploadedFiles.forEach((file, idx) => {
+            const chip = document.createElement("div");
+            chip.className = "file-chip";
+            chip.innerHTML = `
+                <span class="file-chip-name">${escapeHtml(file.name)}</span>
+                <button type="button" class="file-chip-remove" data-idx="${idx}" aria-label="Remove">&times;</button>
+            `;
+            chip.querySelector(".file-chip-remove").addEventListener("click", () => {
+                uploadedFiles.splice(idx, 1);
+                renderAttachedFiles();
+            });
+            attachedFilesDiv.appendChild(chip);
+        });
+    }
+
+    function clearUploadedFiles() {
+        uploadedFiles.length = 0;
+        if (attachedFilesDiv) {
+            attachedFilesDiv.innerHTML = "";
+        }
     }
 
     loadModels();

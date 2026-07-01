@@ -88,13 +88,23 @@
                 </div>
             </div>
             <div id="streamStatus" class="stream-status" hidden>Generating response...</div>
+            <div class="input-extras">
+                <label class="toggle-label">
+                    <input type="checkbox" id="codeInterpreterToggle">
+                    <span>Code Interpreter</span>
+                </label>
+            </div>
+            <div id="attachedFiles" class="attached-files"></div>
             <div class="input-area">
                 <textarea id="userInput" rows="2" placeholder="Ask a question about the documents..." autocomplete="off"></textarea>
+                <button type="button" id="uploadFileButton" class="icon-btn" title="Attach data file">&#128203;</button>
                 <button type="button" id="uploadOcrButton" class="icon-btn" title="Extract text from image or PDF" hidden>&#9633;</button>
                 <button type="button" id="uploadAudioButton" class="icon-btn" title="Record audio for transcription">&#9672;</button>
                 <button id="sendButton">Send</button>
             </div>
+
             <input type="file" id="ocrFileInput" class="audio-file-input" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.pdf">
+            <input type="file" id="dataFileInput" class="audio-file-input" accept=".csv,.xlsx,.xls,.json,.parquet,.tsv,.zip,.png,.jpg,.jpeg,.gif,.pdf,.txt,.md" multiple>
         </section>
     </div>
 
