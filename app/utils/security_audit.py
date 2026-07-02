@@ -2,7 +2,7 @@ import time
 import json
 from datetime import datetime
 from typing import Optional
-from .logging_config import APP_LOGGER as log
+from .logging_config import APP_LOGGER as log, sanitize_log_value
 import os
 
 
@@ -16,13 +16,14 @@ class SecurityAuditLogger:
     
     def log(self, event_type: str, severity: str, details: dict):
         """Log security event"""
+        safe_details = sanitize_log_value("details", details)
         event = {
             "timestamp": datetime.utcnow().isoformat(),
             "event_type": event_type,
             "severity": severity,
-            "details": details,
-            "ip": details.get("ip", "unknown"),
-            "user_agent": details.get("user_agent", "unknown")
+            "details": safe_details,
+            "ip": safe_details.get("ip", "unknown"),
+            "user_agent": safe_details.get("user_agent", "unknown")
         }
         
         try:
@@ -32,7 +33,7 @@ class SecurityAuditLogger:
             log.warning(f"Failed to write security audit log: {e}")
         
         if severity in ("high", "critical"):
-            log.warning(f"SECURITY {event_type}: {json.dumps(details)}")
+            log.warning(f"SECURITY {event_type}: {json.dumps(safe_details)}")
     
     def log_blocked_request(self, client_ip: str, user_agent: str, reason: str, 
                            input_type: str, input_value: str):

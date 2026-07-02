@@ -52,6 +52,30 @@ class TestJsonLogFormatter:
         assert output["custom_number"] == 42
         assert output["custom_bool"] == True
 
+    def test_masks_api_keys_in_message_and_extra_fields(self):
+        formatter = JsonLogFormatter()
+        raw_key = "rag_1234567890abcdef_deadbeef"
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="t.py",
+            lineno=1,
+            msg="Using api_key=%s",
+            args=(raw_key,),
+            exc_info=None,
+        )
+        record.module = "t"
+        record.funcName = "f"
+        record.file = "t.py"
+        record.taskName = ""
+        record.api_key = raw_key
+
+        output = json.loads(formatter.format(record))
+
+        assert raw_key not in output["message"]
+        assert output["message"] == "Using api_key=rag_1234...beef"
+        assert output["api_key"] == "rag_1234...beef"
+
     def test_exception_formatting(self):
         formatter = JsonLogFormatter()
         try:

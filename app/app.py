@@ -20,6 +20,7 @@ from flask import (
     Response,
     current_app,
     flash,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -170,6 +171,134 @@ CHAT_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CODE_IMAGE_PATTERN = re.compile(r"^[0-9a-f]{12}_[A-Za-z0-9._-]+\.png$")
 
 
+class RequestTimeoutExceeded(TimeoutError):
+    pass
+
+
+def _env_csv(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name, default)
+    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _request_timeout_seconds(app: Flask | None = None) -> float:
+    value = (app or current_app).config.get("REQUEST_TIMEOUT_SECONDS", 0)
+    try:
+        return max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ensure_request_not_timed_out() -> None:
+    if not has_request_context():
+        return
+    deadline = getattr(request, "_rag_deadline", None)
+    if deadline and time.monotonic() > float(deadline):
+        raise RequestTimeoutExceeded("Richiesta scaduta")
+
+
+def _cors_origin_for_request(app: Flask) -> str:
+    origin = request.headers.get("Origin", "")
+    if not origin:
+        return ""
+    allowed = app.config.get("CORS_ALLOWED_ORIGINS") or []
+    if isinstance(allowed, str):
+        allowed = _split_config_csv(allowed)
+    if "*" in allowed:
+        return origin if app.config.get("CORS_ALLOW_CREDENTIALS") else "*"
+    return origin if origin in allowed else ""
+
+
+def _apply_cors_headers(app: Flask, response: Response) -> None:
+    origin = _cors_origin_for_request(app)
+    if not origin:
+        return
+    response.headers["Access-Control-Allow-Origin"] = origin
+    _append_vary_header(response, "Origin")
+    response.headers["Access-Control-Allow-Methods"] = ", ".join(
+        _split_config_csv(app.config.get("CORS_ALLOWED_METHODS") or [])
+    )
+    response.headers["Access-Control-Allow-Headers"] = ", ".join(
+        _split_config_csv(app.config.get("CORS_ALLOWED_HEADERS") or [])
+    )
+    response.headers["Access-Control-Max-Age"] = str(app.config.get("CORS_MAX_AGE", 600))
+    if app.config.get("CORS_ALLOW_CREDENTIALS"):
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+
+def _split_config_csv(value) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _append_vary_header(response: Response, value: str) -> None:
+    existing = [part.strip() for part in response.headers.get("Vary", "").split(",") if part.strip()]
+    if value not in existing:
+        existing.append(value)
+    response.headers["Vary"] = ", ".join(existing)
+
+
+def _paginate_items(
+    items: list,
+    *,
+    page,
+    per_page,
+    allowed_per_page: tuple[int, ...] = (10, 25, 50, 100),
+    default_per_page: int = 25,
+) -> tuple[list, dict]:
+    total = len(items)
+    per_page_value = _coerce_positive_int(per_page, default_per_page)
+    if per_page_value not in allowed_per_page:
+        per_page_value = default_per_page
+
+    page_count = max(1, (total + per_page_value - 1) // per_page_value)
+    page_value = _coerce_positive_int(page, 1)
+    page_value = min(page_value, page_count)
+
+    start_index = (page_value - 1) * per_page_value
+    end_index = min(start_index + per_page_value, total)
+    window_start = max(1, page_value - 2)
+    window_end = min(page_count, window_start + 4)
+    window_start = max(1, window_end - 4)
+
+    return items[start_index:end_index], {
+        "page": page_value,
+        "per_page": per_page_value,
+        "allowed_per_page": list(allowed_per_page),
+        "total": total,
+        "page_count": page_count,
+        "has_prev": page_value > 1,
+        "has_next": page_value < page_count,
+        "prev_page": max(1, page_value - 1),
+        "next_page": min(page_count, page_value + 1),
+        "start": start_index + 1 if total else 0,
+        "end": end_index,
+        "page_numbers": list(range(window_start, window_end + 1)),
+    }
+
+
+def _coerce_positive_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     load_dotenv()
     _setup_ssl()
@@ -192,6 +321,18 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["RATE_LIMIT_REQUESTS"] = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
     app.config["RATE_LIMIT_WINDOW"] = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
     app.config["VECTOR_STORE_BACKEND"] = Config.vector_store.backend
+    app.config["CORS_ALLOWED_ORIGINS"] = _env_csv("RAG_CORS_ALLOWED_ORIGINS")
+    app.config["CORS_ALLOWED_METHODS"] = _env_csv(
+        "RAG_CORS_ALLOWED_METHODS",
+        default="GET,POST,DELETE,OPTIONS",
+    )
+    app.config["CORS_ALLOWED_HEADERS"] = _env_csv(
+        "RAG_CORS_ALLOWED_HEADERS",
+        default="Content-Type,X-API-Key,X-Request-ID",
+    )
+    app.config["CORS_ALLOW_CREDENTIALS"] = _env_bool("RAG_CORS_ALLOW_CREDENTIALS", False)
+    app.config["CORS_MAX_AGE"] = int(os.getenv("RAG_CORS_MAX_AGE", "600"))
+    app.config["REQUEST_TIMEOUT_SECONDS"] = _env_float("RAG_REQUEST_TIMEOUT_SECONDS", 0.0)
 
     if test_config:
         app.config.update(test_config)
@@ -215,6 +356,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     def _inject_current_user():
         return {"current_user": current_user()}
 
+    @app.errorhandler(RequestTimeoutExceeded)
+    def _request_timeout_error(_error):
+        return jsonify(error="Richiesta scaduta", status="timeout"), 503
+
     # ── Start backup scheduler (background thread) ──
     from utils.vector_store.backup_manager import start_scheduler
     start_scheduler()
@@ -223,7 +368,16 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.before_request
     def _before_request_metrics():
         request._rag_metrics_start = time.time()
+        request._rag_monotonic_start = time.monotonic()
         request._rag_request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        timeout_seconds = _request_timeout_seconds(app)
+        request._rag_deadline = (
+            request._rag_monotonic_start + timeout_seconds
+            if timeout_seconds > 0
+            else None
+        )
+        if request.method == "OPTIONS" and _cors_origin_for_request(app):
+            return Response(status=204)
         # Track API key info for usage logging
         api_key_header = request.headers.get("X-API-Key")
         if api_key_header:
@@ -286,6 +440,18 @@ def create_app(test_config: dict | None = None) -> Flask:
             except Exception:
                 pass
 
+        response.headers["X-Request-ID"] = getattr(request, "_rag_request_id", "")
+        response.headers["X-Request-Duration-Ms"] = str(int(duration * 1000))
+        timeout_seconds = _request_timeout_seconds(app)
+        if timeout_seconds > 0 and duration > timeout_seconds:
+            log.warning(
+                "Request exceeded timeout budget: %s %s took %.3fs (budget %.3fs)",
+                method,
+                endpoint,
+                duration,
+                timeout_seconds,
+            )
+        _apply_cors_headers(app, response)
         return response
 
     return app
@@ -413,6 +579,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return jsonify(result)
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
+        except RequestTimeoutExceeded:
+            raise
         except Exception as e:
             log.error(f"Errore ask: {e}")
             return jsonify(error=str(e), status="server_error"), 500
@@ -651,9 +819,18 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return redirect(url_for("admin_files"))
 
         file_index = FileIndex(config["FILE_INDEX"])
+        files = file_index.list()
+        files_page, files_pagination = _paginate_items(
+            files,
+            page=request.args.get("page", "1"),
+            per_page=request.args.get("per_page", "25"),
+            allowed_per_page=(10, 25, 50, 100),
+            default_per_page=25,
+        )
         return render_template(
             "admin_files.html",
-            files=file_index.list(),
+            files=files_page,
+            files_pagination=files_pagination,
             health=_health_status(app, deep=False, config=config),
             index_status=_index_rebuild_status(app, config=config),
         )
@@ -1102,6 +1279,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return jsonify(run_rag_query(payload, stream=False, public=True))
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
+        except RequestTimeoutExceeded:
+            raise
         except Exception as e:
             log.error(f"Errore api query: {e}")
             return jsonify(error=str(e), status="server_error"), 500
@@ -1180,11 +1359,13 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
     status = "success"
 
     try:
+        _ensure_request_not_timed_out()
         config = _workspace_config(current_app)
         raw_conversation_id = payload.get("conversation_id")
         conversation_id = _scoped_conversation_id(raw_conversation_id)
         custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
         extra_context_docs = _temporary_attachment_context_docs(payload, config)
+        _ensure_request_not_timed_out()
         result = query_rag(
             payload["query"],
             model=payload.get("model"),
@@ -1202,9 +1383,13 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             custom_system_prompt=custom_system,
             extra_context_docs=extra_context_docs,
         )
+        _ensure_request_not_timed_out()
         if isinstance(result, dict) and raw_conversation_id:
             result["conversation_id"] = raw_conversation_id
         return result
+    except RequestTimeoutExceeded:
+        status = "timeout"
+        raise
     except Exception:
         status = "error"
         raise
@@ -1224,10 +1409,12 @@ def run_rag_query_events(payload: dict, public: bool = False):
     status = "success"
 
     config = _workspace_config(current_app)
+    _ensure_request_not_timed_out()
     raw_conversation_id = payload.get("conversation_id")
     conversation_id = _scoped_conversation_id(raw_conversation_id)
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
     extra_context_docs = _temporary_attachment_context_docs(payload, config)
+    _ensure_request_not_timed_out()
     events = query_rag_stream_events(
         payload["query"],
         model=payload.get("model"),
@@ -1249,9 +1436,16 @@ def run_rag_query_events(payload: dict, public: bool = False):
         nonlocal status
         try:
             for event in events:
+                _ensure_request_not_timed_out()
                 if raw_conversation_id and isinstance(event, dict) and event.get("conversation_id"):
                     event = {**event, "conversation_id": raw_conversation_id}
                 yield json.dumps(event, ensure_ascii=False) + "\n"
+        except RequestTimeoutExceeded:
+            status = "timeout"
+            yield json.dumps(
+                {"type": "error", "error": "Richiesta scaduta", "status": "timeout"},
+                ensure_ascii=False,
+            ) + "\n"
         except Exception:
             status = "error"
             raise
@@ -1290,11 +1484,18 @@ def run_code_interpreter_query(payload: dict) -> dict:
     start = time.time()
     status = "success"
     try:
+        _ensure_request_not_timed_out()
         prepared = _prepare_code_interpreter_run(payload)
+        _ensure_request_not_timed_out()
         code = _generate_code_for_interpreter(prepared)
+        _ensure_request_not_timed_out()
         result = _execute_interpreter_code(prepared, code)
+        _ensure_request_not_timed_out()
         _append_code_interpreter_conversation_turn(payload, prepared, result)
         return _code_interpreter_response(prepared, code, result)
+    except RequestTimeoutExceeded:
+        status = "timeout"
+        raise
     except Exception:
         status = "error"
         raise
@@ -1316,14 +1517,21 @@ def run_code_interpreter_query_events(payload: dict):
         return json.dumps(event, ensure_ascii=False) + "\n"
 
     try:
+        _ensure_request_not_timed_out()
         prepared = _prepare_code_interpreter_run(payload)
         yield encode(_code_interpreter_meta_event(prepared))
+        _ensure_request_not_timed_out()
         code = _generate_code_for_interpreter(prepared)
         yield encode({"type": "code", "code": code})
+        _ensure_request_not_timed_out()
         result = _execute_interpreter_code(prepared, code)
         yield encode({"type": "execution", "result": result})
+        _ensure_request_not_timed_out()
         _append_code_interpreter_conversation_turn(payload, prepared, result)
         yield encode({"type": "done", **_code_interpreter_response(prepared, code, result)})
+    except RequestTimeoutExceeded:
+        status = "timeout"
+        yield encode({"type": "error", "error": "Richiesta scaduta", "status": "timeout"})
     except Exception as exc:
         status = "error"
         log.error("Errore code interpreter: %s", exc)

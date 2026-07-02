@@ -160,13 +160,39 @@
         </div>
 
         <section class="panel">
-            <h2>Indexed Files</h2>
+            <div class="indexed-files-header">
+                <div>
+                    <h2>Indexed Files</h2>
+                    <p class="muted">
+                        Note: This is not the RAG vector index. Vectors and queryable chunks are in ChromaDB, or the chosen DB.
+                        This is just administrative metadata to know which files have been uploaded and with what result.
+                    </p>
+                </div>
+                <form method="get" class="pagination-size-form">
+                    <label for="filesPerPage">Rows</label>
+                    <select id="filesPerPage" name="per_page" onchange="this.form.submit()">
+                        {% for option in files_pagination.allowed_per_page %}
+                            <option value="{{ option }}" {% if option == files_pagination.per_page %}selected{% endif %}>{{ option }}</option>
+                        {% endfor %}
+                    </select>
+                    <input type="hidden" name="page" value="1">
+                </form>
+            </div>
             <p class="muted">
-                Note: This is not the RAG vector index. Vectors and queryable chunks are in ChromaDB, or the chosen DB.
-                This is just administrative metadata to know which files have been uploaded and with what result.
+                Showing {{ files_pagination.start }}-{{ files_pagination.end }} of {{ files_pagination.total }} tracked file(s).
             </p>
             <div class="table-wrap">
                 <table class="indexed-files-table">
+                    <colgroup>
+                        <col class="file-col">
+                        <col class="type-col">
+                        <col class="chunks-col">
+                        <col class="status-col">
+                        <col class="updated-col">
+                        <col class="profile-col">
+                        <col class="error-col">
+                        <col class="actions-col">
+                    </colgroup>
                     <thead>
                         <tr>
                             <th>File</th>
@@ -182,7 +208,7 @@
                     <tbody>
                         {% for file in files %}
                             <tr>
-                                <td>
+                                <td class="file-name-cell">
                                     {{ file.filename }}
                                     {% if file.transcript_path %}
                                         <br><span class="muted">Transcript saved</span>
@@ -200,15 +226,17 @@
                                         <span class="muted">n/a</span>
                                     {% endif %}
                                 </td>
-                                <td>{{ file.error if file.error else "—" }}</td>
-                                <td class="table-actions">
-                                    {% if file.status == "indexed" %}
-                                        <a class="secondary-link" href="{{ url_for('admin_download_file', filename=file.filename) }}">Download</a>
-                                    {% endif %}
-                                    <form method="post" action="{{ url_for('admin_delete_file') }}">
-                                        <input type="hidden" name="filename" value="{{ file.filename }}">
-                                        <button type="submit" class="danger">Remove</button>
-                                    </form>
+                                <td class="error-cell">{{ file.error if file.error else "—" }}</td>
+                                <td class="actions-cell">
+                                    <div class="table-actions">
+                                        {% if file.status == "indexed" %}
+                                            <a class="secondary-link" href="{{ url_for('admin_download_file', filename=file.filename) }}">Download</a>
+                                        {% endif %}
+                                        <form method="post" action="{{ url_for('admin_delete_file') }}">
+                                            <input type="hidden" name="filename" value="{{ file.filename }}">
+                                            <button type="submit" class="danger">Remove</button>
+                                        </form>
+                                    </div>
                                 </td>
                             </tr>
                         {% else %}
@@ -217,6 +245,27 @@
                     </tbody>
                 </table>
             </div>
+            {% if files_pagination.page_count > 1 %}
+                <nav class="pagination-nav" aria-label="Indexed files pages">
+                    {% if files_pagination.has_prev %}
+                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.prev_page, per_page=files_pagination.per_page) }}">Previous</a>
+                    {% else %}
+                        <span class="pagination-link disabled">Previous</span>
+                    {% endif %}
+                    {% for page_number in files_pagination.page_numbers %}
+                        {% if page_number == files_pagination.page %}
+                            <span class="pagination-link active" aria-current="page">{{ page_number }}</span>
+                        {% else %}
+                            <a class="pagination-link" href="{{ url_for('admin_files', page=page_number, per_page=files_pagination.per_page) }}">{{ page_number }}</a>
+                        {% endif %}
+                    {% endfor %}
+                    {% if files_pagination.has_next %}
+                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.next_page, per_page=files_pagination.per_page) }}">Next</a>
+                    {% else %}
+                        <span class="pagination-link disabled">Next</span>
+                    {% endif %}
+                </nav>
+            {% endif %}
         </section>
 
         <section class="panel">

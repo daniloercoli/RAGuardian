@@ -55,6 +55,23 @@ def test_create_and_retrieve_api_key():
         assert "key" not in keys[0]
 
 
+def test_bootstrap_admin_if_empty_creates_only_one_admin_concurrently(tmp_path):
+    store_path = tmp_path / "users.json"
+    store = UserStore(store_path)
+
+    def bootstrap(email: str):
+        return store.bootstrap_admin_if_empty(email=email, password="admin")
+
+    emails = ["first@example.local", "second@example.local"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(bootstrap, emails))
+
+    users = UserStore(store_path).list()
+    assert len(users) == 1
+    assert users[0]["role"] == "admin"
+    assert sum(result is not None for result in results) == 1
+
+
 def test_raw_api_key_is_hidden_from_public_user_views():
     with tempfile.TemporaryDirectory() as tmp:
         store_path = Path(tmp) / "users.json"

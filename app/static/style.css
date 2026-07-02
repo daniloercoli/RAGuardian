@@ -1272,6 +1272,41 @@ button.secondary:hover:not(:disabled) {
     margin-top: 16px;
 }
 
+.indexed-files-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.indexed-files-header h2 {
+    margin-bottom: 8px;
+}
+
+.pagination-size-form {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.pagination-size-form label {
+    color: #4a5568;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.pagination-size-form select {
+    border: 1px solid #cbd5e0;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #2d3748;
+    font: inherit;
+    font-weight: 700;
+    padding: 8px 28px 8px 10px;
+}
+
 table {
     width: 100%;
     border-collapse: collapse;
@@ -1280,6 +1315,7 @@ table {
 
 .indexed-files-table {
     table-layout: fixed;
+    min-width: 980px;
 }
 
 .indexed-files-table th,
@@ -1288,9 +1324,59 @@ table {
     word-wrap: break-word;
 }
 
-.indexed-files-table th:first-child,
-.indexed-files-table td:first-child {
-    width: 40%;
+.indexed-files-table .file-col {
+    width: 27%;
+}
+
+.indexed-files-table .type-col {
+    width: 7%;
+}
+
+.indexed-files-table .chunks-col {
+    width: 6%;
+}
+
+.indexed-files-table .status-col {
+    width: 9%;
+}
+
+.indexed-files-table .updated-col {
+    width: 15%;
+}
+
+.indexed-files-table .profile-col {
+    width: 12%;
+}
+
+.indexed-files-table .error-col {
+    width: 11%;
+}
+
+.indexed-files-table .actions-col {
+    width: 13%;
+}
+
+.indexed-files-table .actions-cell {
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.indexed-files-table .table-actions {
+    align-items: stretch;
+    flex-direction: column;
+    min-width: 112px;
+}
+
+.indexed-files-table .table-actions form {
+    width: 100%;
+}
+
+.indexed-files-table .table-actions .secondary-link,
+.indexed-files-table .table-actions button {
+    box-sizing: border-box;
+    justify-content: center;
+    white-space: nowrap;
+    width: 100%;
 }
 
 th,
@@ -1388,7 +1474,46 @@ th {
     background: #eff6ff;
 }
 
+.pagination-nav {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.pagination-link {
+    border: 1px solid #d8dee8;
+    border-radius: 8px;
+    color: #1d4ed8;
+    font-size: 13px;
+    font-weight: 800;
+    min-width: 38px;
+    padding: 8px 10px;
+    text-align: center;
+    text-decoration: none;
+}
+
+.pagination-link:hover {
+    background: #eff6ff;
+}
+
+.pagination-link.active {
+    background: #1d4ed8;
+    border-color: #1d4ed8;
+    color: #ffffff;
+}
+
+.pagination-link.disabled {
+    color: #94a3b8;
+    pointer-events: none;
+}
+
 @media (max-width: 720px) {
+    .indexed-files-header {
+        flex-direction: column;
+    }
+
     .form-grid,
     .form-grid.compact,
     .demo-readiness,

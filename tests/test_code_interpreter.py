@@ -4,6 +4,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import docker
+
+from app.utils.code_interpreter import CodeInterpreter
 from app.utils.interpreter_sandbox import check_code_safety
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,3 +49,26 @@ def test_check_code_safety_blocks_dangerous_os_alias():
     issues = check_code_safety("from os import system\nsystem('echo nope')\n")
 
     assert any("os.system" in issue for issue in issues)
+
+
+def test_code_interpreter_auto_builds_missing_image(tmp_path):
+    calls = []
+
+    class FakeImages:
+        def get(self, image_name):
+            raise docker.errors.ImageNotFound(image_name)
+
+        def build(self, **kwargs):
+            calls.append(kwargs)
+            return object(), []
+
+    class FakeClient:
+        images = FakeImages()
+
+    interpreter = CodeInterpreter({"upload_folder": str(tmp_path), "auto_build": True})
+
+    interpreter._ensure_image(FakeClient())
+
+    assert calls
+    assert calls[0]["tag"] == CodeInterpreter.IMAGE_NAME
+    assert calls[0]["dockerfile"] == "Dockerfile.code-interpreter"

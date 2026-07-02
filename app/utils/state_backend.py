@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import Any
 
 
@@ -8,6 +9,10 @@ SUPPORTED_QUEUE_BACKENDS = {"inline", "redis"}
 
 class StateBackendError(RuntimeError):
     pass
+
+
+_POOL_LOCK = threading.Lock()
+_POOLS: dict[tuple, Any] = {}
 
 
 def configured_state_backend() -> str:
@@ -33,11 +38,36 @@ def redis_connection():
     except ImportError as exc:
         raise StateBackendError("redis package is not installed") from exc
 
-    return redis.Redis.from_url(
+    pool_key = _redis_pool_key()
+    with _POOL_LOCK:
+        pool = _POOLS.get(pool_key)
+        if pool is None:
+            pool = redis.ConnectionPool.from_url(
+                redis_url(),
+                decode_responses=False,
+                socket_connect_timeout=pool_key[1],
+                socket_timeout=pool_key[2],
+                max_connections=pool_key[3],
+            )
+            _POOLS[pool_key] = pool
+    return redis.Redis(connection_pool=pool)
+
+
+def reset_redis_pools() -> None:
+    with _POOL_LOCK:
+        for pool in _POOLS.values():
+            disconnect = getattr(pool, "disconnect", None)
+            if callable(disconnect):
+                disconnect()
+        _POOLS.clear()
+
+
+def _redis_pool_key() -> tuple:
+    return (
         redis_url(),
-        decode_responses=False,
-        socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT", "1.0")),
-        socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "1.0")),
+        float(os.getenv("REDIS_CONNECT_TIMEOUT", "1.0")),
+        float(os.getenv("REDIS_SOCKET_TIMEOUT", "1.0")),
+        int(os.getenv("REDIS_MAX_CONNECTIONS", "20")),
     )
 
 

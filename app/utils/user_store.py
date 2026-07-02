@@ -6,11 +6,17 @@ import re
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 
 USER_ROLES = {"admin", "user"}
@@ -26,6 +32,7 @@ class UserStore:
         configured = path or os.getenv("RAG_USERS_FILE", "app/data/users.json")
         self.path = Path(configured)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         with self._locks_guard:
             self._lock = self._locks.setdefault(str(self.path.resolve()), threading.Lock())
 
@@ -64,24 +71,21 @@ class UserStore:
             raise ValueError("email is required")
         if not password:
             raise ValueError("password is required")
-        now = _now()
         with self._lock:
-            users = self._list_unlocked()
-            if any(user.get("email") == email for user in users):
-                raise ValueError("email already exists")
-            user = {
-                "id": _user_id(email),
-                "email": email,
-                "display_name": display_name.strip() or email,
-                "password_hash": generate_password_hash(password),
-                "role": role,
-                "enabled": bool(enabled),
-                "created_at": now,
-                "updated_at": now,
-            }
-            users.append(user)
-            self._save_unlocked(users)
-            return _public_user(user)
+            with self._process_lock_unlocked():
+                users = self._list_unlocked()
+                if any(user.get("email") == email for user in users):
+                    raise ValueError("email already exists")
+                user = _user_record(
+                    email=email,
+                    password=password,
+                    display_name=display_name,
+                    role=role,
+                    enabled=enabled,
+                )
+                users.append(user)
+                self._save_unlocked(users)
+                return _public_user(user)
 
     def update_user(self, user_id: str, **patch) -> Optional[dict]:
         with self._lock:
@@ -118,15 +122,18 @@ class UserStore:
 
     def bootstrap_admin_if_empty(self, *, email: str, password: str) -> dict | None:
         with self._lock:
-            if self._list_unlocked():
-                return None
-        return self.create_user(
-            email=email or "admin@example.local",
-            password=password,
-            display_name="Admin",
-            role="admin",
-            enabled=True,
-        )
+            with self._process_lock_unlocked():
+                if self._list_unlocked():
+                    return None
+                user = _user_record(
+                    email=normalize_email(email or "admin@example.local"),
+                    password=password,
+                    display_name="Admin",
+                    role="admin",
+                    enabled=True,
+                )
+                self._save_unlocked([user])
+                return _public_user(user)
 
     def get_api_keys(self, user_id: str, *, include_raw: bool = False) -> list[dict]:
         """Return API keys for a user with raw values hidden by default."""
@@ -379,6 +386,18 @@ class UserStore:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
 
+    @contextmanager
+    def _process_lock_unlocked(self):
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock_path.open("a+") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 def normalize_email(value: str) -> str:
     return str(value or "").strip().lower()
@@ -392,6 +411,27 @@ def _public_user(user: dict) -> dict:
             for key in (user.get("api_keys") or [])
         ]
     return result
+
+
+def _user_record(
+    *,
+    email: str,
+    password: str,
+    display_name: str = "",
+    role: str = "user",
+    enabled: bool = True,
+) -> dict:
+    now = _now()
+    return {
+        "id": _user_id(email),
+        "email": email,
+        "display_name": display_name.strip() or email,
+        "password_hash": generate_password_hash(password),
+        "role": role,
+        "enabled": bool(enabled),
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 def _public_api_key(key: dict, *, user_id: str, include_raw: bool = False) -> dict:

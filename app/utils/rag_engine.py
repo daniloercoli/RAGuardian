@@ -106,7 +106,14 @@ def query_rag_non_stream(
 
     conversation_context = _conversation_context(conversation_id)
     retrieval_query = _retrieval_query(query, conversation_id)
-    context_docs = _get_context(retrieval_query, effective_k, selected_model, settings, collection_name=collection_name)
+    context_docs = _get_context(
+        retrieval_query,
+        effective_k,
+        selected_model,
+        settings,
+        collection_name=collection_name,
+        conversation_id=conversation_id,
+    )
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer = "".join(
         generate_response(
@@ -183,6 +190,7 @@ def prepare_rag_context(
         settings,
         use_cache=use_cache,
         collection_name=collection_name,
+        conversation_id=conversation_id,
     )
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     return {
@@ -230,6 +238,7 @@ def query_rag_stream(
         settings,
         use_cache=False,
         collection_name=collection_name,
+        conversation_id=conversation_id,
     )
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer_parts = []
@@ -297,6 +306,7 @@ def query_rag_stream_events(
             settings,
             use_cache=False,
             collection_name=collection_name,
+            conversation_id=conversation_id,
         )
         context_docs = _merge_context_docs(context_docs, extra_context_docs)
         provider_name = provider_config.get("name", provider_id)
@@ -624,6 +634,7 @@ def _get_context(
     settings: dict,
     use_cache: bool = True,
     collection_name: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ):
     from utils.metrics import get_metrics
 
@@ -631,8 +642,9 @@ def _get_context(
     retrieval_start = time.time()
     cached_results = None
     cache_query = f"{collection_name or 'documents'}\n{query}"
+    cache_namespace = conversation_id or "stateless"
     if use_cache and settings["rag"]["enable_cache"]:
-        cached_results = _cache.get(cache_query, k, model)
+        cached_results = _cache.get(cache_query, k, model, namespace=cache_namespace)
 
     cache_hit = bool(cached_results)
     is_cached_or_enabled = cached_results is not None or (use_cache and settings["rag"]["enable_cache"])
@@ -714,7 +726,7 @@ def _get_context(
     metrics.set_context_docs_count(len(context_docs))
 
     if use_cache and settings["rag"]["enable_cache"]:
-        _cache.set(cache_query, context_docs, k, model)
+        _cache.set(cache_query, context_docs, k, model, namespace=cache_namespace)
     return context_docs
 
 

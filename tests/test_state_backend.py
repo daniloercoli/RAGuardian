@@ -1,3 +1,7 @@
+import sys
+import types
+
+from app.utils import state_backend
 from app.utils.state_backend import configured_queue_backend, configured_state_backend, runtime_state_status
 
 
@@ -32,3 +36,35 @@ def test_runtime_state_status_reports_memory_ready(monkeypatch):
         "active_jobs_count": 2,
     }
 
+
+def test_redis_connection_reuses_connection_pool(monkeypatch):
+    created_pools = []
+
+    class FakeConnectionPool:
+        @classmethod
+        def from_url(cls, *args, **kwargs):
+            pool = types.SimpleNamespace(args=args, kwargs=kwargs, disconnected=False)
+            pool.disconnect = lambda: setattr(pool, "disconnected", True)
+            created_pools.append(pool)
+            return pool
+
+    class FakeRedisClient:
+        def __init__(self, connection_pool):
+            self.connection_pool = connection_pool
+
+    fake_redis = types.SimpleNamespace(
+        ConnectionPool=FakeConnectionPool,
+        Redis=FakeRedisClient,
+    )
+    monkeypatch.setitem(sys.modules, "redis", fake_redis)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/15")
+    state_backend.reset_redis_pools()
+
+    first = state_backend.redis_connection()
+    second = state_backend.redis_connection()
+
+    assert first.connection_pool is second.connection_pool
+    assert len(created_pools) == 1
+
+    state_backend.reset_redis_pools()
+    assert created_pools[0].disconnected is True

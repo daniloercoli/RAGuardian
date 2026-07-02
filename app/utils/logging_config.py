@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -12,6 +13,65 @@ class LogLevel:
     WARNING = logging.WARNING
     ERROR = logging.ERROR
     CRITICAL = logging.CRITICAL
+
+
+_SECRET_FIELD_RE = re.compile(r"(api[_-]?key|x-api-key|authorization|bearer|token|secret|password)", re.I)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?P<label>api[_-]?key|x-api-key|authorization|bearer|token|secret|password)"
+    r"(?P<sep>\s*[:=]\s*|\s+)"
+    r"(?P<value>[^\s,;\"']{9,})",
+    re.I,
+)
+_BEARER_RE = re.compile(r"\b(?P<label>Bearer\s+)(?P<value>[^\s,;\"']{9,})", re.I)
+
+
+def mask_secret_for_log(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def sanitize_log_text(value: object) -> str:
+    text = str(value)
+
+    def repl(match: re.Match) -> str:
+        return f"{match.group('label')}{match.group('sep')}{mask_secret_for_log(match.group('value'))}"
+
+    text = _BEARER_RE.sub(
+        lambda match: f"{match.group('label')}{mask_secret_for_log(match.group('value'))}",
+        text,
+    )
+    return _SECRET_ASSIGNMENT_RE.sub(repl, text)
+
+
+def sanitize_log_value(key: str, value):
+    if isinstance(value, dict):
+        return {name: sanitize_log_value(str(name), item) for name, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_log_value(key, item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_log_value(key, item) for item in value)
+    if isinstance(value, str):
+        if _SECRET_FIELD_RE.search(str(key)):
+            return mask_secret_for_log(value)
+        return sanitize_log_text(value)
+    return value
+
+
+class SanitizingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        original_msg = record.msg
+        original_args = record.args
+        record.msg = sanitize_log_text(record.getMessage())
+        record.args = ()
+        try:
+            return super().format(record)
+        finally:
+            record.msg = original_msg
+            record.args = original_args
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -39,7 +99,7 @@ class JsonLogFormatter(logging.Formatter):
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": sanitize_log_text(record.getMessage()),
             "module": record.module,
             "function": record.funcName,
             "line": record.lineno,
@@ -52,7 +112,7 @@ class JsonLogFormatter(logging.Formatter):
             if key in self._STANDARD_ATTRS:
                 continue
             if isinstance(value, (str, int, float, bool)) or value is None:
-                log_data[key] = value
+                log_data[key] = sanitize_log_value(key, value)
 
         # Exception info
         if record.exc_info and record.exc_info[0] is not None:
@@ -121,7 +181,7 @@ def _has_handler(logger: logging.Logger, kind: str) -> bool:
 
 
 def _human_formatter(datefmt: str) -> logging.Formatter:
-    return logging.Formatter(
+    return SanitizingFormatter(
         fmt="[%(asctime)s] %(levelname)-8s %(name)s: %(message)s",
         datefmt=datefmt,
     )

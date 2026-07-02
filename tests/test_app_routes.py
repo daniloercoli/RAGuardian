@@ -3,6 +3,7 @@ import io
 import json
 import re
 import sys
+import time
 import types
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -10,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from flask import request
 
 from app import create_app
 from app.utils.conversation_memory import get_conversation_store, reset_conversation_store
@@ -89,6 +91,77 @@ def _workspace_context(flask_app):
             enabled=True,
         )
     return workspace_for_user(user, app=flask_app)
+
+
+def test_cors_preflight_allows_configured_origin(client, flask_app):
+    flask_app.config.update(
+        CORS_ALLOWED_ORIGINS=["https://client.example"],
+        CORS_ALLOWED_METHODS=["GET", "POST", "OPTIONS"],
+        CORS_ALLOWED_HEADERS=["Content-Type", "X-API-Key"],
+        CORS_ALLOW_CREDENTIALS=True,
+    )
+
+    response = client.options(
+        "/api/v1/query",
+        headers={
+            "Origin": "https://client.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 204
+    assert response.headers["Access-Control-Allow-Origin"] == "https://client.example"
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+    assert "X-API-Key" in response.headers["Access-Control-Allow-Headers"]
+
+
+def test_cors_does_not_reflect_untrusted_origin(client, flask_app):
+    flask_app.config["CORS_ALLOWED_ORIGINS"] = ["https://client.example"]
+
+    response = client.options(
+        "/api/v1/query",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+def test_request_timeout_helper_raises_when_deadline_elapsed(flask_app):
+    app_module = importlib.import_module("app.app")
+
+    with flask_app.test_request_context("/ask"):
+        request._rag_deadline = time.monotonic() - 1
+        with pytest.raises(app_module.RequestTimeoutExceeded):
+            app_module._ensure_request_not_timed_out()
+
+
+def test_admin_files_paginates_indexed_files(client, flask_app, tmp_path):
+    client.post("/admin/login", data={"password": "admin"})
+    workspace = _workspace_context(flask_app)
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir(exist_ok=True)
+    for index in range(30):
+        upload_path = upload_dir / f"file-{index:02d}.pdf"
+        upload_path.write_bytes(b"%PDF-1.4")
+        FileIndex(workspace.file_index).record(
+            f"file-{index:02d}.pdf",
+            str(upload_path),
+            chunks=index + 1,
+            status="indexed",
+        )
+
+    response = client.get("/admin/files?page=2&per_page=10")
+    html = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Showing 11-20 of 30 tracked file(s)." in html
+    assert "file-19.pdf" in html
+    assert "file-10.pdf" in html
+    assert "file-29.pdf" not in html
+    assert 'aria-current="page">2</span>' in html
 
 
 def test_user_api_key_expiration_uses_full_timestamp(flask_app):

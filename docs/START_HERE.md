@@ -144,7 +144,8 @@ Wait until the Docker daemon is ready:
 until docker info >/dev/null 2>&1; do sleep 2; done
 ```
 
-Build the code interpreter image from the project root:
+By default, the app builds the code interpreter image automatically on first use
+when Docker is available. You can also build it manually from the project root:
 
 ```bash
 docker build -f Dockerfile.code-interpreter -t code-interpreter:latest .
@@ -154,6 +155,7 @@ Useful `.env` settings:
 
 ```env
 CODE_INTERPRETER_ENABLED=1
+CODE_INTERPRETER_AUTO_BUILD=1
 CODE_INTERPRETER_TIMEOUT=60
 CODE_INTERPRETER_MAX_FILE_MB=25
 CODE_INTERPRETER_TTL_HOURS=24
@@ -411,15 +413,15 @@ open -a Docker
 docker info
 ```
 
-### Code interpreter image is missing
+### Code interpreter image build fails
 
 Symptom:
 
 ```text
-Immagine Docker non trovata
+Immagine Docker non trovata e auto-build non disponibile
 ```
 
-Fix:
+Fix or rebuild manually:
 
 ```bash
 docker build -f Dockerfile.code-interpreter -t code-interpreter:latest .

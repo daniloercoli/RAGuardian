@@ -103,8 +103,9 @@ class RAGCache:
         from config import Config
         return Config.rag
     
-    def _generate_key(self, query: str, k: int, model: str) -> str:
+    def _generate_key(self, query: str, k: int, model: str, namespace: str = "stateless") -> str:
         key_data = {
+            "namespace": namespace or "stateless",
             "query": query,
             "k": k,
             "model": model
@@ -115,14 +116,20 @@ class RAGCache:
     def _redis_key(self, cache_key: str) -> str:
         return f"{state_key_prefix()}:cache:{cache_key}"
     
-    def get(self, query: str, k: Optional[int] = None, model: Optional[str] = None) -> Optional[list]:
+    def get(
+        self,
+        query: str,
+        k: Optional[int] = None,
+        model: Optional[str] = None,
+        namespace: str = "stateless",
+    ) -> Optional[list]:
         config = self._get_config()
         if not config.enable_cache:
             return None
         
         k = k or config.query_k
         model = model or config.default_model
-        cache_key = self._generate_key(query, k, model)
+        cache_key = self._generate_key(query, k, model, namespace)
         
         if self._backend == "redis" and self._redis is not None:
             try:
@@ -140,14 +147,21 @@ class RAGCache:
         
         return result
     
-    def set(self, query: str, results: list, k: Optional[int] = None, model: Optional[str] = None):
+    def set(
+        self,
+        query: str,
+        results: list,
+        k: Optional[int] = None,
+        model: Optional[str] = None,
+        namespace: str = "stateless",
+    ):
         config = self._get_config()
         if not config.enable_cache:
             return
         
         k = k or config.query_k
         model = model or config.default_model
-        cache_key = self._generate_key(query, k, model)
+        cache_key = self._generate_key(query, k, model, namespace)
         
         if self._backend == "redis" and self._redis is not None:
             try:

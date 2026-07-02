@@ -46,6 +46,12 @@ class CodeInterpreter:
             config.get("docker_cpu_quota")
             or env.get("CODE_INTERPRETER_DOCKER_CPU_QUOTA", "100000")
         )
+        auto_build_value = (
+            config["auto_build"]
+            if "auto_build" in config
+            else env.get("CODE_INTERPRETER_AUTO_BUILD", "1")
+        )
+        self.auto_build = _as_bool(auto_build_value, default=True)
 
         upload_folder = str(config.get("upload_folder", "app/uploads"))
         self.upload_folder = Path(upload_folder)
@@ -130,6 +136,7 @@ class CodeInterpreter:
         try:
             client = self._client or docker.from_env()
             self._client = client
+            self._ensure_image(client)
             container = client.containers.run(
                 self.IMAGE_NAME,
                 command=[
@@ -176,9 +183,9 @@ class CodeInterpreter:
             return {
                 "success": False,
                 "error": (
-                    "Immagine Docker non trovata. "
+                    "Immagine Docker non trovata e auto-build non disponibile. "
                     "Esegui: docker build -f Dockerfile.code-interpreter "
-                    "-t code-interpreter:latest ."
+                    "-t code-interpreter:latest . oppure abilita CODE_INTERPRETER_AUTO_BUILD=1."
                 ),
             }
         except docker.errors.DockerException as exc:
@@ -206,6 +213,33 @@ class CodeInterpreter:
         if raw is None:
             return {"success": False, "error": "Execution produced no result"}
         return self._normalise_result(raw, run_id, output_dir)
+
+    def _ensure_image(self, client) -> None:
+        if not self.auto_build:
+            return
+        try:
+            client.images.get(self.IMAGE_NAME)
+            return
+        except docker.errors.ImageNotFound:
+            pass
+
+        project_root = Path(__file__).resolve().parents[2]
+        dockerfile = project_root / "Dockerfile.code-interpreter"
+        if not dockerfile.exists():
+            raise RuntimeError(f"Dockerfile non trovato: {dockerfile}")
+
+        log.info("Code interpreter image missing, building %s", self.IMAGE_NAME)
+        try:
+            client.images.build(
+                path=str(project_root),
+                dockerfile=str(dockerfile.relative_to(project_root)),
+                tag=self.IMAGE_NAME,
+                rm=True,
+                pull=False,
+            )
+        except docker.errors.BuildError as exc:
+            raise RuntimeError(f"Build automatico immagine Docker fallito: {exc}") from exc
+        log.info("Code interpreter image built: %s", self.IMAGE_NAME)
 
     def _read_result(self, output_dir: Path) -> dict | None:
         host_result = output_dir / "result.json"
@@ -250,3 +284,11 @@ class CodeInterpreter:
             "error": raw.get("error", ""),
             "images": url_images,
         }
+
+
+def _as_bool(value, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}

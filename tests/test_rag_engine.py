@@ -163,6 +163,37 @@ def test_query_rag_stream_events_uses_conversation_memory(monkeypatch):
     reset_conversation_store()
 
 
+def test_context_cache_is_namespaced_by_conversation_id(monkeypatch):
+    docs = [SimpleNamespace(page_content="Contesto", metadata={"source": "demo.pdf"})]
+    captured = {"get": [], "set": []}
+
+    class FakeCache:
+        def get(self, query, k, model, namespace="stateless"):
+            captured["get"].append((query, k, model, namespace))
+            return None
+
+        def set(self, query, results, k, model, namespace="stateless"):
+            captured["set"].append((query, results, k, model, namespace))
+
+    monkeypatch.setattr(rag_engine, "_cache", FakeCache())
+    monkeypatch.setattr(rag_engine, "query_chroma", lambda *args, **kwargs: docs)
+
+    settings = {"rag": {"enable_cache": True, "reranker_enabled": False}}
+
+    result = rag_engine._get_context(
+        "Domanda valida?",
+        4,
+        "fake-model",
+        settings,
+        collection_name="workspace-alice",
+        conversation_id="workspace-alice:conv-12345678",
+    )
+
+    assert result == docs
+    assert captured["get"][0][3] == "workspace-alice:conv-12345678"
+    assert captured["set"][0][4] == "workspace-alice:conv-12345678"
+
+
 def test_response_language_instruction_policy():
     assert _response_language_instruction(None) == "Rispondi nella stessa lingua della domanda dell'utente."
     assert _response_language_instruction("auto") == "Rispondi nella stessa lingua della domanda dell'utente."

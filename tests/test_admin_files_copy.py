@@ -24,6 +24,11 @@ def test_admin_files_explains_file_index_metadata():
     assert "rebuildModal" in template
     assert "Rebuild Index" in template
     assert "source_type" in template
+    assert "files_pagination" in template
+    assert '<col class="actions-col">' in template
+    assert '<td class="actions-cell">' in template
+    assert "pagination-size-form" in template
+    assert "pagination-nav" in template
 
 
 def test_admin_files_supports_multi_file_upload_interface():
