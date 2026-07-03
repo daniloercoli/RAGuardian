@@ -11,7 +11,6 @@ langchain-community>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-core>=0.3,<0.4
 chromadb>=1.0.21,<1.1
-mistralai>=1.0,<2
 # Modern Transformers line. Local sentence-transformers embeddings are installed
 # automatically only where modern PyTorch wheels are available. On macOS x86_64,
 # PyPI currently exposes only torch 2.2.x, so use Regolo/cloud embeddings or a
@@ -20,7 +19,6 @@ transformers>=5.0,<6
 torch>=2.4,<3; sys_platform != "darwin" or platform_machine != "x86_64"
 sentence-transformers>=5.0,<6; sys_platform != "darwin" or platform_machine != "x86_64"
 openai>=1.50,<3
-regolo>=1.0
 certifi>=2025.1.31
 pypdf>=5,<7
 PyMuPDF>=1.24,<2

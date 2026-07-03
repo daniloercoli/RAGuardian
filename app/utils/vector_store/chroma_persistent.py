@@ -1,5 +1,6 @@
 import os
 import re
+from collections import Counter
 from typing import Callable, Optional
 
 from config import Config
@@ -121,6 +122,7 @@ class ChromaPersistentVectorStore(VectorStore):
         top_n: int = 20,
         reranker=None,
         score_threshold: float = 0.0,
+        diversity_enabled: bool = True,
     ):
         from utils.reranker import DummyReranker
 
@@ -129,8 +131,18 @@ class ChromaPersistentVectorStore(VectorStore):
 
         log.info(f"Query con ReRanker: '{query}' (recupero {top_n}, finale {k})")
 
-        docs = self.query(query, k=top_n)
-        log.info(f"ReRanker: recuperati {len(docs)} documenti dal vector DB")
+        if diversity_enabled:
+            retrieved_docs = self.query(query, k=_rerank_pool_size(top_n))
+            docs = _diverse_documents(retrieved_docs, limit=top_n, max_per_source=_max_chunks_per_source(k))
+            log.info(
+                f"ReRanker: recuperati {len(retrieved_docs)} documenti dal vector DB, "
+                f"{len(docs)} candidati dopo diversity"
+            )
+        else:
+            docs = self.query(query, k=top_n)
+            log.info(f"ReRanker: recuperati {len(docs)} documenti dal vector DB")
+        if docs:
+            log.info("ReRanker: candidati dal vector DB: %s", _document_labels(docs))
 
         reranked_docs = reranker.rerank(query, docs, k)
         if score_threshold > 0:
@@ -194,3 +206,49 @@ def _reranker_score(doc) -> Optional[float]:
         return float(score)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _rerank_pool_size(top_n: int) -> int:
+    return min(max(top_n, top_n * 4), 200)
+
+
+def _max_chunks_per_source(final_k: int) -> int:
+    return max(1, min(3, final_k))
+
+
+def _diverse_documents(docs, limit: int, max_per_source: int):
+    selected = []
+    overflow = []
+    counts = Counter()
+
+    for doc in docs:
+        source = _document_source(doc)
+        if counts[source] < max_per_source:
+            selected.append(doc)
+            counts[source] += 1
+            if len(selected) >= limit:
+                return selected
+        else:
+            overflow.append(doc)
+
+    for doc in overflow:
+        if len(selected) >= limit:
+            break
+        selected.append(doc)
+    return selected
+
+
+def _document_source(doc) -> str:
+    metadata = doc.metadata or {}
+    return str(metadata.get("source") or metadata.get("document_id") or "document")
+
+
+def _document_labels(docs) -> str:
+    labels = []
+    for index, doc in enumerate(docs, start=1):
+        metadata = doc.metadata or {}
+        source = _document_source(doc)
+        name = os.path.basename(source) or source
+        chunk = metadata.get("chunk_id")
+        labels.append(f"{index}:{name}" + (f" chunk={chunk}" if chunk is not None else ""))
+    return ", ".join(labels)

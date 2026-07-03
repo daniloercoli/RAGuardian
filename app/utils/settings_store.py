@@ -139,6 +139,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "reranker_type": str(_reranker_default.get("id") or "local"),
         "reranker_model": _default_reranker_model_value(_reranker_default),
         "reranker_top_n": 20,
+        "reranker_source_diversity": False,
         "reranker_threshold": 0.0,
         "reranker_api_key": "",
         "reranker_regolo_api_key": "",
@@ -375,6 +376,7 @@ class SettingsStore:
         rag["reranker_enabled"] = _as_bool(rag.get("reranker_enabled"), False)
         _normalize_reranker_default(settings)
         rag["reranker_top_n"] = _int_between(rag.get("reranker_top_n"), 1, 200, 20)
+        rag["reranker_source_diversity"] = _as_bool(rag.get("reranker_source_diversity"), False)
         rag["reranker_threshold"] = _float_between(rag.get("reranker_threshold"), 0.0, 10.0, 0.0)
         rag["reranker_api_key"] = str(
             rag.get("reranker_api_key") or rag.get("reranker_regolo_api_key") or ""

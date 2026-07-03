@@ -283,6 +283,12 @@ class TestBackupStorageFactory:
         storage = create_backup_storage()
         assert isinstance(storage, LocalBackupStorage)
 
+    def test_remote_env_still_returns_local(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BACKUP_REMOTE_TYPE", "http")
+        monkeypatch.setenv("BACKUP_DIR", str(tmp_path))
+        storage = create_backup_storage()
+        assert isinstance(storage, LocalBackupStorage)
+
     def test_schedule_hours_default(self, monkeypatch):
         # Default is "2,20"
         assert _default_schedule_hours() == [2, 20]

@@ -8,6 +8,17 @@ from app.utils.model_defaults import (
     load_builtin_voice_providers,
 )
 from app.utils.providers.registry import ProviderRegistry
+from app.utils.providers.provider_factory import ProviderFactory
+from app.utils.providers import provider_factory as provider_factory_module
+
+
+class FakeLLMProvider:
+    def __init__(self, provider_config):
+        self.provider_config = provider_config
+
+    @property
+    def provider_name(self):
+        return self.provider_config["name"]
 
 
 def test_builtin_models_are_listed():
@@ -26,6 +37,21 @@ def test_builtin_models_are_loaded_from_json():
     assert providers["mistral"]["api_key_env"] == "MISTRAL_API_KEY"
     assert "mistral-medium" in providers["mistral"]["models"]
     assert providers["regolo"]["api_key_env"] == "REGOLO_API_KEY"
+
+
+def test_builtin_llm_uses_openai_compatible_provider(monkeypatch):
+    ProviderFactory.reset_cache()
+    monkeypatch.setattr(provider_factory_module, "OpenAICompatibleProvider", FakeLLMProvider)
+
+    try:
+        provider = ProviderFactory.get_provider(
+            model="mistral-medium",
+            settings={"rag": {"default_provider": "mistral", "default_model": "mistral-medium"}},
+        )
+
+        assert provider.provider_config["base_url"] == "https://api.mistral.ai/v1"
+    finally:
+        ProviderFactory.reset_cache()
 
 
 def test_builtin_reranker_mode_is_loaded_from_json():

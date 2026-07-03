@@ -68,6 +68,7 @@ class RAGConfig:
     reranker_enabled: bool = False
     reranker_model: str = DEFAULT_SETTINGS["rag"]["reranker_model"]
     reranker_top_n: int = 20
+    reranker_source_diversity: bool = False
     reranker_threshold: float = 0.0
 
 @dataclass

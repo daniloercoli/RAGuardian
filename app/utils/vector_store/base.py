@@ -29,6 +29,7 @@ class VectorStore(ABC):
         top_n: int = 20,
         reranker=None,
         score_threshold: float = 0.0,
+        diversity_enabled: bool = True,
     ):
         pass
 

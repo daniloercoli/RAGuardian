@@ -3494,6 +3494,7 @@ def _handle_config_post(store: SettingsStore) -> None:
                 "reranker_model": reranker_model,
                 "reranker_type": reranker_type,
                 "reranker_top_n": request.form.get("reranker_top_n"),
+                "reranker_source_diversity": "reranker_source_diversity" in request.form,
                 "reranker_threshold": request.form.get("reranker_threshold"),
                 "reranker_api_key": reranker_api_key,
                 "reranker_regolo_api_key": current_rag.get("reranker_regolo_api_key", ""),

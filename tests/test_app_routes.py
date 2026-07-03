@@ -1267,6 +1267,7 @@ def test_admin_can_select_custom_reranker_provider(client, flask_app):
             "reranker_enabled": "on",
             "reranker_model": "ranker/vendor/rerank-b",
             "reranker_top_n": "24",
+            "reranker_source_diversity": "on",
             "reranker_threshold": "1.5",
         },
     )
@@ -1275,6 +1276,7 @@ def test_admin_can_select_custom_reranker_provider(client, flask_app):
     assert response.status_code == 302
     assert settings["rag"]["reranker_type"] == "ranker"
     assert settings["rag"]["reranker_model"] == "ranker/vendor/rerank-b"
+    assert settings["rag"]["reranker_source_diversity"] is True
 
 
 def test_admin_can_select_custom_voice_provider(client, flask_app):
@@ -1480,6 +1482,7 @@ def test_admin_reranker_keeps_existing_secret_when_password_field_blank(client, 
             "reranker_enabled": "on",
             "reranker_model": "regolo/Qwen3-Reranker-4B",
             "reranker_top_n": "12",
+            "reranker_source_diversity": "on",
             "reranker_threshold": "2.5",
             "reranker_regolo_api_key": "",
         },
@@ -1489,6 +1492,7 @@ def test_admin_reranker_keeps_existing_secret_when_password_field_blank(client, 
     assert response.status_code == 302
     assert settings["rag"]["reranker_regolo_api_key"] == "regolo-secret-1234"
     assert settings["rag"]["reranker_top_n"] == 12
+    assert settings["rag"]["reranker_source_diversity"] is True
     assert settings["rag"]["reranker_threshold"] == 2.5
 
 

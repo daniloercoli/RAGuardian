@@ -267,6 +267,7 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
             "reranker_type": "custom",
             "reranker_model": "ranker/vendor/rerank-b",
             "reranker_top_n": 12,
+            "reranker_source_diversity": False,
             "reranker_threshold": 1.5,
         },
         "reranker_providers": [
@@ -287,13 +288,14 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
         captured["reranker_kwargs"] = kwargs
         return FakeReranker()
 
-    def fake_query_chroma_with_rerank(query, k, top_n, reranker, score_threshold):
+    def fake_query_chroma_with_rerank(query, k, top_n, reranker, score_threshold, diversity_enabled):
         captured["query_kwargs"] = {
             "query": query,
             "k": k,
             "top_n": top_n,
             "reranker": reranker,
             "score_threshold": score_threshold,
+            "diversity_enabled": diversity_enabled,
         }
         return ["doc"]
 
@@ -311,4 +313,29 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
         "mode": "chat_completions",
     }
     assert captured["query_kwargs"]["top_n"] == 12
+    assert captured["query_kwargs"]["diversity_enabled"] is False
     assert captured["query_kwargs"]["score_threshold"] == 1.5
+
+
+def test_get_context_defaults_source_diversity_off(monkeypatch):
+    settings = {
+        "rag": {
+            "enable_cache": False,
+            "reranker_enabled": True,
+            "reranker_type": "local",
+            "reranker_model": "local/test-reranker",
+            "reranker_top_n": 12,
+        },
+    }
+    captured = {}
+
+    monkeypatch.setattr(rag_engine, "get_reranker", lambda **kwargs: object())
+
+    def fake_query_chroma_with_rerank(query, **kwargs):
+        captured.update(kwargs)
+        return ["doc"]
+
+    monkeypatch.setattr(rag_engine, "query_chroma_with_rerank", fake_query_chroma_with_rerank)
+
+    assert rag_engine._get_context("domanda", 4, "model", settings, use_cache=False) == ["doc"]
+    assert captured["diversity_enabled"] is False

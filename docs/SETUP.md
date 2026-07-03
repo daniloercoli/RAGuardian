@@ -47,6 +47,34 @@ The app starts without provider keys. To ask questions against your documents, c
 
 Voice and OCR are optional; configure them only for audio or scanned PDF workflows.
 
+## ReRanking and Source Diversity
+
+With ReRanking enabled, retrieval has four steps:
+
+```text
+question -> Chroma candidates -> optional Source Diversity -> reranker -> final k chunks -> LLM
+```
+
+`Documents for ReRanking (top_n)` controls how many chunks the reranker receives.
+Without Source Diversity, those chunks are the top `top_n` results returned by
+Chroma. If one large or very repetitive document dominates vector similarity,
+many candidates can come from that same source, and other relevant books or PDFs
+may never reach the reranker.
+
+**Source Diversity** is an optional pre-reranker diversification step in
+**Admin -> Configuration -> ReRanking**. It is OFF by default. When enabled, the
+app retrieves a wider Chroma pool, then limits how many chunks from the same
+source document are sent to the reranker. This gives more documents a chance to
+compete before the reranker chooses the final `Retrieval Results (k)` chunks.
+
+This is not full MMR. It is a simpler per-source chunk cap before reranking:
+
+- use it when the same document monopolizes Chroma candidates;
+- leave it off when you intentionally want pure vector similarity and repeated
+  chunks from one source are acceptable;
+- inspect the `rag_service.chroma` logs to see which source filenames and chunk
+  IDs are passed to the reranker.
+
 ## Production Environment
 
 Set these values for any non-trivial deployment:

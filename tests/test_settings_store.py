@@ -19,6 +19,7 @@ def test_settings_store_creates_defaults(tmp_path):
     assert settings_file.exists()
     assert settings["rag"]["query_k"] == 5
     assert settings["rag"]["default_model"] == "gpt-oss-120b"
+    assert settings["rag"]["reranker_source_diversity"] is False
     assert settings["voice"]["enabled"] is True
     assert settings["voice"]["stt_language"] == ""
     assert settings["ocr"]["enabled"] is True
@@ -46,6 +47,14 @@ def test_settings_store_persists_runtime_values(tmp_path):
     assert loaded["rag"]["temperature"] == 0.7
     assert loaded["rag"]["embedding_provider"] == "regolo"
     assert loaded["rag"]["embedding_model"] == "Qwen3-Embedding-8B"
+
+
+def test_settings_store_persists_reranker_source_diversity(tmp_path):
+    store = SettingsStore(str(tmp_path / "settings.json"))
+
+    settings = store.update({"rag": {"reranker_source_diversity": False}})
+
+    assert settings["rag"]["reranker_source_diversity"] is False
 
 
 def test_settings_store_canonicalizes_llm_default_model_casing(tmp_path):

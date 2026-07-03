@@ -4,6 +4,7 @@ import pytest
 from langchain_core.documents import Document
 
 from app.utils import chroma_manager
+from utils.vector_store import chroma_persistent
 from utils.vector_store.chroma_persistent import ChromaPersistentVectorStore
 from utils.vector_store.factory import create_vector_store
 
@@ -170,6 +171,99 @@ def test_query_chroma_with_rerank_applies_score_threshold(monkeypatch):
     )
 
     assert [doc.metadata["source"] for doc in result] == ["high.pdf"]
+
+
+def test_query_chroma_with_rerank_logs_candidate_documents(monkeypatch):
+    docs = [
+        Document(page_content="uno", metadata={"source": "app/uploads/one.pdf", "chunk_id": 3}),
+        Document(page_content="due", metadata={"document_id": "doc-two"}),
+    ]
+    messages = []
+
+    class FakeLog:
+        def info(self, message, *args):
+            messages.append(message % args if args else message)
+
+    class FakeReranker:
+        def rerank(self, query, retrieved_docs, top_n):
+            return retrieved_docs[:top_n]
+
+    store = ChromaPersistentVectorStore()
+    monkeypatch.setattr(store, "query", lambda query, k: docs)
+    monkeypatch.setattr(chroma_persistent, "log", FakeLog())
+
+    store.query_with_rerank("query", k=2, top_n=10, reranker=FakeReranker())
+
+    assert "ReRanker: candidati dal vector DB: 1:one.pdf chunk=3, 2:doc-two" in messages
+
+
+def test_query_chroma_with_rerank_diversifies_candidates_before_reranker(monkeypatch):
+    docs = [
+        Document(page_content=f"a{i}", metadata={"source": "a.pdf", "chunk_id": i})
+        for i in range(6)
+    ] + [
+        Document(page_content="b", metadata={"source": "b.pdf"}),
+        Document(page_content="c", metadata={"source": "c.pdf"}),
+        Document(page_content="d", metadata={"source": "d.pdf"}),
+    ]
+    captured = {}
+
+    class FakeReranker:
+        def rerank(self, query, retrieved_docs, top_n):
+            captured["docs"] = retrieved_docs
+            return retrieved_docs[:top_n]
+
+    store = ChromaPersistentVectorStore()
+
+    def fake_query(query, k):
+        captured["query_k"] = k
+        return docs
+
+    monkeypatch.setattr(store, "query", fake_query)
+
+    store.query_with_rerank("query", k=3, top_n=6, reranker=FakeReranker())
+
+    assert captured["query_k"] == 24
+    assert [doc.metadata["source"] for doc in captured["docs"]] == [
+        "a.pdf",
+        "a.pdf",
+        "a.pdf",
+        "b.pdf",
+        "c.pdf",
+        "d.pdf",
+    ]
+
+
+def test_query_chroma_with_rerank_can_disable_source_diversity(monkeypatch):
+    docs = [
+        Document(page_content=f"a{i}", metadata={"source": "a.pdf", "chunk_id": i})
+        for i in range(6)
+    ]
+    captured = {}
+
+    class FakeReranker:
+        def rerank(self, query, retrieved_docs, top_n):
+            captured["docs"] = retrieved_docs
+            return retrieved_docs[:top_n]
+
+    store = ChromaPersistentVectorStore()
+
+    def fake_query(query, k):
+        captured["query_k"] = k
+        return docs
+
+    monkeypatch.setattr(store, "query", fake_query)
+
+    store.query_with_rerank(
+        "query",
+        k=3,
+        top_n=6,
+        reranker=FakeReranker(),
+        diversity_enabled=False,
+    )
+
+    assert captured["query_k"] == 6
+    assert captured["docs"] == docs
 
 
 def test_create_vector_store_returns_chroma_persistent_backend():

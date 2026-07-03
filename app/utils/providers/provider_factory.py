@@ -28,14 +28,6 @@ class ProviderFactory:
         try:
             if is_openai_compatible(provider_config):
                 instance = OpenAICompatibleProvider(provider_config)
-            elif provider_type == "mistral":
-                from .mistral_provider import MistralProvider
-
-                instance = MistralProvider()
-            elif provider_type == "regolo":
-                from .regolo_provider import RegoloProvider
-
-                instance = RegoloProvider()
             else:
                 raise ValueError(f"Provider {provider_type} non supportato")
         except Exception as e:

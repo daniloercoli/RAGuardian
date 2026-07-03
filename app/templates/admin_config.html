@@ -232,6 +232,13 @@
                     </span>
                     <input type="number" name="reranker_top_n" min="1" max="200" value="{{ settings.rag.reranker_top_n }}">
                 </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" name="reranker_source_diversity" {% if settings.rag.reranker_source_diversity %}checked{% endif %}>
+                    <span class="field-label">
+                        Source Diversity
+                        <button type="button" class="help-trigger" aria-label="Help on Source Diversity" data-help-title="Source Diversity" data-help-body="Retrieves a wider ChromaDB candidate pool, then limits how many chunks from the same source document are sent to the reranker. This helps avoid one document monopolizing all reranking candidates.">?</button>
+                    </span>
+                </label>
                 <label>
                     <span class="field-label">
                         ReRanking Threshold

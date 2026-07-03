@@ -69,6 +69,18 @@ Embeddings can be:
 - local `sentence-transformers`, where supported;
 - Regolo/custom embeddings, configured from **Admin -> Configuration**.
 
+ReRanking is optional. When enabled, Chroma first retrieves candidate chunks,
+then the reranker sorts those candidates and returns the final context chunks
+for the LLM. The reranker can only rank what Chroma gives it.
+
+If Chroma keeps returning many chunks from the same PDF while another relevant
+book never appears in the candidates, enable **Source Diversity** in
+**Admin -> Configuration -> ReRanking**. Source Diversity is OFF by default. When
+enabled, RAGuardian retrieves a wider Chroma candidate pool and limits how many
+chunks from the same source document can be sent to the reranker. This is a
+simple per-source chunk cap, not full MMR, and it is useful when one long or
+repetitive document crowds out other relevant sources.
+
 ## 4. Add documents to the persistent knowledge base
 
 For persistent RAG:
