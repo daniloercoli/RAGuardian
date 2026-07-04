@@ -139,7 +139,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "reranker_type": str(_reranker_default.get("id") or "local"),
         "reranker_model": _default_reranker_model_value(_reranker_default),
         "reranker_top_n": 20,
-        "reranker_source_diversity": False,
+        "reranker_diversity_mode": "none",
+        "reranker_mmr_lambda": 0.7,
+        "reranker_mmr_candidate_pool": 80,
         "reranker_threshold": 0.0,
         "reranker_api_key": "",
         "reranker_regolo_api_key": "",
@@ -190,6 +192,7 @@ API_SCOPES = {"query", "ingest", "speech"}
 VOICE_FORMATS = {"mp3", "wav", "opus", "aac", "flac"}
 OCR_MODES = {"vision_chat", "ocr_endpoint", "local_engine"}
 OCR_INPUT_TYPES = {"image", "pdf"}
+DIVERSITY_MODES = {"none", "source_diversity", "mmr"}
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -376,12 +379,25 @@ class SettingsStore:
         rag["reranker_enabled"] = _as_bool(rag.get("reranker_enabled"), False)
         _normalize_reranker_default(settings)
         rag["reranker_top_n"] = _int_between(rag.get("reranker_top_n"), 1, 200, 20)
-        rag["reranker_source_diversity"] = _as_bool(rag.get("reranker_source_diversity"), False)
+        rag["reranker_diversity_mode"] = _choice(
+            rag.get("reranker_diversity_mode"),
+            DIVERSITY_MODES,
+            "none",
+        )
+        rag["reranker_mmr_lambda"] = _float_between(rag.get("reranker_mmr_lambda"), 0.0, 1.0, 0.7)
+        rag["reranker_mmr_candidate_pool"] = _int_between(
+            rag.get("reranker_mmr_candidate_pool"),
+            rag["reranker_top_n"],
+            200,
+            min(max(rag["reranker_top_n"], rag["reranker_top_n"] * 4), 200),
+        )
         rag["reranker_threshold"] = _float_between(rag.get("reranker_threshold"), 0.0, 10.0, 0.0)
         rag["reranker_api_key"] = str(
             rag.get("reranker_api_key") or rag.get("reranker_regolo_api_key") or ""
         ).strip()
         rag["reranker_regolo_api_key"] = str(rag.get("reranker_regolo_api_key", "")).strip()
+        rag.pop("reranker_source_diversity", None)
+        rag.pop("reranker_mmr_enabled", None)
         rag.pop("reranker_custom_api_key", None)
 
         auth = settings.setdefault("auth", {})

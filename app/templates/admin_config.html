@@ -232,12 +232,33 @@
                     </span>
                     <input type="number" name="reranker_top_n" min="1" max="200" value="{{ settings.rag.reranker_top_n }}">
                 </label>
-                <label class="checkbox-label">
-                    <input type="checkbox" name="reranker_source_diversity" {% if settings.rag.reranker_source_diversity %}checked{% endif %}>
+                <label>
                     <span class="field-label">
-                        Source Diversity
-                        <button type="button" class="help-trigger" aria-label="Help on Source Diversity" data-help-title="Source Diversity" data-help-body="Retrieves a wider ChromaDB candidate pool, then limits how many chunks from the same source document are sent to the reranker. This helps avoid one document monopolizing all reranking candidates.">?</button>
+                        Candidate Diversity
+                        <button type="button" class="help-trigger" aria-label="Help on Candidate Diversity" data-help-title="Candidate Diversity" data-help-body="Optional pre-reranker selection mode. Source Diversity caps chunks per source. MMR Diversity uses semantic diversity to pick candidates from a wider ChromaDB pool before reranking. Only one mode can be active.">?</button>
                     </span>
+                    <select id="rerankerDiversityMode" name="reranker_diversity_mode">
+                        <option value="none" {% if settings.rag.reranker_diversity_mode == "none" %}selected{% endif %}>None</option>
+                        <option value="source_diversity" {% if settings.rag.reranker_diversity_mode == "source_diversity" %}selected{% endif %}>Source Diversity</option>
+                        <option value="mmr" {% if settings.rag.reranker_diversity_mode == "mmr" %}selected{% endif %}>MMR Diversity</option>
+                    </select>
+                </label>
+                <p class="muted span-2">
+                    None uses Chroma's top candidates as-is. Source Diversity prevents one document from filling the reranker pool. MMR Diversity balances Chroma relevance with semantic variety before reranking.
+                </p>
+                <label data-mmr-setting {% if settings.rag.reranker_diversity_mode != "mmr" %}hidden{% endif %}>
+                    <span class="field-label">
+                        MMR Lambda
+                        <button type="button" class="help-trigger" aria-label="Help on MMR Lambda" data-help-title="MMR Lambda" data-help-body="Balance between Chroma relevance and semantic diversity before reranking. 1.0 favors relevance; 0.0 favors diversity; 0.6-0.8 is usually a good compromise.">?</button>
+                    </span>
+                    <input type="number" name="reranker_mmr_lambda" min="0" max="1" step="0.05" value="{{ settings.rag.reranker_mmr_lambda }}">
+                </label>
+                <label data-mmr-setting {% if settings.rag.reranker_diversity_mode != "mmr" %}hidden{% endif %}>
+                    <span class="field-label">
+                        MMR Candidate Pool
+                        <button type="button" class="help-trigger" aria-label="Help on MMR Candidate Pool" data-help-title="MMR Candidate Pool" data-help-body="How many ChromaDB candidates MMR can choose from before sending Documents for ReRanking (top_n) candidates to the reranker. Default is top_n x 4, capped at 200.">?</button>
+                    </span>
+                    <input type="number" name="reranker_mmr_candidate_pool" min="1" max="200" value="{{ settings.rag.reranker_mmr_candidate_pool }}">
                 </label>
                 <label>
                     <span class="field-label">
@@ -246,7 +267,7 @@
                     </span>
                     <input type="number" name="reranker_threshold" min="0" max="10" step="0.1" value="{{ settings.rag.reranker_threshold }}">
                 </label>
-                 <p class="muted  span-2">Note: With ReRanking enabled, the final documents passed to the LLM are controlled by the "Retrieval Results (k)" parameter above. The reranker retrieves documents here, sorts them by relevance, and returns the top k.</p>
+                 <p class="muted  span-2">Note: With ReRanking enabled, Candidate Diversity runs before reranking. The final documents passed to the LLM are controlled by the "Retrieval Results (k)" parameter above.</p>
                 <button type="submit">Save ReRanking</button>
             </form>
         </section>

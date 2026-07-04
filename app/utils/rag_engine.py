@@ -658,11 +658,11 @@ def _get_context(
     # Usa reranker se abilitato
     if settings["rag"].get("reranker_enabled", False):
         # Logica standard RAG con reranking:
-        # 1. Recupera reranker_top_n documenti da ChromaDB
+        # 1. Recupera i candidati da ChromaDB, con eventuale diversity pre-reranker
         # 2. Re-ranka per rilevanza
         # 3. Restituisci query_k (k) documenti finali
         top_n = settings["rag"].get("reranker_top_n", 20)
-        source_diversity = settings["rag"].get("reranker_source_diversity", False)
+        diversity_mode = settings["rag"].get("reranker_diversity_mode", "none")
         score_threshold = settings["rag"].get("reranker_threshold", 0.0)
         reranker_model = settings["rag"].get("reranker_model", "local/BAAI/bge-reranker-v2-m3")
         reranker_type = settings["rag"].get("reranker_type", "local")
@@ -708,7 +708,9 @@ def _get_context(
             "top_n": top_n,
             "reranker": reranker,
             "score_threshold": score_threshold,
-            "diversity_enabled": source_diversity,
+            "diversity_mode": diversity_mode,
+            "mmr_lambda": settings["rag"].get("reranker_mmr_lambda", 0.7),
+            "mmr_candidate_pool": settings["rag"].get("reranker_mmr_candidate_pool"),
         }
         if collection_name:
             rerank_kwargs["collection_name"] = collection_name

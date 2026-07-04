@@ -107,6 +107,21 @@ document.addEventListener("DOMContentLoaded", () => {
         syncReRankerControls();
     }
 
+    const rerankerDiversityMode = document.getElementById("rerankerDiversityMode");
+    const mmrSettings = document.querySelectorAll("[data-mmr-setting]");
+
+    if (rerankerDiversityMode && mmrSettings.length) {
+        function syncDiversityControls() {
+            const showMmrSettings = rerankerDiversityMode.value === "mmr";
+            mmrSettings.forEach((setting) => {
+                setting.hidden = !showMmrSettings;
+            });
+        }
+
+        rerankerDiversityMode.addEventListener("change", syncDiversityControls);
+        syncDiversityControls();
+    }
+
     // Voice provider controls
     const voiceProvider = document.getElementById("voiceProvider");
     const voiceBaseUrl = document.getElementById("voiceBaseUrl");

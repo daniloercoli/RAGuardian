@@ -74,12 +74,11 @@ then the reranker sorts those candidates and returns the final context chunks
 for the LLM. The reranker can only rank what Chroma gives it.
 
 If Chroma keeps returning many chunks from the same PDF while another relevant
-book never appears in the candidates, enable **Source Diversity** in
-**Admin -> Configuration -> ReRanking**. Source Diversity is OFF by default. When
-enabled, RAGuardian retrieves a wider Chroma candidate pool and limits how many
-chunks from the same source document can be sent to the reranker. This is a
-simple per-source chunk cap, not full MMR, and it is useful when one long or
-repetitive document crowds out other relevant sources.
+book never appears in the candidates, set **Candidate Diversity** in
+**Admin -> Configuration -> ReRanking**. It is OFF by default. **Source
+Diversity** applies a simple per-source chunk cap; **MMR Diversity** uses
+Maximal Marginal Relevance to select semantically diverse Chroma candidates
+before the reranker. Only one mode can be active.
 
 ## 4. Add documents to the persistent knowledge base
 

@@ -267,7 +267,9 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
             "reranker_type": "custom",
             "reranker_model": "ranker/vendor/rerank-b",
             "reranker_top_n": 12,
-            "reranker_source_diversity": False,
+            "reranker_diversity_mode": "mmr",
+            "reranker_mmr_lambda": 0.65,
+            "reranker_mmr_candidate_pool": 60,
             "reranker_threshold": 1.5,
         },
         "reranker_providers": [
@@ -288,14 +290,25 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
         captured["reranker_kwargs"] = kwargs
         return FakeReranker()
 
-    def fake_query_chroma_with_rerank(query, k, top_n, reranker, score_threshold, diversity_enabled):
+    def fake_query_chroma_with_rerank(
+        query,
+        k,
+        top_n,
+        reranker,
+        score_threshold,
+        diversity_mode,
+        mmr_lambda,
+        mmr_candidate_pool,
+    ):
         captured["query_kwargs"] = {
             "query": query,
             "k": k,
             "top_n": top_n,
             "reranker": reranker,
             "score_threshold": score_threshold,
-            "diversity_enabled": diversity_enabled,
+            "diversity_mode": diversity_mode,
+            "mmr_lambda": mmr_lambda,
+            "mmr_candidate_pool": mmr_candidate_pool,
         }
         return ["doc"]
 
@@ -313,11 +326,13 @@ def test_get_context_uses_dedicated_reranker_provider(monkeypatch):
         "mode": "chat_completions",
     }
     assert captured["query_kwargs"]["top_n"] == 12
-    assert captured["query_kwargs"]["diversity_enabled"] is False
+    assert captured["query_kwargs"]["diversity_mode"] == "mmr"
+    assert captured["query_kwargs"]["mmr_lambda"] == 0.65
+    assert captured["query_kwargs"]["mmr_candidate_pool"] == 60
     assert captured["query_kwargs"]["score_threshold"] == 1.5
 
 
-def test_get_context_defaults_source_diversity_off(monkeypatch):
+def test_get_context_defaults_diversity_mode_off(monkeypatch):
     settings = {
         "rag": {
             "enable_cache": False,
@@ -338,4 +353,4 @@ def test_get_context_defaults_source_diversity_off(monkeypatch):
     monkeypatch.setattr(rag_engine, "query_chroma_with_rerank", fake_query_chroma_with_rerank)
 
     assert rag_engine._get_context("domanda", 4, "model", settings, use_cache=False) == ["doc"]
-    assert captured["diversity_enabled"] is False
+    assert captured["diversity_mode"] == "none"

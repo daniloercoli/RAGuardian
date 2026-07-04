@@ -1267,7 +1267,9 @@ def test_admin_can_select_custom_reranker_provider(client, flask_app):
             "reranker_enabled": "on",
             "reranker_model": "ranker/vendor/rerank-b",
             "reranker_top_n": "24",
-            "reranker_source_diversity": "on",
+            "reranker_diversity_mode": "mmr",
+            "reranker_mmr_lambda": "0.6",
+            "reranker_mmr_candidate_pool": "96",
             "reranker_threshold": "1.5",
         },
     )
@@ -1276,7 +1278,9 @@ def test_admin_can_select_custom_reranker_provider(client, flask_app):
     assert response.status_code == 302
     assert settings["rag"]["reranker_type"] == "ranker"
     assert settings["rag"]["reranker_model"] == "ranker/vendor/rerank-b"
-    assert settings["rag"]["reranker_source_diversity"] is True
+    assert settings["rag"]["reranker_diversity_mode"] == "mmr"
+    assert settings["rag"]["reranker_mmr_lambda"] == 0.6
+    assert settings["rag"]["reranker_mmr_candidate_pool"] == 96
 
 
 def test_admin_can_select_custom_voice_provider(client, flask_app):
@@ -1469,6 +1473,7 @@ def test_admin_reranker_keeps_existing_secret_when_password_field_blank(client, 
                 "reranker_type": "regolo",
                 "reranker_model": "regolo/Qwen3-Reranker-4B",
                 "reranker_top_n": 20,
+                "reranker_diversity_mode": "none",
                 "reranker_threshold": 0.0,
                 "reranker_regolo_api_key": "regolo-secret-1234",
             }
@@ -1482,7 +1487,7 @@ def test_admin_reranker_keeps_existing_secret_when_password_field_blank(client, 
             "reranker_enabled": "on",
             "reranker_model": "regolo/Qwen3-Reranker-4B",
             "reranker_top_n": "12",
-            "reranker_source_diversity": "on",
+            "reranker_diversity_mode": "source_diversity",
             "reranker_threshold": "2.5",
             "reranker_regolo_api_key": "",
         },
@@ -1492,7 +1497,7 @@ def test_admin_reranker_keeps_existing_secret_when_password_field_blank(client, 
     assert response.status_code == 302
     assert settings["rag"]["reranker_regolo_api_key"] == "regolo-secret-1234"
     assert settings["rag"]["reranker_top_n"] == 12
-    assert settings["rag"]["reranker_source_diversity"] is True
+    assert settings["rag"]["reranker_diversity_mode"] == "source_diversity"
     assert settings["rag"]["reranker_threshold"] == 2.5
 
 

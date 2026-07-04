@@ -197,7 +197,7 @@ def test_query_chroma_with_rerank_logs_candidate_documents(monkeypatch):
     assert "ReRanker: candidati dal vector DB: 1:one.pdf chunk=3, 2:doc-two" in messages
 
 
-def test_query_chroma_with_rerank_diversifies_candidates_before_reranker(monkeypatch):
+def test_query_chroma_with_rerank_source_diversifies_candidates_before_reranker(monkeypatch):
     docs = [
         Document(page_content=f"a{i}", metadata={"source": "a.pdf", "chunk_id": i})
         for i in range(6)
@@ -221,7 +221,13 @@ def test_query_chroma_with_rerank_diversifies_candidates_before_reranker(monkeyp
 
     monkeypatch.setattr(store, "query", fake_query)
 
-    store.query_with_rerank("query", k=3, top_n=6, reranker=FakeReranker())
+    store.query_with_rerank(
+        "query",
+        k=3,
+        top_n=6,
+        reranker=FakeReranker(),
+        diversity_mode="source_diversity",
+    )
 
     assert captured["query_k"] == 24
     assert [doc.metadata["source"] for doc in captured["docs"]] == [
@@ -234,7 +240,7 @@ def test_query_chroma_with_rerank_diversifies_candidates_before_reranker(monkeyp
     ]
 
 
-def test_query_chroma_with_rerank_can_disable_source_diversity(monkeypatch):
+def test_query_chroma_with_rerank_leaves_candidates_unchanged_when_diversity_is_off(monkeypatch):
     docs = [
         Document(page_content=f"a{i}", metadata={"source": "a.pdf", "chunk_id": i})
         for i in range(6)
@@ -259,11 +265,93 @@ def test_query_chroma_with_rerank_can_disable_source_diversity(monkeypatch):
         k=3,
         top_n=6,
         reranker=FakeReranker(),
-        diversity_enabled=False,
+        diversity_mode="none",
     )
 
     assert captured["query_k"] == 6
     assert captured["docs"] == docs
+
+
+def test_query_chroma_with_rerank_mmr_selects_diverse_candidates_before_reranker(monkeypatch):
+    docs = [
+        Document(page_content="a0", metadata={"source": "a.pdf", "chroma_score": 1.0}),
+        Document(page_content="a1", metadata={"source": "a.pdf", "chroma_score": 0.99}),
+        Document(page_content="a2", metadata={"source": "a.pdf", "chroma_score": 0.98}),
+        Document(page_content="b", metadata={"source": "b.pdf", "chroma_score": 0.70}),
+    ]
+    embeddings = [
+        [1.0, 0.0],
+        [0.99, 0.01],
+        [0.98, 0.02],
+        [0.0, 1.0],
+    ]
+    captured = {}
+
+    class FakeReranker:
+        def rerank(self, query, retrieved_docs, top_n):
+            captured["docs"] = retrieved_docs
+            return retrieved_docs[:top_n]
+
+    store = ChromaPersistentVectorStore()
+
+    def fake_query_documents(query, k, include_embeddings):
+        captured["query_k"] = k
+        captured["include_embeddings"] = include_embeddings
+        return docs, embeddings, [1.0, 0.0]
+
+    monkeypatch.setattr(store, "_query_documents", fake_query_documents)
+
+    store.query_with_rerank(
+        "query",
+        k=2,
+        top_n=2,
+        reranker=FakeReranker(),
+        diversity_mode="mmr",
+        mmr_lambda=0.3,
+        mmr_candidate_pool=4,
+    )
+
+    assert captured["query_k"] == 4
+    assert captured["include_embeddings"] is True
+    assert [doc.metadata["source"] for doc in captured["docs"]] == ["a.pdf", "b.pdf"]
+
+
+def test_query_chroma_with_rerank_mmr_lambda_one_matches_relevance_order(monkeypatch):
+    docs = [
+        Document(page_content="a0", metadata={"source": "a.pdf", "chroma_score": 1.0}),
+        Document(page_content="a1", metadata={"source": "a.pdf", "chroma_score": 0.99}),
+        Document(page_content="b", metadata={"source": "b.pdf", "chroma_score": 0.70}),
+    ]
+    embeddings = [
+        [1.0, 0.0],
+        [0.99, 0.01],
+        [0.0, 1.0],
+    ]
+    captured = {}
+
+    class FakeReranker:
+        def rerank(self, query, retrieved_docs, top_n):
+            captured["docs"] = retrieved_docs
+            return retrieved_docs[:top_n]
+
+    store = ChromaPersistentVectorStore()
+    monkeypatch.setattr(
+        store,
+        "_query_documents",
+        lambda query, k, include_embeddings: (docs, embeddings, [1.0, 0.0]),
+    )
+
+    store.query_with_rerank(
+        "query",
+        k=2,
+        top_n=2,
+        reranker=FakeReranker(),
+        diversity_mode="mmr",
+        mmr_lambda=1.0,
+        mmr_candidate_pool=3,
+    )
+
+    assert [doc.page_content for doc in captured["docs"]] == ["a0", "a1"]
 
 
 def test_create_vector_store_returns_chroma_persistent_backend():

@@ -47,33 +47,35 @@ The app starts without provider keys. To ask questions against your documents, c
 
 Voice and OCR are optional; configure them only for audio or scanned PDF workflows.
 
-## ReRanking and Source Diversity
+## ReRanking and Candidate Diversity
 
 With ReRanking enabled, retrieval has four steps:
 
 ```text
-question -> Chroma candidates -> optional Source Diversity -> reranker -> final k chunks -> LLM
+question -> Chroma candidates -> optional diversity selection -> reranker -> final k chunks -> LLM
 ```
 
 `Documents for ReRanking (top_n)` controls how many chunks the reranker receives.
-Without Source Diversity, those chunks are the top `top_n` results returned by
+Without Candidate Diversity, those chunks are the top `top_n` results returned by
 Chroma. If one large or very repetitive document dominates vector similarity,
 many candidates can come from that same source, and other relevant books or PDFs
 may never reach the reranker.
 
-**Source Diversity** is an optional pre-reranker diversification step in
-**Admin -> Configuration -> ReRanking**. It is OFF by default. When enabled, the
-app retrieves a wider Chroma pool, then limits how many chunks from the same
-source document are sent to the reranker. This gives more documents a chance to
-compete before the reranker chooses the final `Retrieval Results (k)` chunks.
+**Candidate Diversity** is an optional pre-reranker selection mode in
+**Admin -> Configuration -> ReRanking**. It is OFF by default, and only one mode
+can be active:
 
-This is not full MMR. It is a simpler per-source chunk cap before reranking:
+- **Source Diversity** retrieves a wider Chroma pool, then limits chunks from the
+  same source document before reranking.
+- **MMR Diversity** retrieves a wider Chroma pool, uses Maximal Marginal
+  Relevance to balance Chroma relevance with semantic diversity, then sends the
+  selected `top_n` candidates to the reranker.
 
-- use it when the same document monopolizes Chroma candidates;
-- leave it off when you intentionally want pure vector similarity and repeated
-  chunks from one source are acceptable;
-- inspect the `rag_service.chroma` logs to see which source filenames and chunk
-  IDs are passed to the reranker.
+For MMR, `MMR Lambda` controls the relevance/diversity tradeoff. `1.0` is mostly
+relevance, `0.0` is mostly diversity, and `0.6-0.8` is usually a good compromise.
+`MMR Candidate Pool` defaults to `top_n * 4`, capped at 200. Inspect the
+`rag_service.chroma` logs to see which source filenames, chunk IDs, and scores
+are passed to the reranker.
 
 ## Production Environment
 

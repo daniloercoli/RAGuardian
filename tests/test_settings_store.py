@@ -19,7 +19,9 @@ def test_settings_store_creates_defaults(tmp_path):
     assert settings_file.exists()
     assert settings["rag"]["query_k"] == 5
     assert settings["rag"]["default_model"] == "gpt-oss-120b"
-    assert settings["rag"]["reranker_source_diversity"] is False
+    assert settings["rag"]["reranker_diversity_mode"] == "none"
+    assert settings["rag"]["reranker_mmr_lambda"] == 0.7
+    assert settings["rag"]["reranker_mmr_candidate_pool"] == 80
     assert settings["voice"]["enabled"] is True
     assert settings["voice"]["stt_language"] == ""
     assert settings["ocr"]["enabled"] is True
@@ -49,12 +51,23 @@ def test_settings_store_persists_runtime_values(tmp_path):
     assert loaded["rag"]["embedding_model"] == "Qwen3-Embedding-8B"
 
 
-def test_settings_store_persists_reranker_source_diversity(tmp_path):
+def test_settings_store_persists_reranker_diversity_mode_and_mmr_params(tmp_path):
     store = SettingsStore(str(tmp_path / "settings.json"))
 
-    settings = store.update({"rag": {"reranker_source_diversity": False}})
+    settings = store.update(
+        {
+            "rag": {
+                "reranker_diversity_mode": "mmr",
+                "reranker_mmr_lambda": 0.55,
+                "reranker_mmr_candidate_pool": 120,
+            }
+        }
+    )
 
-    assert settings["rag"]["reranker_source_diversity"] is False
+    assert settings["rag"]["reranker_diversity_mode"] == "mmr"
+    assert settings["rag"]["reranker_mmr_lambda"] == 0.55
+    assert settings["rag"]["reranker_mmr_candidate_pool"] == 120
+    assert "reranker_source_diversity" not in settings["rag"]
 
 
 def test_settings_store_canonicalizes_llm_default_model_casing(tmp_path):

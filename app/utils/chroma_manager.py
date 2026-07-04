@@ -61,7 +61,9 @@ def query_chroma_with_rerank(
     top_n: int = 20,
     reranker=None,
     score_threshold: float = 0.0,
-    diversity_enabled: bool = True,
+    diversity_mode: str = "none",
+    mmr_lambda: float = 0.7,
+    mmr_candidate_pool: int | None = None,
     collection_name: str | None = None,
 ):
     return _vector_store(collection_name).query_with_rerank(
@@ -70,7 +72,9 @@ def query_chroma_with_rerank(
         top_n=top_n,
         reranker=reranker,
         score_threshold=score_threshold,
-        diversity_enabled=diversity_enabled,
+        diversity_mode=diversity_mode,
+        mmr_lambda=mmr_lambda,
+        mmr_candidate_pool=mmr_candidate_pool,
     )
 
 

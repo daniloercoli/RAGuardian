@@ -7,7 +7,7 @@
   <link rel="icon" type="image/png" href="../favicon.png">
   <link rel="apple-touch-icon" href="../apple-touch-icon.png">
   <title>Tecnologia — Architettura RAGuardian</title>
-  <meta name="description" content="Architettura tecnica di RAGuardian. Multi-utente, workspace personali, ingestion email e Microsoft Drive, RAG pipeline, Redis, job queue, vector store adapter.">
+  <meta name="description" content="Architettura tecnica di RAGuardian. Workspace personali, ingestion email e Drive, candidate diversity, MMR, reranking, Redis, job queue, vector store adapter.">
   <link rel="stylesheet" href="../css/style.css">
 </head>
 <body>
@@ -80,7 +80,7 @@
             <div class="arch-blocks">
               <div class="arch-block green">Document Processing</div>
               <div class="arch-block green">Collection per workspace</div>
-              <div class="arch-block green">Reranking</div>
+              <div class="arch-block green">Diversity + Reranking</div>
               <div class="arch-block green">Conversation Memory</div>
             </div>
           </div>
@@ -111,8 +111,8 @@
         </div>
         <div class="value-card fade-in">
           <div class="value-icon green">🔍</div>
-          <h3>Retrieval + Reranking</h3>
-          <p>Similitudine vettoriale su collection Chroma dedicate per workspace. BGE reranker locale o Regolo remote reranking per precisione. Cache namespaced per evitare contaminazioni.</p>
+          <h3>Retrieval + Candidate Diversity</h3>
+          <p>Similitudine vettoriale su collection Chroma dedicate per workspace. Source Diversity o MMR selezionano candidati migliori prima del reranking BGE locale, Regolo remoto o custom. Cache namespaced per evitare contaminazioni.</p>
         </div>
         <div class="value-card fade-in">
           <div class="value-icon purple">💬</div>
@@ -151,7 +151,8 @@
           <div class="flow-line"><span class="keyword">Auth:</span> UserStore JSON + workspace personali</div>
           <div class="flow-line"><span class="keyword">Vector DB:</span> ChromaDB (persistent)</div>
           <div class="flow-line"><span class="keyword">Embedding:</span> sentence-transformers / Regolo cloud</div>
-          <div class="flow-line"><span class="keyword">Reranker:</span> BAAI bge-reranker / Regolo</div>
+          <div class="flow-line"><span class="keyword">Candidate selection:</span> none / Source Diversity / MMR</div>
+          <div class="flow-line"><span class="keyword">Reranker:</span> BAAI bge-reranker / Regolo / custom</div>
           <div class="flow-line"><span class="keyword">LLM:</span> Regolo.ai, Mistral, OpenAI-compatible</div>
           <div class="flow-line"><span class="keyword">Server:</span> Gunicorn (production)</div>
           <div class="flow-line"><span class="keyword">Frontend:</span> Flask templates + Vanilla JS</div>

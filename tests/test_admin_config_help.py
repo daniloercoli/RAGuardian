@@ -22,6 +22,13 @@ def test_rag_parameter_help_popovers_are_wired():
     assert "Application API Keys" not in template
     assert "api_key_scopes" not in template
     assert "Provider and model policy is global" in template
+    assert "id=\"rerankerDiversityMode\"" in template
+    assert "None uses Chroma's top candidates as-is." in template
+    assert "Source Diversity prevents one document from filling the reranker pool." in template
+    assert "MMR Diversity balances Chroma relevance with semantic variety before reranking." in template
+    assert "data-mmr-setting" in template
     assert "help-popover" in script
+    assert "syncDiversityControls" in script
+    assert "setting.hidden = !showMmrSettings" in script
     assert "event.clientX" in script
     assert "Escape" in script
