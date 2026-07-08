@@ -315,33 +315,36 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
 
     _login_email(client, "user@example.local", "secret")
     user_prompts = client.get("/my-prompts").get_data(as_text=True)
-    user_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", user_prompts, re.S).group(1)
-    user_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', user_nav)
-    assert 'href="/my-prompts"' in user_nav
+    user_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", user_prompts, re.S).group(1)
+    user_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', user_nav)
     assert "System Prompts" in user_nav
+    assert 'href="/my-prompts"' not in user_nav
     assert 'href="/admin/prompts"' not in user_nav
     assert 'href="/admin/config"' not in user_nav
-    assert user_links[-1] == ("/my-prompts", "System Prompts")
+    assert '<span class="nav-item active" aria-current="page">System Prompts</span>' in user_nav
+    assert user_links[-1] == ("/", "Close")
 
     _login_email(client, "admin@example.local")
     admin_home = client.get("/").get_data(as_text=True)
     admin_files = client.get("/admin/files").get_data(as_text=True)
-    admin_home_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", admin_home, re.S).group(1)
-    admin_files_nav = re.search(r"<nav class=\"top-nav\">(.*?)</nav>", admin_files, re.S).group(1)
-    admin_home_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
-    admin_files_links = re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
-    assert 'href="/my-prompts"' in admin_home
-    assert "System Prompts" in admin_home
-    assert 'href="/admin/prompts"' in admin_home
+    admin_home_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", admin_home, re.S).group(1)
+    admin_files_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", admin_files, re.S).group(1)
+    admin_home_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
+    admin_files_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
+    assert '<span class="nav-item active" aria-current="page">Chat</span>' in admin_home_nav
+    assert admin_home_links == [("/admin/files", "Configuration")]
+    assert 'href="/my-prompts"' not in admin_home_nav
+    assert 'href="/admin/prompts"' not in admin_home_nav
+    assert 'href="/admin/config"' not in admin_home_nav
     assert 'href="/my-prompts"' in admin_files
     assert 'href="/admin/prompts"' in admin_files
-    assert admin_home_links[-2:] == [
+    assert '<span class="nav-item active" aria-current="page">RAG Files</span>' in admin_files_nav
+    assert 'href="/admin/files"' not in admin_files_nav
+    assert ("/admin/config", "AI Settings") in admin_files_links
+    assert admin_files_links[-3:] == [
         ("/my-prompts", "System Prompts"),
         ("/admin/prompts", "Shared Prompts"),
-    ]
-    assert admin_files_links[-2:] == [
-        ("/my-prompts", "System Prompts"),
-        ("/admin/prompts", "Shared Prompts"),
+        ("/", "Close"),
     ]
 
 
@@ -1374,6 +1377,78 @@ def test_admin_can_select_custom_ocr_provider(client, flask_app):
     assert settings["ocr"]["api_key"] == "ocr-key"
     assert settings["ocr"]["default_model"] == "vision-ocr-model"
     assert settings["ocr"]["auto_on_empty_pdf"] is True
+
+
+def test_admin_ocr_save_updates_existing_workspace_for_upload(client, flask_app, monkeypatch):
+    app_module = importlib.import_module("app.app")
+    import utils.chroma_manager as chroma_manager
+    import utils.rag_engine as rag_engine
+
+    client.post("/admin/login", data={"password": "admin"})
+    workspace = _workspace_context(flask_app)
+    SettingsStore(workspace.settings_file).update({"ocr": {"enabled": False}})
+    SettingsStore(flask_app.config["SETTINGS_FILE"]).update(
+        {
+            "ocr_providers": [
+                {
+                    "id": "vision-ocr",
+                    "name": "Vision OCR",
+                    "base_url": "https://ocr.example.com/v1",
+                    "api_key": "",
+                    "requires_api_key": False,
+                    "models": ["vision-ocr-model"],
+                    "default_model": "vision-ocr-model",
+                    "input_types": ["image", "pdf"],
+                    "enabled": True,
+                }
+            ]
+        }
+    )
+
+    save_response = client.post(
+        "/admin/config",
+        data={
+            "action": "save_ocr",
+            "ocr_enabled": "on",
+            "ocr_auto_on_empty_pdf": "on",
+            "ocr_provider": "vision-ocr",
+            "ocr_base_url": "https://ocr.example.com/v1",
+            "ocr_api_key": "",
+            "ocr_requires_api_key": "0",
+            "ocr_default_model": "vision-ocr-model",
+            "ocr_mode": "vision_chat",
+            "ocr_output_format": "text",
+            "ocr_input_types": ["image", "pdf"],
+        },
+    )
+
+    workspace_settings = SettingsStore(workspace.settings_file).load()
+    assert save_response.status_code == 302
+    assert workspace_settings["ocr"]["enabled"] is True
+    assert workspace_settings["ocr"]["provider"] == "vision-ocr"
+
+    fake_pdf_processor = types.ModuleType("utils.pdf_processor")
+    fake_pdf_processor.process_pdf = lambda file_path, settings_path=None: []
+    monkeypatch.setitem(sys.modules, "utils.pdf_processor", fake_pdf_processor)
+    monkeypatch.setattr(chroma_manager, "delete_documents_by_source", lambda source, **kwargs: 0)
+    monkeypatch.setattr(chroma_manager, "find_document_by_id", lambda document_id, exclude_source=None, **kwargs: None)
+    monkeypatch.setattr(chroma_manager, "add_documents_to_chroma", lambda documents, **kwargs: None)
+    monkeypatch.setattr(rag_engine, "clear_cache", lambda: None)
+    monkeypatch.setattr(
+        app_module,
+        "_run_ocr_for_config",
+        lambda config, file_path, settings=None: "OCR extracted text from scanned PDF.",
+    )
+
+    upload_response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"%PDF-1.4"), "scan.pdf", "application/pdf")},
+        content_type="multipart/form-data",
+    )
+
+    payload = upload_response.get_json()
+    assert upload_response.status_code == 200
+    assert payload["ocr_used"] is True
 
 
 def test_admin_config_does_not_render_full_provider_or_reranker_secrets(client, flask_app):

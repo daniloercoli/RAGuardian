@@ -24,7 +24,13 @@ class OpenAICompatibleOCRProvider:
         self.ocr_mode = str(config.get("ocr_mode") or "vision_chat")
         self.input_types = set(config.get("input_types") or ["image", "pdf"])
         self.max_pages = _int_between(config.get("max_pages"), 1, 50, 8)
-        self.render_scale = _float_between(config.get("render_scale"), 1.0, 4.0, 2.0)
+        self.render_scale = _float_between(config.get("render_scale"), 0.5, 4.0, 1.0)
+        self.max_output_tokens = _int_between(
+            config.get("max_output_tokens") or config.get("max_tokens"),
+            1,
+            8192,
+            2048,
+        )
 
         if not self.base_url:
             raise ProviderError("OCR provider base_url is not configured")
@@ -48,13 +54,43 @@ class OpenAICompatibleOCRProvider:
         elif extension == "pdf":
             if "pdf" not in self.input_types:
                 raise ProviderError("OCR provider does not accept PDF inputs")
-            image_urls = _pdf_to_data_urls(file_path, max_pages=self.max_pages, scale=self.render_scale)
+            return self._extract_pdf_with_vision_chat(file_path)
         else:
             raise ProviderError(f"OCR input type '{extension}' is not supported")
 
         if not image_urls:
             raise ProviderError("No OCR input pages generated")
         return self._extract_with_vision_chat(image_urls)
+
+    def _extract_pdf_with_vision_chat(self, file_path: str) -> str:
+        try:
+            import fitz
+        except ImportError as exc:
+            raise ProviderError("PDF OCR requires PyMuPDF. Install the project dependencies again.") from exc
+
+        parts: list[str] = []
+        with fitz.open(file_path) as document:
+            page_count = min(len(document), self.max_pages)
+            for page_index in range(page_count):
+                text = self._extract_pdf_page(document, page_index)
+                if text:
+                    parts.append(text)
+        if not parts:
+            raise ProviderError("OCR did not extract text from the PDF")
+        return "\n\n".join(parts).strip()
+
+    def _extract_pdf_page(self, document: Any, page_index: int) -> str:
+        last_error = ""
+        for scale in _retry_render_scales(self.render_scale):
+            image_url = _pdf_page_to_data_url(document, page_index, scale=scale)
+            try:
+                return self._extract_with_vision_chat([image_url])
+            except ProviderError as exc:
+                last_error = str(exc)
+                if _should_retry_with_smaller_image(last_error):
+                    continue
+                raise
+        raise ProviderError(f"OCR provider error on page {page_index + 1}: {last_error}")
 
     def _extract_with_vision_chat(self, image_urls: list[str]) -> str:
         prompt = str(
@@ -71,6 +107,7 @@ class OpenAICompatibleOCRProvider:
                 model=self.model,
                 messages=[{"role": "user", "content": content}],
                 temperature=0,
+                max_tokens=self.max_output_tokens,
             )
         except Exception as exc:
             raise ProviderError(f"OCR provider error: {exc}") from exc
@@ -120,17 +157,52 @@ def _pdf_to_data_urls(file_path: str, max_pages: int, scale: float) -> list[str]
     urls: list[str] = []
     with fitz.open(file_path) as document:
         for page_index in range(min(len(document), max_pages)):
-            page = document.load_page(page_index)
-            matrix = fitz.Matrix(scale, scale)
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            png_bytes = pixmap.tobytes("png")
-            encoded = base64.b64encode(png_bytes).decode("ascii")
-            urls.append(f"data:image/png;base64,{encoded}")
+            urls.append(_pdf_page_to_data_url(document, page_index, scale=scale))
     return urls
+
+
+def _pdf_page_to_data_url(document: Any, page_index: int, scale: float) -> str:
+    try:
+        import fitz
+    except ImportError as exc:
+        raise ProviderError("PDF OCR requires PyMuPDF. Install the project dependencies again.") from exc
+
+    page = document.load_page(page_index)
+    matrix = fitz.Matrix(scale, scale)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+    png_bytes = pixmap.tobytes("png")
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 def _extension(file_path: str) -> str:
     return os.path.splitext(file_path.lower())[1].lstrip(".")
+
+
+def _retry_render_scales(initial_scale: float) -> list[float]:
+    initial = _float_between(initial_scale, 0.5, 4.0, 1.0)
+    scales: list[float] = []
+    for scale in (initial, 1.0, 0.75, 0.5):
+        if scale > initial:
+            continue
+        if scale not in scales:
+            scales.append(scale)
+    return scales
+
+
+def _should_retry_with_smaller_image(error: str) -> bool:
+    normalized = str(error or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "max_tokens must be at least 1",
+            "context length",
+            "context window",
+            "maximum context",
+            "too many tokens",
+            "input too large",
+        )
+    )
 
 
 def _int_between(value: Any, min_value: int, max_value: int, default: int) -> int:

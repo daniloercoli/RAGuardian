@@ -70,21 +70,8 @@
     <div class="container wide">
         <header class="page-header">
             <h1>System Prompts</h1>
-            <nav class="top-nav">
-                <a href="{{ url_for('index') }}">Chat</a>
-                <a href="{{ url_for('admin_files') }}">RAG Files</a>
-                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
-                {% if current_user and current_user.role == "admin" %}
-                    <a href="{{ url_for('admin_config') }}">Config</a>
-                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
-                    <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
-                {% else %}
-                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
-                {% endif %}
-                <form method="post" action="{{ url_for('admin_logout') }}">
-                    <button type="submit" class="link-button">Logout</button>
-                </form>
-            </nav>
+            {% set nav_mode = "admin" %}
+            {% include "_top_nav.html" %}
         </header>
 
         {% with messages = get_flashed_messages(with_categories=true) %}

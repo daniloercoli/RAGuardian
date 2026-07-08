@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Configuration - RAG Service</title>
+    <title>AI Settings - RAG Service</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
     <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
@@ -12,19 +12,9 @@
 <body>
     <div class="container wide">
         <header class="page-header">
-            <h1>Configuration</h1>
-            <nav class="top-nav">
-                <a href="{{ url_for('index') }}">Chat</a>
-                <a href="{{ url_for('admin_files') }}">RAG Files</a>
-                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
-                <a href="{{ url_for('admin_users') }}">Users</a>
-                <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
-                <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
-                <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
-                <form method="post" action="{{ url_for('admin_logout') }}">
-                    <button type="submit" class="link-button">Logout</button>
-                </form>
-            </nav>
+            <h1>AI Settings</h1>
+            {% set nav_mode = "admin" %}
+            {% include "_top_nav.html" %}
         </header>
 
         {% with messages = get_flashed_messages(with_categories=true) %}

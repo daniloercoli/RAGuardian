@@ -20,11 +20,11 @@ def test_chat_markdown_is_sanitized_before_dom_insert():
     assert "renderSourceCard" in script
     assert "sourceSnippet" in script
     assert "<textarea" in template
-    assert "chatStatus" in template
     assert "clearChatButton" in template
-    assert "demo-readiness" in template
+    assert "chatStatus" not in template
+    assert "demo-readiness" not in template
     assert "data-prompt" in template
-    assert "loadHealth()" in script
+    assert "loadHealth()" not in script
 
 
 def test_templates_include_browser_icons():

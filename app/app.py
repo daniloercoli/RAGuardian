@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -161,6 +162,16 @@ _OCR_INDEX_PROFILE_KEYS = {
     "ocr_model",
     "ocr_mode",
     "ocr_output_format",
+}
+_WORKSPACE_ADMIN_SETTING_KEYS = {
+    "rag",
+    "custom_providers",
+    "embedding_providers",
+    "reranker_providers",
+    "voice_providers",
+    "ocr_providers",
+    "voice",
+    "ocr",
 }
 DOCUMENT_UPLOAD_EXTENSIONS = {"pdf", "txt", "md", "csv"}
 AUDIO_UPLOAD_EXTENSIONS = {"mp3", "wav", "m4a", "webm", "ogg", "flac"}
@@ -615,6 +626,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         if request.method == "POST":
             try:
                 _handle_config_post(store)
+                _sync_admin_settings_to_workspaces(app, store.load())
                 ProviderFactory.reset_cache()
                 from utils.providers.embedding_factory import EmbeddingFactory
 
@@ -1903,6 +1915,29 @@ def _any_user_api_keys(app: Flask) -> bool:
 
 def _workspace_config(app: Flask) -> dict:
     return workspace_from_request(app).as_config()
+
+
+def _sync_admin_settings_to_workspaces(app: Flask, settings: dict) -> None:
+    workspace_root = app.config.get("WORKSPACE_DATA_DIR")
+    if not workspace_root or not os.path.isdir(workspace_root):
+        return
+
+    patch = {
+        key: deepcopy(settings[key])
+        for key in _WORKSPACE_ADMIN_SETTING_KEYS
+        if key in settings
+    }
+    if not patch:
+        return
+
+    for workspace_id in os.listdir(workspace_root):
+        settings_path = os.path.join(workspace_root, workspace_id, "settings.json")
+        if not os.path.isfile(settings_path):
+            continue
+        try:
+            SettingsStore(settings_path).update(patch)
+        except Exception as exc:
+            log.warning("Unable to sync admin settings to workspace %s: %s", workspace_id, exc)
 
 
 def _scoped_conversation_id(conversation_id: str | None) -> str | None:

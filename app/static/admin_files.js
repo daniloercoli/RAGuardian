@@ -22,6 +22,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const rebuildErrorPanel = document.getElementById("rebuildErrorPanel");
     const rebuildErrorList = document.getElementById("rebuildErrorList");
     const closeRebuildModalButton = document.getElementById("closeRebuildModalButton");
+    const fileErrorModal = document.getElementById("fileErrorModal");
+    const fileErrorModalMessage = document.getElementById("fileErrorModalMessage");
+    const closeFileErrorModalButton = document.getElementById("closeFileErrorModalButton");
 
     if (!form || !fileInput || !folderInput || !startButton || !cancelButton || !progressPanel || !queueList) {
         return;
@@ -145,6 +148,36 @@ document.addEventListener("DOMContentLoaded", () => {
             rebuildModal.hidden = true;
             window.location.reload();
         });
+    }
+
+    document.querySelectorAll("[data-file-error]").forEach((button) => {
+        button.addEventListener("click", () => {
+            if (!fileErrorModal || !fileErrorModalMessage) return;
+            fileErrorModalMessage.textContent = button.dataset.fileError || "Unknown error";
+            fileErrorModal.hidden = false;
+        });
+    });
+
+    if (closeFileErrorModalButton) {
+        closeFileErrorModalButton.addEventListener("click", closeFileErrorModal);
+    }
+    if (fileErrorModal) {
+        fileErrorModal.addEventListener("click", (event) => {
+            if (event.target === fileErrorModal) {
+                closeFileErrorModal();
+            }
+        });
+        document.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && !fileErrorModal.hidden) {
+                closeFileErrorModal();
+            }
+        });
+    }
+
+    function closeFileErrorModal() {
+        if (fileErrorModal) {
+            fileErrorModal.hidden = true;
+        }
     }
 
     async function startRebuild() {

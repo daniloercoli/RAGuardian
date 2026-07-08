@@ -13,9 +13,8 @@
     <div class="container narrow">
         <header class="page-header">
             <h1>Configuration Required</h1>
-            <nav class="top-nav">
-                <a href="{{ url_for('admin_config') }}">Admin Config</a>
-            </nav>
+            {% set nav_mode = "main" %}
+            {% include "_top_nav.html" %}
         </header>
 
         <section class="panel">

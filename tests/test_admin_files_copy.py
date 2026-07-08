@@ -29,6 +29,9 @@ def test_admin_files_explains_file_index_metadata():
     assert '<td class="actions-cell">' in template
     assert "pagination-size-form" in template
     assert "pagination-nav" in template
+    assert "fileErrorModal" in template
+    assert "data-file-error" in template
+    assert "error-icon-button" in template
 
 
 def test_admin_files_supports_multi_file_upload_interface():
@@ -51,6 +54,8 @@ def test_admin_files_supports_multi_file_upload_interface():
     assert "isAudioFile" in script
     assert "for (let index = 0; index < files.length; index += 1)" in script
     assert "renderErrors(errors)" in script
+    assert "querySelectorAll(\"[data-file-error]\")" in script
+    assert "fileErrorModalMessage.textContent" in script
 
 
 def test_admin_files_supports_index_rebuild_progress_modal():

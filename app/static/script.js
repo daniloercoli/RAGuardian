@@ -13,14 +13,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const sendButton = document.getElementById("sendButton");
     const modelSelect = document.getElementById("modelSelect");
     const promptSelect = document.getElementById("promptSelect");
-    const chatStatus = document.getElementById("chatStatus");
     const clearChatButton = document.getElementById("clearChatButton");
     const streamStatus = document.getElementById("streamStatus");
     const emptyState = document.getElementById("emptyState");
-    const readinessStatus = document.getElementById("readinessStatus");
-    const readinessDocs = document.getElementById("readinessDocs");
-    const readinessIndex = document.getElementById("readinessIndex");
-    const readinessModel = document.getElementById("readinessModel");
     const promptButtons = document.querySelectorAll("[data-prompt]");
     const uploadAudioButton = document.getElementById("uploadAudioButton");
     const uploadOcrButton = document.getElementById("uploadOcrButton");
@@ -38,7 +33,6 @@ document.addEventListener("DOMContentLoaded", () => {
     let codeInterpreterEnabled = false;
     const uploadedFiles = [];
 
-    let healthState = null;
     let busy = false;
     const conversationStorageKey = "ragConversationId";
     let conversationId = loadOrCreateConversationId();
@@ -261,18 +255,8 @@ document.addEventListener("DOMContentLoaded", () => {
             modelSelect.innerHTML = "";
             modelSelect.appendChild(new Option("Error loading models", ""));
             modelSelect.disabled = true;
-            updateChatStatus("Models not available");
+            updateChatStatus();
         }
-    }
-
-    async function loadHealth() {
-        try {
-            const response = await fetch("/health");
-            healthState = await response.json();
-        } catch (error) {
-            healthState = {status: "unreachable"};
-        }
-        updateChatStatus();
     }
 
     async function sendMessage() {
@@ -699,63 +683,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return div.innerHTML;
     }
 
-    function updateChatStatus(overrideText) {
-        if (!chatStatus) return;
+    function updateChatStatus() {
         if (!busy) {
             sendButton.disabled = !modelSelect.value;
-        }
-        if (overrideText) {
-            chatStatus.textContent = overrideText;
-            return;
-        }
-
-        const selected = modelSelect.selectedOptions[0];
-        const modelName = selected && selected.value ? selected.textContent : "model not selected";
-        const parts = [`Model: ${modelName}`];
-
-        if (healthState) {
-            const status = healthState.status || "n/a";
-            const docs = healthState.documents_count;
-            const docsLabel = Number.isFinite(Number(docs)) ? `${docs} chunks` : "index n/a";
-            parts.push(`Status: ${status}`);
-            parts.push(`Knowledge base: ${docsLabel}`);
-        }
-
-        chatStatus.textContent = parts.join(" | ");
-        updateReadinessCards();
-    }
-
-    function updateReadinessCards() {
-        const selected = modelSelect.selectedOptions[0];
-        const modelName = selected && selected.value ? selected.textContent : "n/a";
-        if (readinessModel) {
-            readinessModel.textContent = modelName;
-        }
-        if (!healthState) {
-            return;
-        }
-
-        const docs = Number(healthState.documents_count || 0);
-        const files = Number(healthState.indexed_files_count || 0);
-        const stale = Number(healthState.stale_index_files_count || 0);
-
-        if (readinessStatus) {
-            if (healthState.system_ready) {
-                readinessStatus.textContent = "Ready";
-                readinessStatus.dataset.state = "ready";
-            } else if (healthState.status === "healthy") {
-                readinessStatus.textContent = "To complete";
-                readinessStatus.dataset.state = "warning";
-            } else {
-                readinessStatus.textContent = "Warning";
-                readinessStatus.dataset.state = "error";
-            }
-        }
-        if (readinessDocs) {
-            readinessDocs.textContent = `${files} files | ${docs} chunks`;
-        }
-        if (readinessIndex) {
-            readinessIndex.textContent = healthState.needs_rebuild ? `${stale} files to rebuild` : "Aligned";
         }
     }
 
@@ -1022,6 +952,5 @@ document.addEventListener("DOMContentLoaded", () => {
 
     loadModels();
     loadPrompts();
-    loadHealth();
     resizeInput();
 });

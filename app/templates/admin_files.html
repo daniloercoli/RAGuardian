@@ -13,22 +13,8 @@
     <div class="container wide">
         <header class="page-header">
             <h1>RAG Files</h1>
-            <nav class="top-nav">
-                <a href="{{ url_for('index') }}">Chat</a>
-                <a href="{{ url_for('admin_data_sources') }}">Data Sources</a>
-                {% if current_user and current_user.role == "admin" %}
-                    <a href="{{ url_for('admin_config') }}">Config</a>
-                    <a href="{{ url_for('admin_users') }}">Users</a>
-                    <a href="{{ url_for('admin_api_keys') }}">API Keys</a>
-                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
-                    <a href="{{ url_for('admin_prompts') }}">Shared Prompts</a>
-                {% else %}
-                    <a href="{{ url_for('admin_my_prompts') }}">System Prompts</a>
-                {% endif %}
-                <form method="post" action="{{ url_for('admin_logout') }}">
-                    <button type="submit" class="link-button">Logout</button>
-                </form>
-            </nav>
+            {% set nav_mode = "admin" %}
+            {% include "_top_nav.html" %}
         </header>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -159,6 +145,16 @@
             </section>
         </div>
 
+        <div id="fileErrorModal" class="modal-backdrop" hidden>
+            <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="fileErrorModalTitle">
+                <h2 id="fileErrorModalTitle">File Error</h2>
+                <pre id="fileErrorModalMessage" class="error-detail-text"></pre>
+                <div class="modal-actions">
+                    <button type="button" id="closeFileErrorModalButton">Close</button>
+                </div>
+            </section>
+        </div>
+
         <section class="panel">
             <div class="indexed-files-header">
                 <div>
@@ -226,7 +222,19 @@
                                         <span class="muted">n/a</span>
                                     {% endif %}
                                 </td>
-                                <td class="error-cell">{{ file.error if file.error else "—" }}</td>
+                                <td class="error-cell">
+                                    {% if file.error %}
+                                        <button
+                                            type="button"
+                                            class="error-icon-button"
+                                            data-file-error="{{ file.error|e }}"
+                                            aria-label="Show error for {{ file.filename }}"
+                                            title="Show error"
+                                        >!</button>
+                                    {% else %}
+                                        <span class="muted">—</span>
+                                    {% endif %}
+                                </td>
                                 <td class="actions-cell">
                                     <div class="table-actions">
                                         {% if file.status == "indexed" %}
