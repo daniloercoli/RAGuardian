@@ -27,6 +27,19 @@ def test_chat_markdown_is_sanitized_before_dom_insert():
     assert "loadHealth()" not in script
 
 
+def test_chat_ask_button_recovers_from_stalled_streams():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert "createAskTimeout" in script
+    assert "controller.abort()" in script
+    assert "askTimeout.clear()" in script
+    assert "postAsk(body, askTimeout)" in script
+    assert "renderStreamingResponse(response, messageDiv, askTimeout)" in script
+    assert "renderCodeInterpreterStream(response, messageDiv, askTimeout)" in script
+    assert script.count("reader.cancel().catch") >= 2
+    assert "formatConnectionError" in script
+
+
 def test_templates_include_browser_icons():
     templates = [
         ROOT / "app/templates/index.html",

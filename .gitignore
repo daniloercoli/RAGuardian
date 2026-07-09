@@ -39,6 +39,7 @@ app/data/users.json
 app/data/secrets.json
 app/data/api_keys_usage.json
 app/data/workspaces/
+app/data/user_prompts/
 .pytest_cache/
 
 # Uploads

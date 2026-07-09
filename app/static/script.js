@@ -32,6 +32,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let systemPromptId = loadSystemPromptId();
     let codeInterpreterEnabled = false;
     const uploadedFiles = [];
+    const askIdleTimeoutMs = 120000;
 
     let busy = false;
     const conversationStorageKey = "ragConversationId";
@@ -271,9 +272,11 @@ document.addEventListener("DOMContentLoaded", () => {
         userInput.value = "";
         resizeInput();
         setBusy(true);
+        let askTimeout = null;
 
         try {
             const selected = modelSelect.selectedOptions[0];
+            askTimeout = createAskTimeout();
 
             // Code interpreter mode
             if (codeInterpreterEnabled && uploadedFiles.length > 0) {
@@ -293,17 +296,13 @@ document.addEventListener("DOMContentLoaded", () => {
                         type: f.type
                     }))
                 };
-                const response = await fetch("/ask", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify(ciBody)
-                });
+                const response = await postAsk(ciBody, askTimeout);
                 if (!response.ok) {
                     const data = await readErrorPayload(response);
                     appendMessage(formatError(data, response.statusText), "bot-message");
                 } else {
                     const messageDiv = appendBotMessage("Preparing analysis...");
-                    await renderCodeInterpreterStream(response, messageDiv);
+                    await renderCodeInterpreterStream(response, messageDiv, askTimeout);
                 }
                 // Clear uploaded files after sending
                 uploadedFiles.length = 0;
@@ -330,26 +329,23 @@ document.addEventListener("DOMContentLoaded", () => {
                 }));
             }
 
-            const response = await fetch("/ask", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify(body)
-            });
+            const response = await postAsk(body, askTimeout);
 
             if (!response.ok) {
                 const data = await readErrorPayload(response);
                 appendMessage(formatError(data, response.statusText), "bot-message");
             } else {
                 const messageDiv = appendBotMessage("");
-                await renderStreamingResponse(response, messageDiv);
+                await renderStreamingResponse(response, messageDiv, askTimeout);
                 if (uploadedFiles.length > 0) {
                     uploadedFiles.length = 0;
                     renderAttachedFiles();
                 }
             }
         } catch (error) {
-            appendMessage(`**Connection error:** ${error.message}`, "bot-message");
+            appendMessage(formatConnectionError(error), "bot-message");
         } finally {
+            if (askTimeout) askTimeout.clear();
             setBusy(false);
             userInput.focus();
         }
@@ -364,7 +360,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function renderCodeInterpreterStream(response, messageDiv) {
+    async function renderCodeInterpreterStream(response, messageDiv, timeout) {
         const state = {code: "", result: null, hasError: false, status: "Preparing analysis..."};
 
         const onEvent = (event) => {
@@ -406,10 +402,15 @@ document.addEventListener("DOMContentLoaded", () => {
         while (true) {
             const {value, done} = await reader.read();
             if (done) break;
+            if (timeout) timeout.reset();
             buffer += decoder.decode(value, {stream: true});
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
             parseNdjsonLines(lines.join("\n"), onEvent);
+            if (state.hasError) {
+                reader.cancel().catch(() => {});
+                return;
+            }
         }
         buffer += decoder.decode();
         parseNdjsonLines(buffer, onEvent);
@@ -460,6 +461,38 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function createAskTimeout() {
+        if (!window.AbortController) {
+            return {signal: undefined, reset() {}, clear() {}};
+        }
+
+        const controller = new AbortController();
+        let timeoutId = null;
+        const reset = () => {
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => controller.abort(), askIdleTimeoutMs);
+        };
+        reset();
+        return {
+            signal: controller.signal,
+            reset,
+            clear() {
+                clearTimeout(timeoutId);
+            }
+        };
+    }
+
+    async function postAsk(body, timeout) {
+        const response = await fetch("/ask", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(body),
+            signal: timeout.signal
+        });
+        timeout.reset();
+        return response;
+    }
+
     async function readErrorPayload(response) {
         try {
             return await response.json();
@@ -468,7 +501,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    async function renderStreamingResponse(response, messageDiv) {
+    async function renderStreamingResponse(response, messageDiv, timeout) {
         const state = {answerText: "", hasError: false};
 
         if (!response.body || !response.body.getReader) {
@@ -484,11 +517,16 @@ document.addEventListener("DOMContentLoaded", () => {
         while (true) {
             const {value, done} = await reader.read();
             if (done) break;
+            if (timeout) timeout.reset();
 
             buffer += decoder.decode(value, {stream: true});
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
             parseNdjsonLines(lines.join("\n"), (event) => handleStreamEvent(event, state, messageDiv));
+            if (state.hasError) {
+                reader.cancel().catch(() => {});
+                return;
+            }
         }
 
         buffer += decoder.decode();
@@ -693,6 +731,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const status = data && data.status ? `\n\nStatus: \`${data.status}\`` : "";
         const retry = data && data.retry_after ? ` Retry in ${data.retry_after} seconds.` : "";
         return `**Unable to complete the request.**\n\n${(data && data.error) || fallback || "Unknown error."}${retry}${status}`;
+    }
+
+    function formatConnectionError(error) {
+        if (error && error.name === "AbortError") {
+            return "**Request timed out.**\n\nThe response took too long, so the chat was unlocked. Please try again.";
+        }
+        return `**Connection error:** ${error.message}`;
     }
 
     function clearChat() {
