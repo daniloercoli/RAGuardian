@@ -7,7 +7,7 @@ from langchain_core.documents import Document
 
 from app.utils.chroma_manager import query_chroma_with_rerank
 from app.utils.file_index import FileIndex
-from app.utils.reranker import DummyReranker, get_reranker
+from app.utils.reranker import get_reranker
 
 
 class TestRerankerE2E:
@@ -24,9 +24,7 @@ class TestRerankerE2E:
         4. Verifica che i documenti più rilevanti vengano selezionati
         """
         # Setup: crea un reranker (usa cpu per:test in CI)
-        reranker = get_reranker(enabled=True)
-        if not isinstance(reranker, DummyReranker):
-            reranker.model.device = "cpu"
+        reranker = get_reranker(enabled=True, device="cpu")
 
         # Documenti di esempio con contenuti diversi
         docs = [
@@ -63,9 +61,7 @@ class TestRerankerE2E:
         """
         E2E test: Verifica che i documenti siano ordinati per rilevanza.decrescente.
         """
-        reranker = get_reranker(enabled=True)
-        if not isinstance(reranker, DummyReranker):
-            reranker.model.device = "cpu"
+        reranker = get_reranker(enabled=True, device="cpu")
 
         docs = [
             Document(
@@ -106,9 +102,7 @@ class TestRerankerE2E:
 
     def test_reranker_respects_top_n(self, tmp_path):
         """E2E test: Verifica che top_n venga rispettato."""
-        reranker = get_reranker(enabled=True)
-        if not isinstance(reranker, DummyReranker):
-            reranker.model.device = "cpu"
+        reranker = get_reranker(enabled=True, device="cpu")
 
         # Creiamo documenti diversi per avere punteggi distinti
         docs = [

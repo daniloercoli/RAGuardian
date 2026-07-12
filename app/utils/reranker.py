@@ -252,6 +252,7 @@ def get_reranker(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     mode: str = "auto",
+    device: str = "cuda",
 ) -> BaseReranker:
     """Factory per ottenere l'istanza del reranker corretta."""
     if not enabled:
@@ -266,7 +267,7 @@ def get_reranker(
             return DummyReranker()
 
     try:
-        return BGEReranker(model_name=model_name)
+        return BGEReranker(model_name=model_name, device=device)
     except Exception as e:
         logger.warning("ReRanker LOCALE: impossibile caricare (%s), uso DummyReranker", e)
         return DummyReranker()
