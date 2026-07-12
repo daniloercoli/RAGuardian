@@ -1,14 +1,11 @@
 import json
-import hashlib
 import mimetypes
 import os
 import re
 import threading
 import time
 import uuid
-from collections import defaultdict
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
 
 try:
     from dotenv import load_dotenv
@@ -21,30 +18,38 @@ from flask import (
     Response,
     current_app,
     flash,
-    has_request_context,
     jsonify,
     redirect,
     render_template,
     request,
-    session,
     url_for,
 )
 from werkzeug.utils import secure_filename
 
 from config import Config
 from utils.auth import (
-    authenticate_user,
-    check_admin_password,
     current_user,
-    hash_password,
     require_admin,
     require_admin_or_api_scope,
     require_admin_or_upload_api_key,
-    require_api_key,
     require_api_scope,
     require_login,
 )
 from utils.file_index import FileIndex
+from utils.http_security import (
+    RequestTimeoutExceeded,
+    apply_cors_headers as _apply_cors_headers,
+    cors_origin_for_request as _cors_origin_for_request,
+    csrf_token as _csrf_token,
+    ensure_request_not_timed_out as _ensure_request_not_timed_out,
+    env_bool as _env_bool,
+    env_csv as _env_csv,
+    env_float as _env_float,
+    request_timeout_seconds as _request_timeout_seconds,
+    security_hardening_required as _security_hardening_required,
+    validate_csrf_request as _validate_csrf_request,
+    validate_security_config as _validate_security_config,
+)
 from utils.logging_config import APP_LOGGER as log, configure_external_loggers
 from utils.model_defaults import (
     ModelConfigurationError,
@@ -57,6 +62,8 @@ from utils.model_defaults import (
 )
 from utils.providers.provider_factory import ProviderFactory
 from utils.providers.registry import ProviderRegistry
+from utils.pagination import paginate_items as _paginate_items
+from utils.rate_limiter import RateLimiter
 from utils.settings_store import (
     SettingsStore,
     normalize_custom_provider,
@@ -69,10 +76,8 @@ from utils.settings_store import (
 )
 from utils.state_backend import (
     configured_queue_backend,
-    configured_state_backend,
     redis_connection,
     runtime_state_status,
-    state_key_prefix,
 )
 from utils.job_store import get_job_store, queue_name
 from utils.workspace import workspace_from_request
@@ -87,73 +92,6 @@ from utils.validators import (
     validate_string,
 )
 
-
-class RateLimiter:
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests = defaultdict(list)
-        self.lock = threading.Lock()
-        self.backend = configured_state_backend()
-        self.redis = None
-        if self.backend == "redis":
-            try:
-                self.redis = redis_connection()
-            except Exception as exc:
-                log.warning("Redis rate limiter unavailable, falling back to memory: %s", exc)
-                self.backend = "memory"
-
-    def is_allowed(self, client_ip: str) -> tuple[bool, int]:
-        if self.backend == "redis" and self.redis is not None:
-            try:
-                return self._is_allowed_redis(client_ip)
-            except Exception as exc:
-                log.warning("Redis rate limiter failed, using memory fallback: %s", exc)
-                return self._is_allowed_memory(client_ip)
-        return self._is_allowed_memory(client_ip)
-
-    def _is_allowed_memory(self, client_ip: str) -> tuple[bool, int]:
-        with self.lock:
-            current_time = time.time()
-            timestamps = [
-                ts for ts in self.requests.get(client_ip, [])
-                if current_time - ts < self.window_seconds
-            ]
-            self.requests[client_ip] = timestamps
-
-            if len(timestamps) >= self.max_requests:
-                oldest = timestamps[0]
-                wait_time = oldest + self.window_seconds - current_time
-                return False, max(1, int(wait_time) + 1)
-
-            timestamps.append(current_time)
-            return True, 0
-
-    def _is_allowed_redis(self, client_ip: str) -> tuple[bool, int]:
-        now = time.time()
-        cutoff = now - self.window_seconds
-        key = self._redis_key(client_ip)
-
-        pipe = self.redis.pipeline()
-        pipe.zremrangebyscore(key, 0, cutoff)
-        pipe.zcard(key)
-        _, count = pipe.execute()
-
-        if count >= self.max_requests:
-            oldest = self.redis.zrange(key, 0, 0, withscores=True)
-            wait_time = self.window_seconds
-            if oldest:
-                wait_time = int(float(oldest[0][1]) + self.window_seconds - now) + 1
-            self.redis.expire(key, self.window_seconds + 1)
-            return False, max(1, wait_time)
-
-        self.redis.zadd(key, {f"{now}:{uuid.uuid4().hex}": now})
-        self.redis.expire(key, self.window_seconds + 1)
-        return True, 0
-
-    def _redis_key(self, client_ip: str) -> str:
-        client_hash = hashlib.sha256(client_ip.encode("utf-8")).hexdigest()[:24]
-        return f"{state_key_prefix()}:rate_limit:{client_hash}"
 
 _OCR_INDEX_PROFILE_KEYS = {
     "ocr_enabled",
@@ -182,134 +120,6 @@ CHAT_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CODE_IMAGE_PATTERN = re.compile(r"^[0-9a-f]{12}_[A-Za-z0-9._-]+\.png$")
 
 
-class RequestTimeoutExceeded(TimeoutError):
-    pass
-
-
-def _env_csv(name: str, default: str = "") -> list[str]:
-    raw = os.getenv(name, default)
-    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float = 0.0) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _request_timeout_seconds(app: Flask | None = None) -> float:
-    value = (app or current_app).config.get("REQUEST_TIMEOUT_SECONDS", 0)
-    try:
-        return max(0.0, float(value or 0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _ensure_request_not_timed_out() -> None:
-    if not has_request_context():
-        return
-    deadline = getattr(request, "_rag_deadline", None)
-    if deadline and time.monotonic() > float(deadline):
-        raise RequestTimeoutExceeded("Richiesta scaduta")
-
-
-def _cors_origin_for_request(app: Flask) -> str:
-    origin = request.headers.get("Origin", "")
-    if not origin:
-        return ""
-    allowed = app.config.get("CORS_ALLOWED_ORIGINS") or []
-    if isinstance(allowed, str):
-        allowed = _split_config_csv(allowed)
-    if "*" in allowed:
-        return origin if app.config.get("CORS_ALLOW_CREDENTIALS") else "*"
-    return origin if origin in allowed else ""
-
-
-def _apply_cors_headers(app: Flask, response: Response) -> None:
-    origin = _cors_origin_for_request(app)
-    if not origin:
-        return
-    response.headers["Access-Control-Allow-Origin"] = origin
-    _append_vary_header(response, "Origin")
-    response.headers["Access-Control-Allow-Methods"] = ", ".join(
-        _split_config_csv(app.config.get("CORS_ALLOWED_METHODS") or [])
-    )
-    response.headers["Access-Control-Allow-Headers"] = ", ".join(
-        _split_config_csv(app.config.get("CORS_ALLOWED_HEADERS") or [])
-    )
-    response.headers["Access-Control-Max-Age"] = str(app.config.get("CORS_MAX_AGE", 600))
-    if app.config.get("CORS_ALLOW_CREDENTIALS"):
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-
-
-def _split_config_csv(value) -> list[str]:
-    if isinstance(value, (list, tuple, set)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [part.strip() for part in str(value or "").split(",") if part.strip()]
-
-
-def _append_vary_header(response: Response, value: str) -> None:
-    existing = [part.strip() for part in response.headers.get("Vary", "").split(",") if part.strip()]
-    if value not in existing:
-        existing.append(value)
-    response.headers["Vary"] = ", ".join(existing)
-
-
-def _paginate_items(
-    items: list,
-    *,
-    page,
-    per_page,
-    allowed_per_page: tuple[int, ...] = (10, 25, 50, 100),
-    default_per_page: int = 25,
-) -> tuple[list, dict]:
-    total = len(items)
-    per_page_value = _coerce_positive_int(per_page, default_per_page)
-    if per_page_value not in allowed_per_page:
-        per_page_value = default_per_page
-
-    page_count = max(1, (total + per_page_value - 1) // per_page_value)
-    page_value = _coerce_positive_int(page, 1)
-    page_value = min(page_value, page_count)
-
-    start_index = (page_value - 1) * per_page_value
-    end_index = min(start_index + per_page_value, total)
-    window_start = max(1, page_value - 2)
-    window_end = min(page_count, window_start + 4)
-    window_start = max(1, window_end - 4)
-
-    return items[start_index:end_index], {
-        "page": page_value,
-        "per_page": per_page_value,
-        "allowed_per_page": list(allowed_per_page),
-        "total": total,
-        "page_count": page_count,
-        "has_prev": page_value > 1,
-        "has_next": page_value < page_count,
-        "prev_page": max(1, page_value - 1),
-        "next_page": min(page_count, page_value + 1),
-        "start": start_index + 1 if total else 0,
-        "end": end_index,
-        "page_numbers": list(range(window_start, window_end + 1)),
-    }
-
-
-def _coerce_positive_int(value, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
 def create_app(test_config: dict | None = None) -> Flask:
     load_dotenv()
     _setup_ssl()
@@ -327,6 +137,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["WORKSPACE_DATA_DIR"] = os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
     app.config["WORKSPACE_UPLOAD_DIR"] = os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces")
     app.config["SECRET_KEY"] = Config.api_keys.flask_secret_key or os.getenv("FLASK_SECRET_KEY") or "dev-secret"
+    app.config["RAG_SECRET_KEY"] = os.getenv("RAG_SECRET_KEY") or app.config["SECRET_KEY"]
     app.config["MAX_UPLOAD_SIZE_MB"] = Config.paths.max_upload_size_mb
     app.config["MAX_AUDIO_UPLOAD_SIZE_MB"] = int(os.getenv("MAX_AUDIO_UPLOAD_SIZE_MB", "50"))
     app.config["RATE_LIMIT_REQUESTS"] = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
@@ -344,13 +155,28 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["CORS_ALLOW_CREDENTIALS"] = _env_bool("RAG_CORS_ALLOW_CREDENTIALS", False)
     app.config["CORS_MAX_AGE"] = int(os.getenv("RAG_CORS_MAX_AGE", "600"))
     app.config["REQUEST_TIMEOUT_SECONDS"] = _env_float("RAG_REQUEST_TIMEOUT_SECONDS", 0.0)
+    app.config["CSRF_ENABLED"] = True
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = _security_hardening_required()
 
     if test_config:
         app.config.update(test_config)
+        if app.testing and "CSRF_ENABLED" not in test_config:
+            app.config["CSRF_ENABLED"] = False
+        if app.testing and "RAG_SECRET_KEY" not in test_config:
+            app.config["RAG_SECRET_KEY"] = app.config["SECRET_KEY"]
+
+    _validate_security_config(app)
 
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["WORKSPACE_DATA_DIR"], exist_ok=True)
     os.makedirs(app.config["WORKSPACE_UPLOAD_DIR"], exist_ok=True)
+    from utils.user_store import UserStore
+
+    migrated_api_keys = UserStore(app.config["USERS_FILE"]).migrate_legacy_api_keys()
+    if migrated_api_keys:
+        log.info("Migrated %d legacy API key(s) to hashed storage", migrated_api_keys)
     SettingsStore(app.config["SETTINGS_FILE"]).load()
     model_config_error = get_model_configuration_error()
     if model_config_error:
@@ -365,7 +191,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.context_processor
     def _inject_current_user():
-        return {"current_user": current_user()}
+        return {"current_user": current_user(), "csrf_token": _csrf_token()}
 
     @app.errorhandler(RequestTimeoutExceeded)
     def _request_timeout_error(_error):
@@ -389,6 +215,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
         if request.method == "OPTIONS" and _cors_origin_for_request(app):
             return Response(status=204)
+        csrf_error = _validate_csrf_request(app)
+        if csrf_error is not None:
+            return csrf_error
         # Track API key info for usage logging
         api_key_header = request.headers.get("X-API-Key")
         if api_key_header:
@@ -469,6 +298,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
 
 def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
+    from routes.admin_accounts import register_admin_account_routes
+    from routes.auth import register_auth_routes
+    from routes.backups import register_backup_routes
+    from routes.prompts import register_prompt_routes
+
+    register_admin_account_routes(app)
+    register_auth_routes(app)
+    register_backup_routes(app)
+    register_prompt_routes(app)
+
     @app.route("/")
     @require_login
     def index():
@@ -490,7 +329,21 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
 
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify(_health_status(app))
+        detailed = _health_status(app, deep=False)
+        return jsonify(
+            {
+                key: detailed.get(key)
+                for key in (
+                    "status",
+                    "system_ready",
+                    "model_configuration_ready",
+                    "database_ready",
+                    "redis_ready",
+                    "queue_ready",
+                    "uptime_seconds",
+                )
+            }
+        )
 
     @app.route("/metrics", methods=["GET"])
     def metrics_text():
@@ -601,24 +454,6 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     def upload_legacy():
         return _upload_json_response(app)
 
-    @app.route("/admin/login", methods=["GET", "POST"])
-    def admin_login():
-        if request.method == "POST":
-            email = request.form.get("email", "")
-            password = request.form.get("password", "")
-            user = authenticate_user(email, password)
-            if user:
-                session["user_id"] = user["id"]
-                return redirect(request.args.get("next") or url_for("admin_config"))
-            flash("Password non valida", "error")
-        return render_template("admin_login.html")
-
-    @app.route("/admin/logout", methods=["POST"])
-    @require_login
-    def admin_logout():
-        session.clear()
-        return redirect(url_for("admin_login"))
-
     @app.route("/admin/config", methods=["GET", "POST"])
     @require_admin
     def admin_config():
@@ -648,7 +483,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             models = []
             model_config_error = str(e)
         setup_status = {
-            "users_configured": bool(current_user() or _user_store().has_users()),
+            "users_configured": bool(current_user() or _has_users(app)),
             "api_key_configured": bool(
                 os.getenv("RAG_API_KEY")
                 or _any_user_api_keys(app)
@@ -668,144 +503,6 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             health=_health_status(app, deep=False),
             index_status=_index_rebuild_status(app),
             setup_status=setup_status,
-        )
-
-    @app.route("/admin/users", methods=["GET", "POST"])
-    @require_admin
-    def admin_users():
-        from utils.user_store import UserStore
-        from utils.workspace import workspace_for_user
-
-        store = UserStore(app.config["USERS_FILE"])
-        if request.method == "POST":
-            try:
-                action = request.form.get("action", "create")
-                if action == "create":
-                    user = store.create_user(
-                        email=request.form.get("email", ""),
-                        password=request.form.get("password", ""),
-                        display_name=request.form.get("display_name", ""),
-                        role=request.form.get("role", "user"),
-                        enabled=request.form.get("enabled") == "on",
-                    )
-                    workspace_for_user(user, app=app)
-                    flash("Utente creato", "success")
-                elif action == "update":
-                    user_id = request.form.get("user_id", "")
-                    store.update_user(
-                        user_id,
-                        display_name=request.form.get("display_name", ""),
-                        role=request.form.get("role", "user"),
-                        enabled=request.form.get("enabled") == "on",
-                        password=request.form.get("password", ""),
-                    )
-                    flash("Utente aggiornato", "success")
-            except Exception as e:
-                flash(str(e), "error")
-            return redirect(url_for("admin_users"))
-
-        users = store.list()
-        return render_template("admin_users.html", users=users)
-
-    @app.route("/admin/api-keys", methods=["GET", "POST"])
-    @require_admin
-    def admin_api_keys():
-        from utils.user_store import UserStore
-
-        store = UserStore(app.config["USERS_FILE"])
-
-        def _render_api_keys(revealed_key: dict | None = None):
-            users = store.list()
-            all_keys = []
-            user_map = {user["id"]: user for user in users}
-            for user in users:
-                for key in store.get_api_keys(user["id"]):
-                    all_keys.append({
-                        **key,
-                        "user_id": user["id"],
-                        "user_email": user.get("email", ""),
-                        "user_display_name": user.get("display_name", ""),
-                        "user_role": user.get("role", ""),
-                    })
-            from utils.api_key_logger import ApiKeyLogger
-            usage_logger = ApiKeyLogger(app.config.get("API_KEY_USAGE_FILE"))
-            return render_template(
-                "admin_api_keys.html",
-                users=users,
-                all_keys=all_keys,
-                user_map=user_map,
-                usage_entries=usage_logger.recent_entries(20),
-                usage_entry_limit=20,
-                usage_log_exists=usage_logger.file_exists(),
-                usage_log_path=str(usage_logger.path),
-                revealed_key=revealed_key,
-            )
-
-        if request.method == "POST":
-            try:
-                action = request.form.get("action")
-                user_id = request.form.get("user_id", "")
-                if action == "create":
-                    name = request.form.get("name", "").strip()
-                    description = request.form.get("description", "").strip()
-                    scopes = [s.strip() for s in request.form.getlist("scopes") if s.strip()]
-                    if not scopes:
-                        scopes = ["query"]
-                    enabled = request.form.get("enabled") == "on"
-                    expires_in = request.form.get("expires_in", "").strip()
-                    expires_at = _api_key_expires_at_from_ttl(expires_in)
-                    store.create_api_key(
-                        user_id=user_id,
-                        name=name,
-                        scopes=scopes,
-                        description=description,
-                        enabled=enabled,
-                        expires_at=expires_at,
-                    )
-                    flash(f"API key '{name}' creata", "success")
-                elif action == "delete":
-                    key_name = request.form.get("key_name", "").strip()
-                    store.delete_api_key(user_id=user_id, key_name=key_name)
-                    flash(f"API key '{key_name}' eliminata", "success")
-                elif action == "toggle":
-                    key_name = request.form.get("key_name", "").strip()
-                    existing = store.toggle_api_key_enabled(user_id=user_id, key_name=key_name)
-                    flash(f"API key '{key_name}' {'abilitata' if existing and existing.get('enabled') else 'disabilitata'}", "success")
-                elif action == "download":
-                    key_name = request.form.get("key_name", "").strip()
-                    key = store.get_api_key(user_id, key_name, include_raw=True)
-                    if not key:
-                        flash("API key non trovata", "error")
-                    elif not key.get("key"):
-                        flash("Chiave non disponibile", "error")
-                    else:
-                        return _render_api_keys(revealed_key={
-                            "name": key_name,
-                            "key": key["key"],
-                        })
-                elif action == "clear_show_key":
-                    pass
-            except Exception as e:
-                flash(str(e), "error")
-            return redirect(url_for("admin_api_keys"))
-
-        return _render_api_keys()
-
-    @app.route("/admin/api-keys/usage-log", methods=["GET"])
-    @require_admin
-    def admin_api_key_usage_log_download():
-        from flask import send_file
-        from utils.api_key_logger import ApiKeyLogger
-
-        usage_file = ApiKeyLogger(app.config.get("API_KEY_USAGE_FILE")).path
-        if not usage_file.exists():
-            flash("Usage log API key non ancora disponibile", "error")
-            return redirect(url_for("admin_api_keys"))
-        return send_file(
-            str(usage_file),
-            mimetype="application/json",
-            as_attachment=True,
-            download_name=usage_file.name,
         )
 
     @app.route("/admin/files", methods=["GET", "POST"])
@@ -980,63 +677,6 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             flash(str(e), "error")
             return redirect(url_for("admin_files"))
 
-    @app.route("/admin/backup/create", methods=["POST"])
-    @require_admin
-    def admin_create_backup():
-        from utils.vector_store.backup_manager import create_backup
-        try:
-            result = create_backup()
-            flash(f"Backup creato: {result.get('id', '?')} ({result.get('document_count', 0)} documenti)", "success")
-        except Exception as e:
-            log.error(f"Backup creation failed: {e}")
-            flash(str(e), "error")
-        return redirect(url_for("admin_files"))
-
-    @app.route("/admin/backup/list", methods=["GET"])
-    @require_admin
-    def admin_list_backups():
-        from utils.vector_store.backup_manager import list_backups
-        try:
-            backups = list_backups()
-        except Exception as e:
-            log.error(f"List backups failed: {e}")
-            backups = []
-        return jsonify(backups)
-
-    @app.route("/admin/backup/restore/<backup_id>", methods=["POST"])
-    @require_admin
-    def admin_restore_backup(backup_id):
-        from utils.vector_store.backup_manager import restore_backup
-        try:
-            result = restore_backup(backup_id)
-            flash(f"Restore completato: {backup_id} ({result.get('document_count', 'unknown')} documenti)", "success")
-        except Exception as e:
-            log.error(f"Restore failed: {e}")
-            flash(str(e), "error")
-        return redirect(url_for("admin_files"))
-
-    @app.route("/admin/backup/delete/<backup_id>", methods=["POST"])
-    @require_admin
-    def admin_delete_backup(backup_id):
-        from utils.vector_store.backup_manager import delete_backup, apply_retention
-        try:
-            ok = delete_backup(backup_id)
-            flash(f"Backup {backup_id} eliminato", "success")
-        except Exception as e:
-            log.error(f"Delete backup failed: {e}")
-            flash(str(e), "error")
-        return redirect(url_for("admin_files"))
-
-    @app.route("/admin/backup/verify/<backup_id>", methods=["GET"])
-    @require_admin
-    def admin_verify_backup(backup_id):
-        from utils.vector_store.backup_manager import verify_backup
-        try:
-            result = verify_backup(backup_id)
-        except Exception as e:
-            result = {"status": "error", "error": str(e)}
-        return jsonify(result)
-
     # ---------------------------------------------------------------
     # Code Interpreter Routes
     # ---------------------------------------------------------------
@@ -1096,165 +736,6 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return jsonify(error="Image not found"), 404
         from flask import send_file as _send_file
         return _send_file(pic_path)
-
-    # System Prompt Routes
-    # ---------------------------------------------------------------
-
-    @app.route("/my-prompts", methods=["GET"])
-    @require_login
-    def admin_my_prompts():
-        return render_template("my_prompts.html")
-
-    @app.route("/admin/prompts", methods=["GET"])
-    @require_admin
-    def admin_prompts():
-        return render_template("admin_prompts.html")
-
-    # Personal prompts CRUD
-    @app.route("/api/prompts", methods=["GET"])
-    @require_login
-    def api_list_prompts():
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        user_id = user["id"] if user else ""
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        return jsonify({"personal": ps.list_user_prompts(user_id)})
-
-    @app.route("/api/prompts", methods=["POST"])
-    @require_login
-    def api_create_prompt():
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        user_id = user["id"] if user else ""
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify(error="empty body"), 400
-        name = (data.get("name") or "").strip()
-        content = (data.get("content") or "").strip()
-        if not name or not content:
-            return jsonify(error="name and content required"), 400
-        try:
-            ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-            prompt = ps.create_user_prompt(user_id, name, content)
-            return jsonify(prompt), 201
-        except Exception as e:
-            return jsonify(error=str(e)), 400
-
-    @app.route("/api/prompts/<prompt_id>", methods=["PUT"])
-    @require_login
-    def api_update_prompt(prompt_id):
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        user_id = user["id"] if user else ""
-        data = request.get_json(silent=True) or {}
-        name = data.get("name")
-        content = data.get("content")
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        updated = ps.update_user_prompt(user_id, prompt_id, name=name, content=content)
-        if updated:
-            return jsonify(updated)
-        return jsonify(error="prompt not found"), 404
-
-    @app.route("/api/prompts/<prompt_id>", methods=["DELETE"])
-    @require_login
-    def api_delete_prompt(prompt_id):
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        user_id = user["id"] if user else ""
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        ok = ps.delete_user_prompt(user_id, prompt_id)
-        if ok:
-            return jsonify(ok=True)
-        return jsonify(error="prompt not found"), 404
-
-    # Shared (admin) prompts CRUD
-    @app.route("/api/prompts/shared", methods=["GET"])
-    @require_login
-    def api_list_shared_prompts():
-        from utils.prompt_store import PromptStore
-
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        user = current_user()
-        if not user or user.get("role") != "admin":
-            return jsonify({"prompts": ps.list_shared()})
-        all_prompts = ps.all_shared()
-        active = [p for p in all_prompts if p.get("is_active", True)]
-        inactive = [p for p in all_prompts if not p.get("is_active", True)]
-        return jsonify({"prompts": active + inactive})
-
-    @app.route("/api/prompts/shared", methods=["POST"])
-    @require_admin
-    def api_create_shared_prompt():
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        user_id = user["id"] if user else ""
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify(error="empty body"), 400
-        name = (data.get("name") or "").strip()
-        content = (data.get("content") or "").strip()
-        if not name or not content:
-            return jsonify(error="name and content required"), 400
-        try:
-            ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-            prompt = ps.create_shared(name, content, created_by=user_id)
-            return jsonify(prompt), 201
-        except Exception as e:
-            return jsonify(error=str(e)), 400
-
-    @app.route("/api/prompts/shared/<prompt_id>", methods=["PUT"])
-    @require_admin
-    def api_update_shared_prompt(prompt_id):
-        from utils.prompt_store import PromptStore
-
-        data = request.get_json(silent=True) or {}
-        name = data.get("name")
-        content = data.get("content")
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        updated = ps.update_shared(prompt_id, name=name, content=content)
-        if updated:
-            return jsonify(updated)
-        return jsonify(error="prompt not found"), 404
-
-    @app.route("/api/prompts/shared/<prompt_id>/toggle", methods=["POST"])
-    @require_admin
-    def api_toggle_shared_prompt(prompt_id):
-        from utils.prompt_store import PromptStore
-
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        result = ps.toggle_shared(prompt_id)
-        if result:
-            return jsonify(result)
-        return jsonify(error="prompt not found"), 404
-
-    @app.route("/api/prompts/shared/<prompt_id>", methods=["DELETE"])
-    @require_admin
-    def api_delete_shared_prompt(prompt_id):
-        from utils.prompt_store import PromptStore
-
-        ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-        ok = ps.delete_shared(prompt_id)
-        if ok:
-            return jsonify(ok=True)
-        return jsonify(error="prompt not found"), 404
-
-    # Template resolution preview
-    @app.route("/api/prompts/resolve", methods=["POST"])
-    @require_login
-    def api_resolve_prompt():
-        from utils.prompt_store import PromptStore
-
-        user = current_user()
-        data = request.get_json(silent=True)
-        if not data or not data.get("content"):
-            return jsonify(error="content required"), 400
-        resolved = PromptStore.resolve_template(data["content"], user)
-        return jsonify(resolved=resolved)
 
     @app.route("/api/v1/health", methods=["GET"])
     @require_api_scope("query")
@@ -1889,28 +1370,16 @@ def _code_interpreter_response(prepared: dict, code: str, result: dict) -> dict:
     return response
 
 
-def _api_key_expires_at_from_ttl(value: str) -> str | None:
-    value = str(value or "").strip().lower()
-    if not value:
-        return None
-    match = re.fullmatch(r"([1-9][0-9]*)([dhm])", value)
-    if not match:
-        raise ValidationError("TTL API key non valido. Usa formati come 30d, 24h o 60m.", "expires_in")
-    amount = int(match.group(1))
-    unit = match.group(2)
-    if unit == "d":
-        delta = timedelta(days=amount)
-    elif unit == "h":
-        delta = timedelta(hours=amount)
-    else:
-        delta = timedelta(minutes=amount)
-    return (datetime.now(timezone.utc) + delta).isoformat(timespec="seconds")
-
-
 def _any_user_api_keys(app: Flask) -> bool:
     from utils.user_store import UserStore
 
     return any(user.get("api_keys") for user in UserStore(app.config["USERS_FILE"]).list())
+
+
+def _has_users(app: Flask) -> bool:
+    from utils.user_store import UserStore
+
+    return UserStore(app.config["USERS_FILE"]).has_users()
 
 
 def _workspace_config(app: Flask) -> dict:

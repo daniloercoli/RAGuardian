@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <script src="{{ url_for('static', filename='csrf.js') }}"></script>
     <title>System Prompts - RAG Service</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
@@ -137,9 +139,9 @@ Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;. Rispondi a &#123;&#123;NOME_UT
         const sharedEl = document.getElementById("sharedPrompts");
         const previewResult = document.getElementById("previewResult");
 
-        const csrfMeta = document.querySelector("meta[name='csrf-token']");
         function csrfHeaders() {
-            return {};
+            const csrfMeta = document.querySelector("meta[name='csrf-token']");
+            return csrfMeta ? {"X-CSRF-Token": csrfMeta.content} : {};
         }
 
         // Fetch and render personal prompts

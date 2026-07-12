@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <script src="{{ url_for('static', filename='csrf.js') }}"></script>
     <title>API Keys - RAG Service</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
@@ -59,9 +61,10 @@
 
         {% if revealed_key %}
         <section class="panel">
-            <h2>API Key Revealed</h2>
+            <h2>API Key Created</h2>
             <div class="raw-key-box">
                 <p>API key per "<strong>{{ revealed_key.name }}</strong>"</p>
+                <p class="muted">Copy it now: the server stores only its hash and cannot reveal it again.</p>
                 <input type="text" id="rawKeyInput" value="{{ revealed_key.key }}" readonly onclick="this.select()">
                 <button onclick="copyRawKey()">Copy</button>
                 <form method="post">
@@ -178,12 +181,6 @@
                                             Enabled
                                         </label>
                                         <button type="submit" class="secondary">Toggle</button>
-                                    </form>
-                                    <form method="post" class="form-grid compact">
-                                        <input type="hidden" name="action" value="download">
-                                        <input type="hidden" name="user_id" value="{{ key.user_id }}">
-                                        <input type="hidden" name="key_name" value="{{ key.name }}">
-                                        <button type="submit" class="secondary">Show Key</button>
                                     </form>
                                     <form method="post" class="form-grid compact">
                                         <input type="hidden" name="action" value="delete">

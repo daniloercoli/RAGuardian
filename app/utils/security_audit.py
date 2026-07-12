@@ -1,6 +1,6 @@
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from .logging_config import APP_LOGGER as log, sanitize_log_value
 import os
@@ -18,7 +18,7 @@ class SecurityAuditLogger:
         """Log security event"""
         safe_details = sanitize_log_value("details", details)
         event = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
             "severity": severity,
             "details": safe_details,

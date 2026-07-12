@@ -72,7 +72,7 @@ def test_bootstrap_admin_if_empty_creates_only_one_admin_concurrently(tmp_path):
     assert sum(result is not None for result in results) == 1
 
 
-def test_raw_api_key_is_hidden_from_public_user_views():
+def test_raw_api_key_is_hashed_and_cannot_be_retrieved():
     with tempfile.TemporaryDirectory() as tmp:
         store_path = Path(tmp) / "users.json"
         _make_user(store_path, "user-1")
@@ -91,9 +91,24 @@ def test_raw_api_key_is_hidden_from_public_user_views():
         assert "key" not in listed_key
 
         hidden_key = store.get_api_key("user-1", "secret")
-        revealed_key = store.get_api_key("user-1", "secret", include_raw=True)
         assert "key" not in hidden_key
-        assert revealed_key["key"] == "raw-secret-value"
+        assert "raw-secret-value" not in store_path.read_text(encoding="utf-8")
+        assert "key_hash" in json.loads(store_path.read_text(encoding="utf-8"))["users"][0]["api_keys"][0]
+
+
+def test_legacy_raw_api_keys_are_migrated_to_hashes(tmp_path):
+    store_path = tmp_path / "users.json"
+    _make_user(store_path, "user-1")
+    data = json.loads(store_path.read_text(encoding="utf-8"))
+    data[0]["api_keys"] = [{"name": "legacy", "key": "legacy-secret", "enabled": True}]
+    store_path.write_text(json.dumps(data), encoding="utf-8")
+
+    store = UserStore(store_path)
+    assert store.migrate_legacy_api_keys() == 1
+
+    raw = store_path.read_text(encoding="utf-8")
+    assert "legacy-secret" not in raw
+    assert store.migrate_legacy_api_keys() == 0
 
 
 def test_duplicate_key_name_fails():

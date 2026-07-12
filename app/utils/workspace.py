@@ -57,7 +57,7 @@ def workspace_for_user(user: dict, app=None) -> WorkspaceContext:
         upload_folder=str(workspace_upload),
         chroma_collection=collection_for_workspace(workspace_id),
         secrets_file=app.config.get("SECRETS_FILE", "app/data/secrets.json"),
-        secret_key=app.config.get("SECRET_KEY", ""),
+        secret_key=app.config.get("RAG_SECRET_KEY") or app.config.get("SECRET_KEY", ""),
     )
 
 

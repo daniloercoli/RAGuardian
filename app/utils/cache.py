@@ -1,7 +1,6 @@
 import time
 import hashlib
 import json
-import pickle
 import threading
 from typing import Optional, Any
 from collections import OrderedDict
@@ -12,6 +11,41 @@ from .state_backend import (
     redis_scan_delete,
     state_key_prefix,
 )
+
+
+def _serialize_documents(results: list) -> bytes:
+    payload = []
+    for item in results:
+        if not hasattr(item, "page_content"):
+            raise TypeError("Redis RAG cache supports document results only")
+        payload.append(
+            {
+                "page_content": str(item.page_content or ""),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+            }
+        )
+    return json.dumps(
+        {"schema_version": 1, "documents": payload},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+
+def _deserialize_documents(raw: bytes | str) -> list:
+    from langchain_core.documents import Document
+
+    payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("documents"), list):
+        raise ValueError("Unsupported Redis cache payload")
+    return [
+        Document(
+            page_content=str(item.get("page_content") or ""),
+            metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+        )
+        for item in payload["documents"]
+        if isinstance(item, dict)
+    ]
 
 
 class CacheEntry:
@@ -134,7 +168,7 @@ class RAGCache:
         if self._backend == "redis" and self._redis is not None:
             try:
                 raw = self._redis.get(self._redis_key(cache_key))
-                result = pickle.loads(raw) if raw else None
+                result = _deserialize_documents(raw) if raw else None
             except Exception as exc:
                 log.warning("Redis cache read failed, using memory fallback: %s", exc)
                 result = self._cache.get(cache_key)
@@ -165,7 +199,11 @@ class RAGCache:
         
         if self._backend == "redis" and self._redis is not None:
             try:
-                self._redis.setex(self._redis_key(cache_key), config.cache_ttl, pickle.dumps(results))
+                self._redis.setex(
+                    self._redis_key(cache_key),
+                    config.cache_ttl,
+                    _serialize_documents(results),
+                )
             except Exception as exc:
                 log.warning("Redis cache write failed, using memory fallback: %s", exc)
                 self._cache.set(cache_key, results, config.cache_ttl)

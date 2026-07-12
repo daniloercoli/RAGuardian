@@ -189,7 +189,7 @@ def test_user_api_key_expiration_uses_full_timestamp(flask_app):
         assert find_api_key("expired-key") is None
 
 
-def test_admin_api_key_reveal_does_not_store_raw_key_in_session(client, flask_app):
+def test_admin_cannot_reveal_api_key_after_creation(client, flask_app):
     _login(client)
     store = UserStore(flask_app.config["USERS_FILE"])
     user = store.list()[0]
@@ -209,8 +209,8 @@ def test_admin_api_key_reveal_does_not_store_raw_key_in_session(client, flask_ap
         },
     )
 
-    assert response.status_code == 200
-    assert b"raw-admin-secret" in response.data
+    assert response.status_code == 302
+    assert "raw-admin-secret" not in Path(flask_app.config["USERS_FILE"]).read_text(encoding="utf-8")
     assert "raw-admin-secret" not in response.headers.get("Set-Cookie", "")
     with client.session_transaction() as sess:
         assert "show_key_raw" not in sess

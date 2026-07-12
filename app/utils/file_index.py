@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils.file_lock import ProcessSafeFileLock
+
 
 class FileIndex:
-    _locks: Dict[str, threading.Lock] = {}
+    _locks: Dict[str, ProcessSafeFileLock] = {}
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Optional[str] = None):
@@ -17,7 +19,10 @@ class FileIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_key = str(self.path.resolve())
         with self._locks_guard:
-            self._lock = self._locks.setdefault(lock_key, threading.Lock())
+            self._lock = self._locks.setdefault(
+                lock_key,
+                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
+            )
 
     def list(self) -> List[dict]:
         with self._lock:

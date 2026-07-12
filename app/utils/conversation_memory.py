@@ -1,5 +1,5 @@
+import json
 import logging
-import pickle
 import threading
 import time
 import sys
@@ -285,8 +285,22 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         if not raw:
             return None
         try:
-            state = pickle.loads(raw)
-        except Exception:
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            state = ConversationState(
+                summary=str(payload.get("summary") or ""),
+                turns=[
+                    ConversationTurn(
+                        user=str(turn.get("user") or ""),
+                        assistant=str(turn.get("assistant") or ""),
+                    )
+                    for turn in payload.get("turns", [])
+                    if isinstance(turn, dict)
+                ],
+                created_at=float(payload.get("created_at") or time.time()),
+                updated_at=float(payload.get("updated_at") or time.time()),
+                version=int(payload.get("version") or 0),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
             self._redis.delete(self._state_key(conversation_id))
             return None
         if time.time() - state.updated_at > self.ttl_seconds:
@@ -295,7 +309,22 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         return state
 
     def _save_state(self, conversation_id: str, state: ConversationState) -> None:
-        self._redis.setex(self._state_key(conversation_id), self.ttl_seconds, pickle.dumps(state))
+        payload = {
+            "schema_version": 1,
+            "summary": state.summary,
+            "turns": [
+                {"user": turn.user, "assistant": turn.assistant}
+                for turn in state.turns
+            ],
+            "created_at": state.created_at,
+            "updated_at": state.updated_at,
+            "version": state.version,
+        }
+        self._redis.setex(
+            self._state_key(conversation_id),
+            self.ttl_seconds,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
 
 
 def _build_default_store() -> ConversationMemoryStore:

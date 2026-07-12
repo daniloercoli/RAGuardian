@@ -31,8 +31,9 @@ def test_conversation_memory_returns_summary_job_after_threshold():
 
 
 def test_redis_conversation_memory_uses_shared_backend():
+    redis = FakeRedis()
     store = RedisConversationMemoryStore(
-        redis_client=FakeRedis(),
+        redis_client=redis,
         key_prefix="test:conversation",
         summary_threshold_chars=260,
         recent_turns_to_keep=1,
@@ -57,6 +58,8 @@ def test_redis_conversation_memory_uses_shared_backend():
     prompt_context = store.render_for_prompt(conversation_id)
     assert "Riassunto Redis." in prompt_context
     assert "Seconda domanda" in prompt_context
+    stored = redis.data["test:conversation:conv-12345678"]
+    assert stored.startswith(b'{"schema_version":1')
     assert store.clear(conversation_id) is True
     assert store.render_for_prompt(conversation_id) == ""
 

@@ -1,7 +1,10 @@
 import sys
 import types
 
+from langchain_core.documents import Document
+
 from app.utils import state_backend
+from app.utils.cache import _deserialize_documents, _serialize_documents
 from app.utils.state_backend import configured_queue_backend, configured_state_backend, runtime_state_status
 
 
@@ -68,3 +71,14 @@ def test_redis_connection_reuses_connection_pool(monkeypatch):
 
     state_backend.reset_redis_pools()
     assert created_pools[0].disconnected is True
+
+
+def test_redis_cache_document_payload_uses_json_not_pickle():
+    raw = _serialize_documents(
+        [Document(page_content="context", metadata={"source": "demo.pdf", "page": 1})]
+    )
+
+    assert raw.startswith(b'{"schema_version":1')
+    restored = _deserialize_documents(raw)
+    assert restored[0].page_content == "context"
+    assert restored[0].metadata == {"source": "demo.pdf", "page": 1}

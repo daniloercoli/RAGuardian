@@ -10,13 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from utils.file_lock import ProcessSafeFileLock
+
 SUPPORTED_VARIABLES = {"UTENTE", "NOME_UTENTE", "DATA_ODOIERNO", "ORA"}
 
 
 class PromptStore:
     """JSON-backed store for user-curated and admin-shared system prompts."""
 
-    _locks: dict[str, threading.Lock] = {}
+    _locks: dict[str, ProcessSafeFileLock] = {}
     _locks_guard = threading.Lock()
 
     def __init__(
@@ -40,7 +42,11 @@ class PromptStore:
         self.user_dir.mkdir(parents=True, exist_ok=True)
 
         with self._locks_guard:
-            self._lock = self._locks.setdefault(str(self.data_dir), threading.Lock())
+            lock_key = str(Path(self.data_dir).resolve())
+            self._lock = self._locks.setdefault(
+                lock_key,
+                ProcessSafeFileLock(Path(self.data_dir) / ".prompts.lock"),
+            )
 
     # ---------------------------------------------------------------
     # Shared (admin) prompts

@@ -8,11 +8,13 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from utils.file_lock import ProcessSafeFileLock
+
 
 class SecretStore:
     """Small encrypted JSON secret store for connector credentials."""
 
-    _locks: dict[str, threading.Lock] = {}
+    _locks: dict[str, ProcessSafeFileLock] = {}
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Optional[str] = None, key: Optional[str] = None):
@@ -21,7 +23,10 @@ class SecretStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.key = (key or os.getenv("RAG_SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or "dev-secret-key").encode("utf-8")
         with self._locks_guard:
-            self._lock = self._locks.setdefault(str(self.path.resolve()), threading.Lock())
+            self._lock = self._locks.setdefault(
+                str(self.path.resolve()),
+                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
+            )
 
     def set_secret(self, owner_id: str, name: str, value: str) -> str:
         ref = secret_ref(owner_id, name)

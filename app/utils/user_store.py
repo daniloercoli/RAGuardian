@@ -1,22 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
+from utils.file_lock import ProcessSafeFileLock
 
 
 USER_ROLES = {"admin", "user"}
@@ -25,16 +24,19 @@ USER_ROLES = {"admin", "user"}
 class UserStore:
     """JSON-backed local user store for personal RAG accounts."""
 
-    _locks: dict[str, threading.Lock] = {}
+    _locks: dict[str, ProcessSafeFileLock] = {}
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Optional[str] = None):
         configured = path or os.getenv("RAG_USERS_FILE", "app/data/users.json")
         self.path = Path(configured)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         with self._locks_guard:
-            self._lock = self._locks.setdefault(str(self.path.resolve()), threading.Lock())
+            lock_key = str(self.path.resolve())
+            self._lock = self._locks.setdefault(
+                lock_key,
+                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
+            )
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -72,20 +74,19 @@ class UserStore:
         if not password:
             raise ValueError("password is required")
         with self._lock:
-            with self._process_lock_unlocked():
-                users = self._list_unlocked()
-                if any(user.get("email") == email for user in users):
-                    raise ValueError("email already exists")
-                user = _user_record(
-                    email=email,
-                    password=password,
-                    display_name=display_name,
-                    role=role,
-                    enabled=enabled,
-                )
-                users.append(user)
-                self._save_unlocked(users)
-                return _public_user(user)
+            users = self._list_unlocked()
+            if any(user.get("email") == email for user in users):
+                raise ValueError("email already exists")
+            user = _user_record(
+                email=email,
+                password=password,
+                display_name=display_name,
+                role=role,
+                enabled=enabled,
+            )
+            users.append(user)
+            self._save_unlocked(users)
+            return _public_user(user)
 
     def update_user(self, user_id: str, **patch) -> Optional[dict]:
         with self._lock:
@@ -122,18 +123,17 @@ class UserStore:
 
     def bootstrap_admin_if_empty(self, *, email: str, password: str) -> dict | None:
         with self._lock:
-            with self._process_lock_unlocked():
-                if self._list_unlocked():
-                    return None
-                user = _user_record(
-                    email=normalize_email(email or "admin@example.local"),
-                    password=password,
-                    display_name="Admin",
-                    role="admin",
-                    enabled=True,
-                )
-                self._save_unlocked([user])
-                return _public_user(user)
+            if self._list_unlocked():
+                return None
+            user = _user_record(
+                email=normalize_email(email or "admin@example.local"),
+                password=password,
+                display_name="Admin",
+                role="admin",
+                enabled=True,
+            )
+            self._save_unlocked([user])
+            return _public_user(user)
 
     def get_api_keys(self, user_id: str, *, include_raw: bool = False) -> list[dict]:
         """Return API keys for a user with raw values hidden by default."""
@@ -207,7 +207,9 @@ class UserStore:
         new_key = {
             "id": uuid.uuid4().hex,
             "name": name,
-            "key": api_key_value,
+            "key_hash": api_key_hash(api_key_value),
+            "key_prefix": api_key_value[:8],
+            "key_suffix": api_key_value[-4:],
             "scopes": self._normalize_api_scopes(scopes),
             "enabled": bool(enabled),
             "created_at": now,
@@ -232,8 +234,8 @@ class UserStore:
 
         return {
             "name": new_key["name"],
-            "key": new_key["key"],
-            "masked_key": _mask_api_key(new_key["key"]),
+            "key": api_key_value,
+            "masked_key": _mask_api_key(api_key_value),
             "scopes": new_key["scopes"],
             "enabled": new_key["enabled"],
             "created_at": new_key["created_at"],
@@ -289,14 +291,35 @@ class UserStore:
                     continue
                 for key in (usr.get("api_keys") or []):
                     if key.get("name") == key_name:
-                        key["key"] = new_key
+                        key.pop("key", None)
+                        key["key_hash"] = api_key_hash(new_key)
+                        key["key_prefix"] = new_key[:8]
+                        key["key_suffix"] = new_key[-4:]
                         break
                 else:
                     return None
                 usr["updated_at"] = _now()
                 self._save_unlocked(users)
-                return _public_api_key(key, user_id=user_id, include_raw=True)
+                return {**_public_api_key(key, user_id=user_id), "key": new_key}
             return None
+
+    def migrate_legacy_api_keys(self) -> int:
+        """Hash API keys created by versions that stored raw values."""
+        migrated = 0
+        with self._lock:
+            users = self._list_unlocked()
+            for user in users:
+                for key in user.get("api_keys") or []:
+                    raw = str(key.pop("key", "") or "")
+                    if not raw:
+                        continue
+                    key["key_hash"] = api_key_hash(raw)
+                    key["key_prefix"] = raw[:8]
+                    key["key_suffix"] = raw[-4:]
+                    migrated += 1
+            if migrated:
+                self._save_unlocked(users)
+        return migrated
 
     def update_api_key_name(self, *, user_id: str, key_name: str, new_name: str) -> dict | None:
         """Rename an API key. Returns updated key or None."""
@@ -386,19 +409,6 @@ class UserStore:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
 
-    @contextmanager
-    def _process_lock_unlocked(self):
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock_path.open("a+") as lock_file:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
 def normalize_email(value: str) -> str:
     return str(value or "").strip().lower()
 
@@ -435,11 +445,17 @@ def _user_record(
 
 
 def _public_api_key(key: dict, *, user_id: str, include_raw: bool = False) -> dict:
-    result = {name: value for name, value in key.items() if name != "key"}
+    result = {
+        name: value
+        for name, value in key.items()
+        if name not in {"key", "key_hash", "key_prefix", "key_suffix"}
+    }
     raw = str(key.get("key", "") or "")
-    result["masked_key"] = _mask_api_key(raw)
+    prefix = str(key.get("key_prefix") or raw[:8])
+    suffix = str(key.get("key_suffix") or raw[-4:])
+    result["masked_key"] = f"{prefix}...{suffix}" if prefix or suffix else ""
     result["user_id"] = user_id
-    if include_raw:
+    if include_raw and raw:
         result["key"] = raw
     return result
 
@@ -455,7 +471,19 @@ def _now() -> str:
 
 
 def _generate_api_key() -> str:
-    return f"rag_{uuid.uuid4().hex[:16]}_{uuid.uuid4().hex[:8]}"
+    return f"rag_{secrets.token_urlsafe(32)}"
+
+
+def api_key_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def api_key_matches(record: dict, candidate: str) -> bool:
+    stored_hash = str(record.get("key_hash") or "")
+    if stored_hash:
+        return hmac.compare_digest(stored_hash, api_key_hash(candidate))
+    legacy = str(record.get("key") or "")
+    return bool(legacy) and hmac.compare_digest(legacy, str(candidate or ""))
 
 
 def _mask_api_key(key: str) -> str:

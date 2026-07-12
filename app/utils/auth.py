@@ -1,4 +1,5 @@
 import functools
+import hmac
 import os
 from datetime import datetime, time, timezone
 from typing import Optional
@@ -8,7 +9,7 @@ from werkzeug.security import check_password_hash
 
 
 from utils.settings_store import API_SCOPES
-from utils.user_store import UserStore, normalize_email
+from utils.user_store import UserStore, api_key_matches, normalize_email
 from utils.workspace import workspace_for_user
 
 
@@ -82,7 +83,7 @@ def find_api_key(value: Optional[str]) -> Optional[dict]:
         return None
 
     env_key = os.getenv("RAG_API_KEY")
-    if env_key and value == env_key:
+    if env_key and hmac.compare_digest(value, env_key):
         admin = _first_admin_user()
         if not admin:
             return None
@@ -107,7 +108,7 @@ def find_api_key(value: Optional[str]) -> Optional[dict]:
         users = store._list_unlocked()
     for user in users:
         for key_item in (user.get("api_keys") or []):
-            if not key_item.get("enabled", True) or key_item.get("key") != value:
+            if not key_item.get("enabled", True) or not api_key_matches(key_item, value):
                 continue
             if _api_key_is_expired(key_item.get("expires_at")):
                 continue

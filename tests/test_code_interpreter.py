@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import docker
+import pytest
 
 from app.utils.code_interpreter import CodeInterpreter
 from app.utils.interpreter_sandbox import check_code_safety
@@ -51,6 +52,21 @@ def test_check_code_safety_blocks_dangerous_os_alias():
     assert any("os.system" in issue for issue in issues)
 
 
+def test_code_interpreter_does_not_forward_host_environment_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:secret@example/db")
+    monkeypatch.setenv("REDIS_URL", "redis://:secret@example/0")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access-key")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/credentials.json")
+
+    interpreter = CodeInterpreter({"upload_folder": str(tmp_path), "auto_build": False})
+
+    assert interpreter._build_env() == {
+        "PYTHONWARNINGS": "ignore",
+        "MPLBACKEND": "Agg",
+        "IMAGE_OUTPUT_DIR": "/output",
+    }
+
+
 def test_code_interpreter_auto_builds_missing_image(tmp_path):
     calls = []
 
@@ -72,3 +88,42 @@ def test_code_interpreter_auto_builds_missing_image(tmp_path):
     assert calls
     assert calls[0]["tag"] == CodeInterpreter.IMAGE_NAME
     assert calls[0]["dockerfile"] == "Dockerfile.code-interpreter"
+
+
+@pytest.mark.skipif(
+    os.getenv("RAG_DOCKER_INTEGRATION") != "1",
+    reason="Set RAG_DOCKER_INTEGRATION=1 to run the real Docker sandbox test",
+)
+def test_real_code_interpreter_container_isolated_and_generates_image(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgres://audit-secret")
+    monkeypatch.setenv("REDIS_URL", "redis://audit-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "audit-secret")
+    interpreter = CodeInterpreter(
+        {"upload_folder": str(tmp_path), "auto_build": False, "timeout": 60}
+    )
+    code = (
+        "import os, json\n"
+        "import matplotlib.pyplot as plt\n"
+        "print('ENV_KEYS=' + ','.join(sorted(os.environ)))\n"
+        "with open('providers.json', encoding='utf-8') as handle:\n"
+        "    data = json.load(handle)\n"
+        "print('JSON_TYPE=' + type(data).__name__)\n"
+        "plt.plot([1, 3, 2])\n"
+    )
+
+    result = interpreter.execute(
+        code,
+        [
+            {
+                "path": str(ROOT / "app/default_providers.json"),
+                "runtime_name": "providers.json",
+            }
+        ],
+    )
+
+    assert result["success"] is True
+    assert "JSON_TYPE=" in result["text"]
+    assert "DATABASE_URL" not in result["text"]
+    assert "REDIS_URL" not in result["text"]
+    assert "AWS_ACCESS_KEY_ID" not in result["text"]
+    assert result["images"]

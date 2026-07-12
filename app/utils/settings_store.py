@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.file_lock import ProcessSafeFileLock
+
 
 _BUILTIN_DEFAULTS_CACHE: Dict[str, Any] = {}
 
@@ -213,28 +215,21 @@ def _settings_path(path: Optional[str] = None) -> Path:
 class SettingsStore:
     """Small JSON-backed settings store with atomic writes."""
 
-    _locks: Dict[str, threading.Lock] = {}
+    _locks: Dict[str, ProcessSafeFileLock] = {}
+    _locks_guard = threading.Lock()
 
     def __init__(self, path: Optional[str] = None):
         self.path = _settings_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = self._locks.setdefault(str(self.path), threading.Lock())
+        with self._locks_guard:
+            self._lock = self._locks.setdefault(
+                str(self.path.resolve()),
+                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
+            )
 
     def load(self) -> Dict[str, Any]:
         with self._lock:
-            if not self.path.exists():
-                settings = deepcopy(DEFAULT_SETTINGS)
-                self._write_unlocked(settings)
-                return settings
-
-            try:
-                with self.path.open("r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                loaded = {}
-
-            settings = _deep_merge(DEFAULT_SETTINGS, loaded)
-            return self._normalize(settings)
+            return self._load_unlocked()
 
     def save(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
@@ -244,9 +239,12 @@ class SettingsStore:
             return normalized
 
     def update(self, patch: Dict[str, Any]) -> Dict[str, Any]:
-        current = self.load()
-        merged = _deep_merge(current, patch)
-        return self.save(merged)
+        with self._lock:
+            current = self._load_unlocked()
+            normalized = self._normalize(_deep_merge(DEFAULT_SETTINGS, _deep_merge(current, patch)))
+            normalized["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._write_unlocked(normalized)
+            return normalized
 
     def public_view(self) -> Dict[str, Any]:
         settings = self.load()
@@ -303,6 +301,18 @@ class SettingsStore:
         finally:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
+
+    def _load_unlocked(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            settings = deepcopy(DEFAULT_SETTINGS)
+            self._write_unlocked(settings)
+            return settings
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            loaded = {}
+        return self._normalize(_deep_merge(DEFAULT_SETTINGS, loaded))
 
     def _normalize(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         custom_providers = []

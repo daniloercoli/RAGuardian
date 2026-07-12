@@ -94,19 +94,12 @@ class CodeInterpreter:
         return data_dir, output_dir
 
     def _build_env(self) -> dict[str, str]:
-        """Build a sanitised environment for the container."""
-        env = os.environ.copy()
-        env.update(
-            {
-                "PYTHONWARNINGS": "ignore",
-                "MPLBACKEND": "Agg",
-                "IMAGE_OUTPUT_DIR": "/output",
-            }
-        )
-        for key in list(env):
-            if any(sig in key.upper() for sig in ("API_KEY", "SECRET", "PASSWORD", "TOKEN")):
-                del env[key]
-        return env
+        """Build the minimal environment required inside the container."""
+        return {
+            "PYTHONWARNINGS": "ignore",
+            "MPLBACKEND": "Agg",
+            "IMAGE_OUTPUT_DIR": "/output",
+        }
 
     def execute(
         self, code: str, data_files: List[Dict[str, str]] | None = None

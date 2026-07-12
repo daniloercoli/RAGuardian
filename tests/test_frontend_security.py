@@ -1,4 +1,7 @@
 from pathlib import Path
+import re
+
+from app import create_app
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,3 +60,36 @@ def test_templates_include_browser_icons():
         assert "favicon.ico" in template
         assert "favicon.png" in template
         assert "apple-touch-icon.png" in template
+
+
+def test_session_posts_require_csrf_token_and_login_redirect_stays_local(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_ADMIN_PASSWORD", "admin")
+    monkeypatch.setenv("RAG_ADMIN_PASSWORD_HASH", "")
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", "")
+    app = create_app(
+        {
+            "TESTING": True,
+            "CSRF_ENABLED": True,
+            "SECRET_KEY": "test-secret",
+            "SETTINGS_FILE": str(tmp_path / "settings.json"),
+            "FILE_INDEX": str(tmp_path / "files.json"),
+            "UPLOAD_FOLDER": str(tmp_path / "uploads"),
+            "USERS_FILE": str(tmp_path / "users.json"),
+            "SECRETS_FILE": str(tmp_path / "secrets.json"),
+            "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
+            "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace-uploads"),
+        }
+    )
+    client = app.test_client()
+
+    assert client.post("/admin/login", data={"password": "admin"}).status_code == 403
+
+    login_page = client.get("/admin/login")
+    token = re.search(rb'<meta name="csrf-token" content="([^"]+)"', login_page.data).group(1).decode()
+    response = client.post(
+        "/admin/login?next=https://attacker.example/",
+        data={"password": "admin", "csrf_token": token},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/admin/config")

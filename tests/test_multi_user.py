@@ -114,12 +114,14 @@ def test_admin_api_keys_are_saved_in_user_store(client, flask_app):
     )
 
     global_settings = SettingsStore(flask_app.config["SETTINGS_FILE"]).load()
-    keys = UserStore(flask_app.config["USERS_FILE"]).get_api_keys(admin["id"], include_raw=True)
+    keys = UserStore(flask_app.config["USERS_FILE"]).get_api_keys(admin["id"])
 
-    assert response.status_code == 302
+    assert response.status_code == 200
+    assert b"Copy it now" in response.data
     assert global_settings["auth"]["api_keys"] == []
     assert keys[0]["name"] == "local-client"
     assert keys[0]["scopes"] == ["query", "ingest"]
+    assert "key" not in keys[0]
 
 
 def test_api_key_resolves_to_owning_user_workspace(client, flask_app, monkeypatch):

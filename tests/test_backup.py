@@ -185,6 +185,18 @@ class TestBackupLifecycle:
 
         bm.BACKUP_DIR = orig_dir
 
+    def test_backup_ids_reject_path_traversal(self, tmp_backup_dir):
+        import app.utils.vector_store.backup_manager as bm
+
+        original = bm.BACKUP_DIR
+        bm.BACKUP_DIR = tmp_backup_dir
+        try:
+            assert verify_backup("..") == {"status": "error", "error": "Invalid backup id"}
+            with pytest.raises(BackupError, match="Invalid backup id"):
+                restore_backup("..")
+        finally:
+            bm.BACKUP_DIR = original
+
     def test_apply_retention_no_backups(self, tmp_backup_dir, monkeypatch):
         import app.utils.vector_store.backup_manager as bm
         import app.utils.vector_store.backup_storage as bstorage
@@ -204,11 +216,14 @@ class TestBackupLifecycle:
         orig_backup_dir = bm.BACKUP_DIR
         orig_chroma_dir = bm.CHROMA_DIR
         orig_data_dir = bm.DATA_DIR
+        orig_upload_dir = bm.UPLOAD_DIR
 
         bm.BACKUP_DIR = tmp_backup_dir
         bm.CHROMA_DIR = tmp_chroma_dir
         bm.DATA_DIR = tmp_path / "data"
         bm.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        bm.UPLOAD_DIR = tmp_path / "uploads"
+        bm.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
         try:
             result = create_backup()
@@ -219,6 +234,7 @@ class TestBackupLifecycle:
             bm.BACKUP_DIR = orig_backup_dir
             bm.CHROMA_DIR = orig_chroma_dir
             bm.DATA_DIR = orig_data_dir
+            bm.UPLOAD_DIR = orig_upload_dir
 
     def test_restore_backup_restores_chroma_and_data(self, monkeypatch, tmp_path, tmp_backup_dir, tmp_chroma_dir):
         """Full backup/restore smoke test for local Chroma files and metadata."""
@@ -227,15 +243,22 @@ class TestBackupLifecycle:
         orig_backup_dir = bm.BACKUP_DIR
         orig_chroma_dir = bm.CHROMA_DIR
         orig_data_dir = bm.DATA_DIR
+        orig_upload_dir = bm.UPLOAD_DIR
 
         data_dir = tmp_path / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "files.json").write_text('{"version": 1}', encoding="utf-8")
+        (data_dir / "workspaces" / "alice").mkdir(parents=True)
+        (data_dir / "workspaces" / "alice" / "settings.json").write_text('{"workspace": 1}', encoding="utf-8")
+        upload_dir = tmp_path / "uploads"
+        (upload_dir / "workspaces" / "alice").mkdir(parents=True)
+        (upload_dir / "workspaces" / "alice" / "source.pdf").write_bytes(b"original upload")
         (tmp_chroma_dir / "marker.txt").write_text("original", encoding="utf-8")
 
         bm.BACKUP_DIR = tmp_backup_dir
         bm.CHROMA_DIR = tmp_chroma_dir
         bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
 
         try:
             result = create_backup()
@@ -243,17 +266,82 @@ class TestBackupLifecycle:
 
             (tmp_chroma_dir / "marker.txt").write_text("mutated", encoding="utf-8")
             (data_dir / "files.json").write_text('{"version": 2}', encoding="utf-8")
+            (data_dir / "workspaces" / "alice" / "settings.json").write_text('{"workspace": 2}', encoding="utf-8")
+            (upload_dir / "workspaces" / "alice" / "source.pdf").write_bytes(b"mutated upload")
 
             restore = restore_backup(backup_id)
 
             assert restore["status"] == "success"
             assert (tmp_chroma_dir / "marker.txt").read_text(encoding="utf-8") == "original"
             assert (data_dir / "files.json").read_text(encoding="utf-8") == '{"version": 1}'
+            assert (data_dir / "workspaces" / "alice" / "settings.json").read_text(encoding="utf-8") == '{"workspace": 1}'
+            assert (upload_dir / "workspaces" / "alice" / "source.pdf").read_bytes() == b"original upload"
             assert list(tmp_path.glob("chroma_db.bak.*"))
         finally:
             bm.BACKUP_DIR = orig_backup_dir
             bm.CHROMA_DIR = orig_chroma_dir
             bm.DATA_DIR = orig_data_dir
+            bm.UPLOAD_DIR = orig_upload_dir
+
+    def test_restore_rejects_corrupted_backup_without_touching_live_data(
+        self, tmp_path, tmp_backup_dir, tmp_chroma_dir
+    ):
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        upload_dir = tmp_path / "uploads"
+        data_dir.mkdir()
+        upload_dir.mkdir()
+        (data_dir / "settings.json").write_text('{"state": "backup"}', encoding="utf-8")
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+
+        try:
+            backup_id = create_backup()["id"]
+            (data_dir / "settings.json").write_text('{"state": "live"}', encoding="utf-8")
+            (tmp_backup_dir / backup_id / "data" / "settings.json").write_text("corrupted", encoding="utf-8")
+
+            with pytest.raises(BackupError, match="integrity verification"):
+                restore_backup(backup_id)
+
+            assert (data_dir / "settings.json").read_text(encoding="utf-8") == '{"state": "live"}'
+        finally:
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
+
+    def test_encrypted_backup_has_no_plaintext_snapshot_and_can_restore(
+        self, tmp_path, tmp_backup_dir, tmp_chroma_dir, monkeypatch
+    ):
+        if not shutil.which("openssl"):
+            pytest.skip("openssl is required for encrypted backup test")
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        upload_dir = tmp_path / "uploads"
+        data_dir.mkdir()
+        upload_dir.mkdir()
+        (data_dir / "secret.txt").write_text("sensitive backup data", encoding="utf-8")
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+        monkeypatch.setenv("BACKUP_ENCRYPTION_KEY", "correct horse battery staple")
+
+        try:
+            backup_id = create_backup()["id"]
+            backup_path = tmp_backup_dir / backup_id
+            assert (backup_path / f"{backup_id}.tar.gz.enc").exists()
+            assert not (backup_path / "data").exists()
+            assert verify_backup(backup_id)["status"] == "ok"
+
+            (data_dir / "secret.txt").write_text("mutated", encoding="utf-8")
+            assert restore_backup(backup_id)["status"] == "success"
+            assert (data_dir / "secret.txt").read_text(encoding="utf-8") == "sensitive backup data"
+        finally:
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
 
     def test_retention_zero_keeps_backups(self, tmp_backup_dir, monkeypatch):
         import app.utils.vector_store.backup_manager as bm

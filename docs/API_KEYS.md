@@ -26,7 +26,7 @@ Navigate to **Admin API Keys** → **Create API Key** form:
 | Scopes | Yes | Checkboxes | `query`, `ingest`, `speech` |
 | Status | Yes | Select | `Enabled` or `Disabled` |
 
-After creation, use **Show Key** when you need to reveal the raw value. Store it securely.
+The raw value is displayed once, immediately after creation. Copy it at that point: the server stores only a SHA-256 hash plus the masked prefix/suffix and cannot reveal the key again.
 
 ## Expiration
 
@@ -119,7 +119,7 @@ Every request using a valid API key is logged to `app/data/api_keys_usage.json`:
 
 The usage log is:
 
-- **Thread-safe within the process**: Uses a shared lock per log path for concurrent writes.
+- **Process-safe on Unix**: Uses a shared file lock per log path for concurrent worker writes.
 - **Capped**: The default maximum is 10,000 entries. Older entries are rotated out to prevent unbounded growth.
 - **Visible**: The "Usage Statistics" table in the admin UI shows the latest 20 log entries and links to the full JSON usage file.
 - **Runtime-only**: `app/data/api_keys_usage.json` is ignored by git; use `app/data/api_keys_usage.example.json` as the committed schema sample.
@@ -127,6 +127,7 @@ The usage log is:
 ## Security Notes
 
 - The raw key value is revealed only in the current admin response and is never stored in the Flask session cookie.
+- Existing plaintext keys are migrated to hashes automatically at application startup.
 - Keys are masked in the UI as `sk-abc...xyz`.
 - Disabled keys remain in the store for audit trails.
 - Expiration validation runs on every request before the key is accepted for authentication.

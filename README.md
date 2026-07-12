@@ -79,6 +79,7 @@ The UI starts without provider keys, but real chat answers require a model provi
 For shared or production deployments, replace the dev secrets in `.env`:
 
 ```env
+RAG_ENV=production
 FLASK_SECRET_KEY=replace-with-a-long-random-secret
 RAG_SECRET_KEY=replace-with-a-different-long-random-secret
 
@@ -133,7 +134,10 @@ See [Deployment](docs/DEPLOYMENT.md) for Redis, reverse proxy, logging, and prod
 
 | Path | Purpose |
 |------|---------|
-| `app/app.py` | Flask app factory, UI routes, API routes, job orchestration |
+| `app/app.py` | Flask app factory, core API routes, and job orchestration |
+| `app/routes/` | Focused route registrars for auth, accounts, backups, and prompts |
+| `app/utils/http_security.py` | CSRF, CORS, request timeout, and production config checks |
+| `app/utils/rate_limiter.py` | In-memory and Redis-backed request rate limiting |
 | `app/utils/user_store.py` | JSON-backed local user store |
 | `app/utils/workspace.py` | Workspace path and collection resolver |
 | `app/utils/secret_store.py` | Encrypted connector credential store |

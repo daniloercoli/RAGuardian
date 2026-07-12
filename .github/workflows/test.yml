@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m compileall -q app tests wsgi.py
+      - run: python -m pytest -q
+
+  wordpress:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/wordpress/rag-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: integrations/wordpress/rag-client/package-lock.json
+      - run: composer install --no-interaction --prefer-dist
+      - run: npm ci
+      - run: npm test

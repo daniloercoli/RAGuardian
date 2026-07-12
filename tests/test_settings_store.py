@@ -1,3 +1,4 @@
+import concurrent.futures
 from pathlib import Path
 
 from app.utils.settings_store import (
@@ -49,6 +50,20 @@ def test_settings_store_persists_runtime_values(tmp_path):
     assert loaded["rag"]["temperature"] == 0.7
     assert loaded["rag"]["embedding_provider"] == "regolo"
     assert loaded["rag"]["embedding_model"] == "Qwen3-Embedding-8B"
+
+
+def test_settings_store_update_keeps_concurrent_read_modify_write_changes(tmp_path):
+    path = tmp_path / "settings.json"
+
+    def write(index: int) -> None:
+        SettingsStore(str(path)).update({"concurrency": {f"value_{index}": index}})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        list(executor.map(write, range(50)))
+
+    assert SettingsStore(str(path)).load()["concurrency"] == {
+        f"value_{index}": index for index in range(50)
+    }
 
 
 def test_settings_store_persists_reranker_diversity_mode_and_mmr_params(tmp_path):

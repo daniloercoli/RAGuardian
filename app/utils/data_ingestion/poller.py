@@ -131,7 +131,12 @@ def runtime_app_from_env():
         "SECRETS_FILE": os.getenv("RAG_SECRETS_FILE", "app/data/secrets.json"),
         "WORKSPACE_DATA_DIR": os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces"),
         "WORKSPACE_UPLOAD_DIR": os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces"),
-        "SECRET_KEY": Config.api_keys.flask_secret_key or os.getenv("FLASK_SECRET_KEY") or "dev-secret",
+        "SECRET_KEY": (
+            os.getenv("RAG_SECRET_KEY")
+            or Config.api_keys.flask_secret_key
+            or os.getenv("FLASK_SECRET_KEY")
+            or "dev-secret-key"
+        ),
         "VECTOR_STORE_BACKEND": Config.vector_store.backend,
     }
     for key in ("UPLOAD_FOLDER", "WORKSPACE_DATA_DIR", "WORKSPACE_UPLOAD_DIR"):

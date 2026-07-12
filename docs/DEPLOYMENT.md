@@ -17,6 +17,7 @@ gunicorn -c gunicorn.conf.py wsgi:application
 Default production posture is conservative:
 
 ```env
+RAG_ENV=production
 GUNICORN_WORKERS=1
 GUNICORN_THREADS=16
 ```
@@ -102,6 +103,7 @@ The API health response reports queue, Redis, database, index, OCR, voice, and r
 
 ## Production Checklist
 
+- Set `RAG_ENV=production`; startup then fails closed when credentials are missing or use development defaults.
 - Set `FLASK_SECRET_KEY`.
 - Set `RAG_SECRET_KEY`.
 - Configure provider API keys.
@@ -109,5 +111,8 @@ The API health response reports queue, Redis, database, index, OCR, voice, and r
 - Use workspace API keys for integrations.
 - Enable HTTPS.
 - Keep runtime JSON, uploads, ChromaDB, logs, and secrets out of git.
+- Configure `BACKUP_ENCRYPTION_KEY` when backups include production users, connector secrets, workspace metadata, and uploads.
 - Configure Redis before multi-worker deployment.
 - Run `.venv/bin/pytest -q` before release.
+
+Backups contain the complete persistent state: ChromaDB, global data, users, hashed API keys, connector secrets, workspace metadata, prompts and uploads. In production, set `BACKUP_ENCRYPTION_KEY`; encrypted backups keep only the manifest and encrypted archive on disk and can be restored with the same key.

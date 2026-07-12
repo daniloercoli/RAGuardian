@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from utils.file_lock import ProcessSafeFileLock
+
 DEFAULT_USAGE_FILE = os.getenv("RAG_API_KEY_USAGE_FILE", "app/data/api_keys_usage.json")
 DEFAULT_MAX_ENTRIES = 10_000
 
@@ -18,14 +20,17 @@ DEFAULT_MAX_ENTRIES = 10_000
 class ApiKeyLogger:
     """Thread-safe, buffered JSON logger for API key usage events."""
 
-    _locks: dict[str, threading.Lock] = {}
+    _locks: dict[str, ProcessSafeFileLock] = {}
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Optional[str] = None, max_entries: int = DEFAULT_MAX_ENTRIES):
         self.path = Path(path or DEFAULT_USAGE_FILE)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._locks_guard:
-            self._lock = self._locks.setdefault(str(self.path.resolve()), threading.Lock())
+            self._lock = self._locks.setdefault(
+                str(self.path.resolve()),
+                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
+            )
         self._enabled = True
         self._max_entries = max_entries
 
