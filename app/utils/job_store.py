@@ -133,9 +133,32 @@ class MemoryJobStore:
                 if self._active_data_source_sync_job_ids.get(sync_key) == job_id:
                     self._active_data_source_sync_job_ids.pop(sync_key, None)
 
-    def active_jobs_count(self) -> int:
+    def active_jobs_count(self, workspace_id: str | None = None) -> int:
         with self._lock:
-            return sum(1 for job in self._jobs.values() if job.get("status") in RUNNING_JOB_STATUSES)
+            return sum(
+                1
+                for job in self._jobs.values()
+                if job.get("status") in RUNNING_JOB_STATUSES
+                and (workspace_id is None or job.get("workspace_id") == workspace_id)
+            )
+
+    def clear_by_workspace(self, workspace_id: str) -> int:
+        if not workspace_id:
+            return 0
+        with self._lock:
+            job_ids = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.get("workspace_id") == workspace_id
+            ]
+            for job_id in job_ids:
+                self._jobs.pop(job_id, None)
+            if self._active_rebuild_job_id in job_ids:
+                self._active_rebuild_job_id = None
+            for sync_key, job_id in list(self._active_data_source_sync_job_ids.items()):
+                if job_id in job_ids:
+                    self._active_data_source_sync_job_ids.pop(sync_key, None)
+            return len(job_ids)
 
     def clear(self) -> None:
         with self._lock:
@@ -235,7 +258,7 @@ class RedisJobStore:
             if active_id == job_id:
                 self.redis.delete(active_key)
 
-    def active_jobs_count(self) -> int:
+    def active_jobs_count(self, workspace_id: str | None = None) -> int:
         count = 0
         for key in self.redis.scan_iter(match=f"{self.prefix}:job:*", count=200):
             raw = self.redis.get(key)
@@ -244,11 +267,41 @@ class RedisJobStore:
             import json
 
             try:
-                if json.loads(raw).get("status") in RUNNING_JOB_STATUSES:
+                job = json.loads(raw)
+                if (
+                    job.get("status") in RUNNING_JOB_STATUSES
+                    and (workspace_id is None or job.get("workspace_id") == workspace_id)
+                ):
                     count += 1
             except (TypeError, ValueError):
                 continue
         return count
+
+    def clear_by_workspace(self, workspace_id: str) -> int:
+        if not workspace_id:
+            return 0
+        deleted = 0
+        for key in list(self.redis.scan_iter(match=f"{self.prefix}:job:*", count=200)):
+            raw = self.redis.get(key)
+            if not raw:
+                continue
+            import json
+
+            try:
+                job = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if job.get("workspace_id") != workspace_id:
+                continue
+            job_id = str(job.get("id") or "")
+            deleted += int(self.redis.delete(key) or 0)
+            if _decode(self.redis.get(self._active_rebuild_key())) == job_id:
+                self.redis.delete(self._active_rebuild_key())
+            if job.get("type") == "data_source_sync":
+                active_key = self._active_data_source_sync_key(job)
+                if _decode(self.redis.get(active_key)) == job_id:
+                    self.redis.delete(active_key)
+        return deleted
 
     def clear(self) -> None:
         # scan glob * matches all sub-keys: job:<id>, job:active:rebuild, job:active:data-source-sync:*

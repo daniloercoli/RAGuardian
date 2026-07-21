@@ -151,6 +151,16 @@ class ConversationMemoryStore:
         with self._lock:
             self._conversations.clear()
 
+    def clear_by_prefix(self, prefix: str) -> int:
+        """Remove all conversations starting with given prefix. Returns count removed."""
+        if not prefix:
+            return 0
+        with self._lock:
+            to_remove = [cid for cid in self._conversations if cid.startswith(prefix)]
+            for cid in to_remove:
+                self._conversations.pop(cid, None)
+            return len(to_remove)
+
     def _get_state(self, conversation_id: str, *, create: bool) -> Optional[ConversationState]:
         self._purge_expired()
         state = self._conversations.get(conversation_id)
@@ -266,6 +276,14 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
     def clear_all(self) -> None:
         redis_scan_delete(self._redis, f"{self._key_prefix}:*")
         redis_scan_delete(self._redis, f"{self._key_prefix}:lock:*")
+
+    def clear_by_prefix(self, prefix: str) -> int:
+        """Remove all conversations starting with given prefix. Returns count removed."""
+        if not prefix:
+            return 0
+        count = redis_scan_delete(self._redis, f"{self._key_prefix}:{prefix}*")
+        redis_scan_delete(self._redis, f"{self._key_prefix}:lock:{prefix}*")
+        return count
 
     def _state_key(self, conversation_id: str) -> str:
         return f"{self._key_prefix}:{conversation_id}"

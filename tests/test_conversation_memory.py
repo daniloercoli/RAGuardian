@@ -64,6 +64,36 @@ def test_redis_conversation_memory_uses_shared_backend():
     assert store.render_for_prompt(conversation_id) == ""
 
 
+def test_conversation_memory_clear_by_prefix_is_workspace_scoped():
+    store = ConversationMemoryStore()
+    store.append_turn("workspace-a:conversation-1", user="A", assistant="A1")
+    store.append_turn("workspace-a:conversation-2", user="B", assistant="B1")
+    store.append_turn("workspace-b:conversation-1", user="C", assistant="C1")
+
+    assert store.clear_by_prefix("workspace-a:") == 2
+    assert store.render_for_prompt("workspace-a:conversation-1") == ""
+    assert store.render_for_prompt("workspace-a:conversation-2") == ""
+    assert "C" in store.render_for_prompt("workspace-b:conversation-1")
+
+
+def test_redis_conversation_memory_clear_by_prefix_removes_states_and_locks():
+    redis = FakeRedis()
+    store = RedisConversationMemoryStore(
+        redis_client=redis,
+        key_prefix="test:conversation",
+    )
+    store.append_turn("workspace-a:conversation-1", user="A", assistant="A1")
+    store.append_turn("workspace-a:conversation-2", user="B", assistant="B1")
+    store.append_turn("workspace-b:conversation-1", user="C", assistant="C1")
+    redis.data["test:conversation:lock:workspace-a:conversation-1"] = b"locked"
+
+    assert store.clear_by_prefix("workspace-a:") == 2
+    assert store.render_for_prompt("workspace-a:conversation-1") == ""
+    assert store.render_for_prompt("workspace-a:conversation-2") == ""
+    assert "C" in store.render_for_prompt("workspace-b:conversation-1")
+    assert "test:conversation:lock:workspace-a:conversation-1" not in redis.data
+
+
 class FakeRedis:
     def __init__(self):
         self.data = {}

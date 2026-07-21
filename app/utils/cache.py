@@ -135,7 +135,9 @@ class RAGCache:
     
     def _get_config(self):
         from config import Config
-        return Config.rag
+        from utils.settings_store import get_settings
+
+        return get_settings(Config.paths.settings_file)["rag"]
     
     def _generate_key(self, query: str, k: int, model: str, namespace: str = "stateless") -> str:
         key_data = {
@@ -158,11 +160,11 @@ class RAGCache:
         namespace: str = "stateless",
     ) -> Optional[list]:
         config = self._get_config()
-        if not config.enable_cache:
+        if not config["enable_cache"]:
             return None
         
-        k = k or config.query_k
-        model = model or config.default_model
+        k = k or config["query_k"]
+        model = model or config["default_model"]
         cache_key = self._generate_key(query, k, model, namespace)
         
         if self._backend == "redis" and self._redis is not None:
@@ -190,25 +192,26 @@ class RAGCache:
         namespace: str = "stateless",
     ):
         config = self._get_config()
-        if not config.enable_cache:
+        if not config["enable_cache"]:
             return
         
-        k = k or config.query_k
-        model = model or config.default_model
+        k = k or config["query_k"]
+        model = model or config["default_model"]
         cache_key = self._generate_key(query, k, model, namespace)
+        cache_ttl = config["cache_ttl"]
         
         if self._backend == "redis" and self._redis is not None:
             try:
                 self._redis.setex(
                     self._redis_key(cache_key),
-                    config.cache_ttl,
+                    cache_ttl,
                     _serialize_documents(results),
                 )
             except Exception as exc:
                 log.warning("Redis cache write failed, using memory fallback: %s", exc)
-                self._cache.set(cache_key, results, config.cache_ttl)
+                self._cache.set(cache_key, results, cache_ttl)
         else:
-            self._cache.set(cache_key, results, config.cache_ttl)
+            self._cache.set(cache_key, results, cache_ttl)
         log.debug(f"Cache set for query: {query[:50]}... (key: {cache_key})")
     
     def clear(self):

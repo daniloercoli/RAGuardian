@@ -188,6 +188,16 @@ pip install -r requirements-dev.txt
 
 Current multi-user regression coverage includes auth, workspace isolation, API key ownership, data sources, secret storage, jobs, upload/query/delete/rebuild, Chroma collection routing, and legacy API compatibility.
 
+## Reset to Zero
+
+To completely wipe all data and start fresh:
+
+```powershell
+Remove-Item -Recurse -Force "app\data", "app\chroma_db", "app\uploads" -ErrorAction SilentlyContinue
+```
+
+This removes users, workspaces, ChromaDB indexes, prompts, API keys, and all uploads. After running this, restart the app and the first login will bootstrap a new admin.
+
 ## Security Notes
 
 - Do not commit `.env`, `app/data/*.json`, workspace data, uploads, ChromaDB, logs, or secrets.

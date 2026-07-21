@@ -13,11 +13,9 @@
 </head>
 <body>
     <div class="container wide">
-        <header class="page-header">
-            <h1>Data Sources</h1>
-            {% set nav_mode = "admin" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "Data Sources" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
@@ -25,11 +23,20 @@
             {% endfor %}
         {% endwith %}
 
-        <section class="panel">
-            <h2>Email IMAP Source</h2>
-            <p class="muted">
-                Create or update an allowlisted source. Credentials are read from environment variables only.
-            </p>
+        <div class="source-configurations" aria-label="Available source types">
+        <details class="panel disclosure-panel">
+            <summary>
+                <span class="source-summary">
+                    <span class="source-icon" aria-hidden="true">@</span>
+                    <span>
+                        <span class="eyebrow">Mailbox</span>
+                        <strong>Email IMAP</strong>
+                        <small>Index messages and supported attachments from an allowlisted inbox.</small>
+                    </span>
+                </span>
+                <span class="disclosure-action" aria-hidden="true"></span>
+            </summary>
+            <div class="disclosure-content">
             <form method="post" class="form-grid compact">
                 <input type="hidden" name="plugin" value="email_imap">
                 <label>
@@ -106,12 +113,23 @@
                 </label>
                 <button type="submit">Save Data Source</button>
             </form>
-        </section>
+            </div>
+        </details>
 
-        <section class="panel">
-            <h2>Microsoft Drive Source</h2>
-            <p class="muted">
-                Uses Microsoft Graph with a Bearer token from an environment variable.
+        <details class="panel disclosure-panel">
+            <summary>
+                <span class="source-summary">
+                    <span class="source-icon" aria-hidden="true">M</span>
+                    <span>
+                        <span class="eyebrow">Cloud storage</span>
+                        <strong>Microsoft Drive</strong>
+                        <small>Sync OneDrive, SharePoint, or a specific Microsoft Graph drive.</small>
+                    </span>
+                </span>
+                <span class="disclosure-action" aria-hidden="true"></span>
+            </summary>
+            <div class="disclosure-content">
+            <p class="muted source-help">
                 Leave Drive ID empty for <code>/me/drive</code>; set it for SharePoint or a specific drive.
             </p>
             <form method="post" class="form-grid compact">
@@ -174,13 +192,22 @@
                 </label>
                 <button type="submit">Save Data Source</button>
             </form>
-        </section>
+            </div>
+        </details>
 
-        <section class="panel">
-            <h2>Folder Watch Source</h2>
-            <p class="muted">
-                Monitor a local or UNC folder for files to index. Files are processed on sync.
-            </p>
+        <details class="panel disclosure-panel">
+            <summary>
+                <span class="source-summary">
+                    <span class="source-icon" aria-hidden="true">/</span>
+                    <span>
+                        <span class="eyebrow">Local storage</span>
+                        <strong>Folder Watch</strong>
+                        <small>Monitor a local or UNC folder and index matching files on sync.</small>
+                    </span>
+                </span>
+                <span class="disclosure-action" aria-hidden="true"></span>
+            </summary>
+            <div class="disclosure-content">
             <form method="post" class="form-grid compact">
                 <input type="hidden" name="plugin" value="folder_watch">
                 <label>
@@ -225,10 +252,18 @@
                 </label>
                 <button type="submit">Save Data Source</button>
             </form>
-        </section>
+            </div>
+        </details>
+        </div>
 
         <section class="panel">
-            <h2>Configured Sources</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>Configured sources</h2>
+                    <p class="muted">Run a manual sync or pause a connection without deleting its configuration.</p>
+                </div>
+                <span class="count-badge">{{ data_sources|length }} configured</span>
+            </div>
             <div id="dataSourceJobStatus" class="notice warning" hidden></div>
             <div class="table-wrap">
                 <table>
@@ -292,7 +327,12 @@
                                 </td>
                             </tr>
                         {% else %}
-                            <tr><td colspan="8">No data sources configured.</td></tr>
+                            <tr>
+                                <td colspan="8" class="empty-table-cell">
+                                    <strong>No data sources configured</strong>
+                                    <span>Open one of the connectors above to add your first source.</span>
+                                </td>
+                            </tr>
                         {% endfor %}
                     </tbody>
                 </table>

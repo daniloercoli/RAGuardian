@@ -218,6 +218,15 @@ class PromptStore:
             self._write(self._user_file(user_id), new_prompts)
         return True
 
+    def delete_user_prompts(self, user_id: str) -> int:
+        """Delete all prompts for a user. Returns count of prompts deleted."""
+        with self._lock:
+            user_file = self._user_file(user_id)
+            prompts = self._read(user_file)
+            count = len(prompts)
+            user_file.unlink(missing_ok=True)
+            return count
+
     def get_user_prompt(self, user_id: str, prompt_id: str) -> Optional[dict]:
         for p in self.list_user_prompts(user_id):
             if p["id"] == prompt_id:

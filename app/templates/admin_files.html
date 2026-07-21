@@ -13,11 +13,9 @@
 </head>
 <body>
     <div class="container wide">
-        <header class="page-header">
-            <h1>RAG Files</h1>
-            {% set nav_mode = "admin" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "RAG Files" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}

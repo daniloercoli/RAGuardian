@@ -1,12 +1,12 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv(*args, **kwargs):
         return False
 
-from utils.settings_store import DEFAULT_SETTINGS, get_settings
+from utils.settings_store import get_settings
 from utils.model_defaults import BUILTIN_PROVIDER_DEFINITIONS, ModelConfigurationError
 
 load_dotenv()
@@ -54,26 +54,6 @@ MISTRAL_MODELS = ModelConfig.VALID_RAG_MODELS.MISTRAL
 REGOLO_MODELS = ModelConfig.VALID_RAG_MODELS.REGOLO
 
 @dataclass
-class RAGConfig:
-    embedding_model: str = DEFAULT_SETTINGS["rag"]["embedding_model"]
-    embedding_provider: str = DEFAULT_SETTINGS["rag"]["embedding_provider"]
-    chunk_size: int = 1000
-    chunk_overlap: int = 150
-    query_k: int = 5
-    temperature: float = 0.3
-    default_model: str = ""
-    enable_cache: bool = True
-    cache_ttl: int = 3600
-    use_internal_knowledge: bool = False
-    reranker_enabled: bool = False
-    reranker_model: str = DEFAULT_SETTINGS["rag"]["reranker_model"]
-    reranker_top_n: int = 20
-    reranker_diversity_mode: str = "none"
-    reranker_mmr_lambda: float = 0.7
-    reranker_mmr_candidate_pool: int = 80
-    reranker_threshold: float = 0.0
-
-@dataclass
 class VectorStoreConfig:
     backend: str = "chroma_persistent"
 
@@ -104,70 +84,6 @@ _api_keys = APIKeys(
     huggingface_token=os.getenv("HUGGINGFACE_TOKEN", ""),
 )
 
-# Validazione configurazione RAG
-_rag = RAGConfig(
-    embedding_model=load_validated_env(
-        "EMBEDDING_MODEL",
-        default=DEFAULT_SETTINGS["rag"]["embedding_model"],
-        value_type=str
-    ),
-    embedding_provider=load_validated_env(
-        "EMBEDDING_PROVIDER",
-        default=DEFAULT_SETTINGS["rag"]["embedding_provider"],
-        value_type=str
-    ),
-    chunk_size=load_validated_env(
-        "CHUNK_SIZE",
-        default=1000,
-        value_type=int,
-        min_value=100,
-        max_value=10000
-    ),
-    chunk_overlap=load_validated_env(
-        "CHUNK_OVERLAP",
-        default=150,
-        value_type=int,
-        min_value=0,
-        max_value=500
-    ),
-    query_k=load_validated_env(
-        "QUERY_K",
-        default=5,
-        value_type=int,
-        min_value=1,
-        max_value=50
-    ),
-    temperature=load_validated_env(
-        "TEMPERATURE",
-        default=0.3,
-        value_type=float,
-        min_value=0.0,
-        max_value=1.0
-    ),
-    default_model=load_validated_env(
-        "LLM_MODEL",
-        default=DEFAULT_SETTINGS["rag"]["default_model"],
-        value_type=str
-    ),
-    enable_cache=load_validated_env(
-        "RAG_CACHE_ENABLED",
-        default="true",
-        value_type=bool
-    ),
-    cache_ttl=load_validated_env(
-        "RAG_CACHE_TTL",
-        default=3600,
-        value_type=int,
-        min_value=60,
-        max_value=86400
-    ),
-    use_internal_knowledge=load_validated_env(
-        "RAG_USE_INTERNAL_KNOWLEDGE",
-        default="false",
-        value_type=bool
-    ),
-)
-
 _vector_store = VectorStoreConfig(
     backend=load_validated_env(
         "VECTOR_STORE_BACKEND",
@@ -180,7 +96,6 @@ _vector_store = VectorStoreConfig(
 class _Config:
     paths = _paths
     api_keys = _api_keys
-    rag = _rag
     vector_store = _vector_store
     @property
     def MISTRAL_API_KEY(self): return _api_keys.mistral_api_key

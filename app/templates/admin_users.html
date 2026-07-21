@@ -13,11 +13,9 @@
 </head>
 <body>
     <div class="container wide">
-        <header class="page-header">
-            <h1>Users</h1>
-            {% set nav_mode = "admin" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "Users" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
@@ -26,7 +24,12 @@
         {% endwith %}
 
         <section class="panel">
-            <h2>Create User</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>Create User</h2>
+                    <p class="muted">Add a workspace member and choose the minimum role they need.</p>
+                </div>
+            </div>
             <form method="post" class="form-grid compact">
                 <input type="hidden" name="action" value="create">
                 <label>
@@ -57,26 +60,33 @@
         </section>
 
         <section class="panel">
-            <h2>Existing Users</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>Existing Users</h2>
+                    <p class="muted">Manage access, reset passwords, or permanently remove a workspace.</p>
+                </div>
+                <span class="count-badge">{{ users|length }} total</span>
+            </div>
             <div class="table-wrap">
-                <table>
+                <table class="users-table">
                     <thead>
                         <tr>
-                            <th>Email</th>
-                            <th>Name</th>
-                            <th>Role</th>
-                            <th>Status</th>
-                            <th>Reset / Update</th>
+                            <th scope="col">Email</th>
+                            <th scope="col">Name</th>
+                            <th scope="col">Role</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Reset / Update</th>
+                            <th scope="col">Delete</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for user in users %}
                             <tr>
-                                <td><code>{{ user.email }}</code><br><span class="muted">{{ user.id }}</span></td>
-                                <td>{{ user.display_name }}</td>
-                                <td>{{ user.role }}</td>
-                                <td>{{ "enabled" if user.enabled else "disabled" }}</td>
-                                <td>
+                                <td data-label="Email"><code>{{ user.email }}</code><br><span class="muted">{{ user.id }}</span></td>
+                                <td data-label="Name">{{ user.display_name }}</td>
+                                <td data-label="Role"><span class="role-pill">{{ user.role }}</span></td>
+                                <td data-label="Status"><span class="status-pill {{ 'indexed' if user.enabled else 'error' }}">{{ "enabled" if user.enabled else "disabled" }}</span></td>
+                                <td data-label="Update">
                                     <form method="post" class="form-grid compact">
                                         <input type="hidden" name="action" value="update">
                                         <input type="hidden" name="user_id" value="{{ user.id }}">
@@ -93,9 +103,16 @@
                                         <button type="submit" class="secondary">Save</button>
                                     </form>
                                 </td>
+                                <td data-label="Delete">
+                                    <form method="post" onsubmit="return confirm('Eliminare questo utente con tutti i dati (workspace, documenti, prompt, secret e API key)?')">
+                                        <input type="hidden" name="action" value="delete">
+                                        <input type="hidden" name="user_id" value="{{ user.id }}">
+                                        <button type="submit" class="danger" {% if current_user.id == user.id %}disabled title="Non puoi eliminare l'utente attualmente loggato"{% endif %}>Delete</button>
+                                    </form>
+                                </td>
                             </tr>
                         {% else %}
-                            <tr><td colspan="5">No users yet. The first successful login can bootstrap an admin.</td></tr>
+                            <tr><td colspan="6">No users yet. The first successful login can bootstrap an admin.</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>

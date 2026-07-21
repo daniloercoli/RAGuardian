@@ -315,7 +315,7 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
 
     _login_email(client, "user@example.local", "secret")
     user_prompts = client.get("/my-prompts").get_data(as_text=True)
-    user_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", user_prompts, re.S).group(1)
+    user_nav = re.search(r"<nav class=\"top-nav[^\"]*\"[^>]*>(.*?)</nav>", user_prompts, re.S).group(1)
     user_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', user_nav)
     assert "System Prompts" in user_nav
     assert 'href="/my-prompts"' not in user_nav
@@ -327,8 +327,8 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
     _login_email(client, "admin@example.local")
     admin_home = client.get("/").get_data(as_text=True)
     admin_files = client.get("/admin/files").get_data(as_text=True)
-    admin_home_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", admin_home, re.S).group(1)
-    admin_files_nav = re.search(r"<nav class=\"top-nav[^\"]*\">(.*?)</nav>", admin_files, re.S).group(1)
+    admin_home_nav = re.search(r"<nav class=\"top-nav[^\"]*\"[^>]*>(.*?)</nav>", admin_home, re.S).group(1)
+    admin_files_nav = re.search(r"<nav class=\"top-nav[^\"]*\"[^>]*>(.*?)</nav>", admin_files, re.S).group(1)
     admin_home_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
     admin_files_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
     assert '<span class="nav-item active" aria-current="page">Chat</span>' in admin_home_nav

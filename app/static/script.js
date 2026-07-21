@@ -38,6 +38,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const conversationStorageKey = "ragConversationId";
     let conversationId = loadOrCreateConversationId();
 
+    function setControlLabel(button, label) {
+        if (!button) return;
+        button.title = label;
+        button.setAttribute("aria-label", label);
+    }
+
     sendButton.addEventListener("click", sendMessage);
     userInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
@@ -95,7 +101,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         stream.getTracks().forEach(track => track.stop());
                         isRecording = false;
                         uploadAudioButton.classList.remove("recording");
-                        uploadAudioButton.title = "Record audio for transcription";
+                        setControlLabel(uploadAudioButton, "Record audio for transcription");
                         await submitRecording(audioChunks, recorder.mimeType);
                     };
                     recorder.onerror = (event) => {
@@ -104,14 +110,14 @@ document.addEventListener("DOMContentLoaded", () => {
                     recorder.start();
                     isRecording = true;
                     uploadAudioButton.classList.add("recording");
-                    uploadAudioButton.title = "Stop recording";
+                    setControlLabel(uploadAudioButton, "Stop recording");
                 } catch (err) {
                     if (stream) {
                         stream.getTracks().forEach(track => track.stop());
                     }
                     isRecording = false;
                     uploadAudioButton.classList.remove("recording");
-                    uploadAudioButton.title = "Record audio for transcription";
+                    setControlLabel(uploadAudioButton, "Record audio for transcription");
                     displayRecordingError(err);
                 }
             } else if (mediaRecorder && mediaRecorder.state !== "inactive") {
@@ -150,7 +156,7 @@ document.addEventListener("DOMContentLoaded", () => {
     async function submitRecording(chunks, mimeType) {
         if (chunks.length === 0) {
             uploadAudioButton.disabled = false;
-            uploadAudioButton.title = "Record audio for transcription";
+            setControlLabel(uploadAudioButton, "Record audio for transcription");
             return;
         }
 
@@ -158,7 +164,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const blob = new Blob(chunks, { type: recordingType });
         const filename = `recording.${recordingExtension(recordingType)}`;
         const originalBtnText = uploadAudioButton.title;
-        uploadAudioButton.title = "Transcribing...";
+        setControlLabel(uploadAudioButton, "Transcribing...");
         uploadAudioButton.disabled = true;
 
         hideEmptyState();
@@ -198,7 +204,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 : escapeHtml("Transcription failed: " + error.message);
         } finally {
             uploadAudioButton.disabled = false;
-            uploadAudioButton.title = originalBtnText || "Record audio for transcription";
+            setControlLabel(uploadAudioButton, originalBtnText || "Record audio for transcription");
             chatbox.scrollTop = chatbox.scrollHeight;
         }
     }
@@ -816,7 +822,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         ocrFileInput.value = "";
         const originalBtnText = uploadOcrButton.title;
-        uploadOcrButton.title = "Extracting text...";
+        setControlLabel(uploadOcrButton, "Extracting text...");
         uploadOcrButton.disabled = true;
 
         hideEmptyState();
@@ -857,7 +863,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 : escapeHtml(`OCR failed: ${error.message}`);
         } finally {
             uploadOcrButton.disabled = false;
-            uploadOcrButton.title = originalBtnText || "Extract text from image or PDF";
+            setControlLabel(uploadOcrButton, originalBtnText || "Extract text from image or PDF");
             chatbox.scrollTop = chatbox.scrollHeight;
         }
     }

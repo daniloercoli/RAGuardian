@@ -13,11 +13,9 @@
 </head>
 <body>
     <div class="container narrow">
-        <header class="page-header">
-            <h1>Configuration Required</h1>
-            {% set nav_mode = "main" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "Configuration Required" %}
+        {% set nav_mode = "main" %}
+        {% include "_page_header.html" %}
 
         <section class="panel">
             <h2>Providers and Models Not Configured</h2>

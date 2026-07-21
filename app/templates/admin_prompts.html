@@ -10,68 +10,12 @@
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
     <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <style>
-        .prompt-card {
-            background: #f9fafb;
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: 16px;
-            margin-bottom: 12px;
-        }
-        .prompt-card:hover {
-            border-color: #d1d5db;
-        }
-        .prompt-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-        .prompt-name {
-            font-weight: 600;
-            font-size: 1.05em;
-        }
-        .prompt-status {
-            font-size: 0.85em;
-        }
-        .badge-active {
-            background: #dcfce7;
-            color: #166534;
-            padding: 2px 8px;
-            border-radius: 4px;
-        }
-        .badge-inactive {
-            background: #fee2e2;
-            color: #991b1b;
-            padding: 2px 8px;
-            border-radius: 4px;
-        }
-        .prompt-content {
-            font-family: ui-monospace, monospace;
-            font-size: 0.88em;
-            white-space: pre-wrap;
-            word-break: break-word;
-            background: #f3f4f6;
-            padding: 10px;
-            border-radius: 6px;
-            max-height: 250px;
-            overflow: auto;
-            margin-bottom: 8px;
-        }
-        .prompt-actions {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-    </style>
 </head>
 <body>
     <div class="container wide">
-        <header class="page-header">
-            <h1>Shared System Prompts</h1>
-            {% set nav_mode = "admin" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "Shared System Prompts" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
@@ -79,42 +23,46 @@
             {% endfor %}
         {% endwith %}
 
-        <section class="panel">
-            <h2>Create Shared Prompt</h2>
-            <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-bottom:16px;">
-                <strong style="font-size:0.9em;">Template Variables</strong>
-                <p class="muted" style="margin:4px 0 0;">Use these placeholders in the content. They are replaced at runtime per-user.</p>
-                <table style="border-collapse:collapse;margin-top:8px;width:100%;font-size:0.88em;">
-                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;UTENTE&#125;&#125;</code></td><td>User email</td></tr>
-                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;NOME_UTENTE&#125;&#125;</code></td><td>User display name</td></tr>
-                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;DATA_ODOIERNO&#125;&#125;</code></td><td>Today's date (YYYY-MM-DD)</td></tr>
-                    <tr><td style="padding:3px 8px 3px 0;font-family:monospace;"><code>&#123;&#123;ORA&#125;&#125;</code></td><td>Current time (HH:MM UTC)</td></tr>
-                </table>
-            </div>
-            <form id="createPromptForm" class="form-grid compact">
-                <label>
-                    Name
-                    <input type="text" id="promptName" required maxlength="500">
-                </label>
-                <label>
-                    Content
-                    <textarea id="promptContent" rows="6" required
-                        placeholder="Sei un assistente professionale di supporto. Rispondi con cortesia a &#123;&#123;NOME_UTENTE&#125;&#125;.
-Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;."></textarea>
-                </label>
+        <section class="panel prompt-editor-panel">
+            <div class="panel-heading">
                 <div>
-                    <button type="submit" class="primary">Create</button>
-                    <button type="button" class="secondary" id="previewBtn">Preview (with variables resolved)</button>
+                    <h2>Create a shared prompt</h2>
+                    <p class="muted">Publish reusable instructions for every user.</p>
                 </div>
-            </form>
-            <div id="previewResult" class="prompt-content" style="display:none; margin-top:12px;"></div>
+                <span class="count-badge">Administrator</span>
+            </div>
+            <div class="prompt-editor-layout">
+                {% include "_prompt_variables.html" %}
+                <form id="createPromptForm" class="form-grid prompt-form">
+                    <label>
+                        Name
+                        <input type="text" id="promptName" required maxlength="500" placeholder="e.g. Customer support">
+                    </label>
+                    <label>
+                        Content
+                        <textarea id="promptContent" rows="8" required
+                            placeholder="Sei un assistente professionale di supporto. Rispondi con cortesia a &#123;&#123;NOME_UTENTE&#125;&#125;.
+Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;."></textarea>
+                    </label>
+                    <div class="prompt-editor-actions">
+                        <button type="button" class="secondary" id="previewBtn">Preview resolved</button>
+                        <button type="submit" class="primary">Create prompt</button>
+                    </div>
+                </form>
+            </div>
+            <div id="previewResult" class="prompt-content prompt-preview" hidden></div>
         </section>
 
-        <section>
-            <h2>Shared Prompts</h2>
+        <section class="panel prompt-library">
+            <div class="panel-heading">
+                <div>
+                    <h2>Shared prompts</h2>
+                    <p class="muted">Manage prompts available across all workspaces.</p>
+                </div>
+            </div>
             <div id="promptsList">
                 {% if prompts|length == 0 %}
-                    <p class="muted">No shared prompts yet.</p>
+                    <div class="empty-panel"><strong>No shared prompts</strong><p>Create the first one above to make it available to everyone.</p></div>
                 {% endif %}
             </div>
         </section>
@@ -131,7 +79,7 @@ Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;."></textarea>
                 if (data.prompts && data.prompts.length > 0) {
                     data.prompts.forEach(p => list.appendChild(renderPrompt(p)));
                 } else {
-                    list.innerHTML = '<p class="muted">No shared prompts yet.</p>';
+                    list.innerHTML = '<div class="empty-panel"><strong>No shared prompts</strong><p>Create the first one above to make it available to everyone.</p></div>';
                 }
             });
 
@@ -154,7 +102,7 @@ Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;."></textarea>
                 }
                 document.getElementById("promptName").value = "";
                 document.getElementById("promptContent").value = "";
-                document.getElementById("previewResult").style.display = "none";
+                document.getElementById("previewResult").hidden = true;
                 location.reload();
             } catch (err) {
                 alert("Network error");
@@ -173,10 +121,10 @@ Oggi è il &#123;&#123;DATA_ODOIERNO&#125;&#125;."></textarea>
                 });
                 const d = await res.json();
                 document.getElementById("previewResult").textContent = d.resolved || content;
-                document.getElementById("previewResult").style.display = "block";
+                document.getElementById("previewResult").hidden = false;
             } catch (err) {
                 document.getElementById("previewResult").textContent = content;
-                document.getElementById("previewResult").style.display = "block";
+                document.getElementById("previewResult").hidden = false;
             }
         });
 

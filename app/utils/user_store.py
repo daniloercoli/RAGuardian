@@ -11,7 +11,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -280,6 +280,24 @@ class UserStore:
                 self._save_unlocked(users)
                 return True
             return False
+
+    def delete_user(
+        self,
+        user_id: str,
+        *,
+        before_delete: Callable[[dict], None] | None = None,
+    ) -> bool:
+        """Delete a user after an optional cleanup succeeds."""
+        with self._lock:
+            users = self._list_unlocked()
+            target = next((user for user in users if user.get("id") == user_id), None)
+            if target is None:
+                return False
+            if before_delete is not None:
+                before_delete(_public_user(target))
+            users = [user for user in users if user.get("id") != user_id]
+            self._save_unlocked(users)
+            return True
 
     def rotate_api_key(self, *, user_id: str, key_name: str) -> dict | None:
         """Generate a new raw key value. Returns updated key or None."""

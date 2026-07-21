@@ -7,6 +7,7 @@ import pytest
 from app import create_app
 from app.utils.file_index import FileIndex
 from app.utils.job_store import get_job_store
+from app.utils.prompt_store import PromptStore
 from app.utils.secret_store import SecretStore
 from app.utils.settings_store import SettingsStore
 from app.utils.user_store import UserStore
@@ -27,6 +28,7 @@ def flask_app(tmp_path, monkeypatch):
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
             "USERS_FILE": str(tmp_path / "users.json"),
+            "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
             "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace_uploads"),
@@ -293,3 +295,206 @@ def test_job_status_is_hidden_across_workspaces(client, flask_app):
     response = client.get("/api/v1/jobs/bob-job", headers={"X-API-Key": "alice-key"})
 
     assert response.status_code == 404
+
+
+def test_admin_deletes_user_and_all_scoped_data(client, flask_app, monkeypatch):
+    workspace_module = importlib.import_module("utils.workspace")
+    conversation_module = importlib.import_module("utils.conversation_memory")
+    deleted_collections = []
+    monkeypatch.setattr(
+        workspace_module,
+        "_delete_chroma_collection",
+        lambda collection_name: deleted_collections.append(collection_name) or True,
+    )
+
+    store = UserStore(flask_app.config["USERS_FILE"])
+    admin = store.create_user(
+        email="admin@example.local",
+        password="admin",
+        role="admin",
+    )
+    target = store.create_user(email="person@example.com", password="person-pass")
+    store.create_api_key(
+        user_id=target["id"],
+        name="person-key",
+        scopes=["query"],
+        api_key_value="person-api-key",
+    )
+    workspace = workspace_for_user(target, app=flask_app)
+    Path(workspace.settings_file).write_text('{"data_sources": []}', encoding="utf-8")
+    upload_file = Path(workspace.upload_folder) / "private.txt"
+    upload_file.write_text("private", encoding="utf-8")
+    PromptStore(flask_app.config["PROMPTS_DIR"]).create_user_prompt(
+        target["id"],
+        "Personal",
+        "Private prompt",
+    )
+    prompt_file = Path(flask_app.config["PROMPTS_DIR"]) / "user_prompts" / f"{target['id']}.json"
+    secret_store = SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["RAG_SECRET_KEY"],
+    )
+    secret_ref = secret_store.set_secret(workspace.workspace_id, "mail:password", "private-secret")
+    conversation_id = f"{workspace.workspace_id}:conversation-1"
+    conversation_module.get_conversation_store().append_turn(
+        conversation_id,
+        user="Private question",
+        assistant="Private answer",
+    )
+    get_job_store().create_job(
+        {
+            "id": "person-job",
+            "type": "file_upload",
+            "status": "completed",
+            "workspace_id": workspace.workspace_id,
+            "errors": [],
+        }
+    )
+    client.post(
+        "/admin/login",
+        data={"email": admin["email"], "password": "admin"},
+    )
+
+    response = client.post(
+        "/admin/users",
+        data={"action": "delete", "user_id": target["id"]},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"Utente eliminato con tutti i dati" in response.data
+    assert store.get(target["id"]) is None
+    assert store.get(admin["id"]) is not None
+    assert not Path(workspace.settings_file).parent.exists()
+    assert not Path(workspace.upload_folder).exists()
+    assert not prompt_file.exists()
+    assert secret_store.get_secret(secret_ref) == ""
+    assert conversation_module.get_conversation_store().render_for_prompt(conversation_id) == ""
+    assert get_job_store().get("person-job") is None
+    assert deleted_collections == [workspace.chroma_collection]
+
+
+def test_admin_cannot_delete_self_or_user_with_active_jobs(client, flask_app, monkeypatch):
+    workspace_module = importlib.import_module("utils.workspace")
+    monkeypatch.setattr(
+        workspace_module,
+        "_delete_chroma_collection",
+        lambda _collection_name: pytest.fail("Chroma cleanup should not run"),
+    )
+    store = UserStore(flask_app.config["USERS_FILE"])
+    admin = store.create_user(
+        email="admin@example.local",
+        password="admin",
+        role="admin",
+    )
+    target = store.create_user(email="busy@example.com", password="busy-pass")
+    workspace = workspace_for_user(target, app=flask_app)
+    get_job_store().create_job(
+        {
+            "id": "busy-job",
+            "type": "file_upload",
+            "status": "running",
+            "workspace_id": workspace.workspace_id,
+            "errors": [],
+        }
+    )
+    client.post(
+        "/admin/login",
+        data={"email": admin["email"], "password": "admin"},
+    )
+
+    self_response = client.post(
+        "/admin/users",
+        data={"action": "delete", "user_id": admin["id"]},
+        follow_redirects=True,
+    )
+    missing_response = client.post(
+        "/admin/users",
+        data={"action": "delete", "user_id": "missing-user"},
+        follow_redirects=True,
+    )
+    busy_response = client.post(
+        "/admin/users",
+        data={"action": "delete", "user_id": target["id"]},
+        follow_redirects=True,
+    )
+
+    assert b"Non puoi eliminare l&#39;utente attualmente loggato" in self_response.data
+    assert b"Utente non trovato" in missing_response.data
+    assert b"Impossibile eliminare l&#39;utente mentre ha job attivi" in busy_response.data
+    assert store.get(admin["id"]) is not None
+    assert store.get(target["id"]) is not None
+    assert Path(workspace.settings_file).parent.exists()
+
+
+def test_cleanup_failure_keeps_user_account(client, flask_app, monkeypatch):
+    workspace_module = importlib.import_module("utils.workspace")
+    store = UserStore(flask_app.config["USERS_FILE"])
+    admin = store.create_user(
+        email="admin@example.local",
+        password="admin",
+        role="admin",
+    )
+    target = store.create_user(email="person@example.com", password="person-pass")
+    workspace = workspace_for_user(target, app=flask_app)
+
+    def fail_chroma_cleanup(_collection_name):
+        raise RuntimeError("Chroma non disponibile")
+
+    monkeypatch.setattr(workspace_module, "_delete_chroma_collection", fail_chroma_cleanup)
+    client.post(
+        "/admin/login",
+        data={"email": admin["email"], "password": "admin"},
+    )
+
+    response = client.post(
+        "/admin/users",
+        data={"action": "delete", "user_id": target["id"]},
+        follow_redirects=True,
+    )
+
+    assert b"Chroma non disponibile" in response.data
+    assert store.get(target["id"]) is not None
+    assert Path(workspace.settings_file).parent.exists()
+
+
+def test_admin_update_protects_current_account_and_reports_missing_user(client, flask_app):
+    store = UserStore(flask_app.config["USERS_FILE"])
+    admin = store.create_user(
+        email="admin@example.local",
+        password="admin",
+        role="admin",
+        enabled=True,
+    )
+    client.post(
+        "/admin/login",
+        data={"email": admin["email"], "password": "admin"},
+    )
+
+    self_response = client.post(
+        "/admin/users",
+        data={
+            "action": "update",
+            "user_id": admin["id"],
+            "display_name": "Admin",
+            "role": "user",
+        },
+        follow_redirects=True,
+    )
+    missing_response = client.post(
+        "/admin/users",
+        data={
+            "action": "update",
+            "user_id": "missing-user",
+            "display_name": "Missing",
+            "role": "user",
+            "enabled": "on",
+        },
+        follow_redirects=True,
+    )
+
+    refreshed = store.get(admin["id"])
+    assert b"Non puoi disabilitare il tuo account o rimuovere il tuo ruolo admin" in self_response.data
+    assert b"Utente non trovato" in missing_response.data
+    assert refreshed["role"] == "admin"
+    assert refreshed["enabled"] is True

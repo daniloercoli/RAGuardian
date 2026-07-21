@@ -53,6 +53,19 @@ def test_memory_job_store_allows_generic_jobs_without_rebuild_conflict():
     assert store.active_jobs_count() == 2
 
 
+def test_memory_job_store_counts_and_clears_one_workspace():
+    store = MemoryJobStore()
+    store.create_job({**_job("job-a"), "workspace_id": "workspace-a"})
+    store.create_job({**_job("job-b"), "workspace_id": "workspace-b"})
+    store.finish("job-a", "completed", "done")
+
+    assert store.active_jobs_count("workspace-a") == 0
+    assert store.active_jobs_count("workspace-b") == 1
+    assert store.clear_by_workspace("workspace-a") == 1
+    assert store.get("job-a") is None
+    assert store.get("job-b") is not None
+
+
 def test_memory_job_store_rejects_concurrent_data_source_sync():
     store = MemoryJobStore()
     first_job = {
@@ -120,6 +133,20 @@ def test_redis_job_store_rejects_concurrent_data_source_sync():
 
     assert status == 202
     assert payload["id"] == "sync-2"
+
+
+def test_redis_job_store_counts_and_clears_one_workspace():
+    redis = FakeRedis()
+    store = RedisJobStore(redis)
+    store.create_job({**_job("job-a"), "workspace_id": "workspace-a"})
+    store.create_job({**_job("job-b"), "workspace_id": "workspace-b"})
+    store.finish("job-a", "completed", "done")
+
+    assert store.active_jobs_count("workspace-a") == 0
+    assert store.active_jobs_count("workspace-b") == 1
+    assert store.clear_by_workspace("workspace-a") == 1
+    assert store.get("job-a") is None
+    assert store.get("job-b") is not None
 
 
 def test_index_write_lock_uses_memory_fallback(monkeypatch):

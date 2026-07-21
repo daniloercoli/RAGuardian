@@ -1,5 +1,6 @@
 import logging
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from app.utils.logging_config import setup_logger
@@ -35,6 +36,50 @@ def test_gunicorn_runtime_files_are_documented():
     assert "gunicorn_access.log" in gunicorn_config
     assert "gunicorn_runtime.log" in gunicorn_config
     assert "LOG_TO_CONSOLE" in gunicorn_config
+
+
+def test_env_example_excludes_legacy_rag_overrides():
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    legacy_names = {
+        "CHUNK_SIZE",
+        "CHUNK_OVERLAP",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_PROVIDER",
+        "LLM_MODEL",
+        "QUERY_K",
+        "RAG_CACHE_ENABLED",
+        "RAG_CACHE_TTL",
+        "RAG_USE_INTERNAL_KNOWLEDGE",
+        "TEMPERATURE",
+    }
+
+    assert not any(f"{name}=" in env_example for name in legacy_names)
+    assert "managed from Admin -> AI Settings" in env_example
+
+
+def test_rag_cache_configuration_comes_from_settings_file(tmp_path, monkeypatch):
+    from config import Config
+    from app.utils.cache import RAGCache
+    from app.utils.settings_store import DEFAULT_SETTINGS, save_settings
+
+    settings_path = tmp_path / "settings.json"
+    settings = deepcopy(DEFAULT_SETTINGS)
+    settings["rag"]["enable_cache"] = False
+    settings["rag"]["cache_ttl"] = 123
+    save_settings(settings, str(settings_path))
+    monkeypatch.setattr(Config.paths, "settings_file", str(settings_path))
+    monkeypatch.setenv("RAG_CACHE_ENABLED", "true")
+    monkeypatch.setenv("RAG_CACHE_TTL", "999")
+
+    RAGCache.reset()
+    cache = RAGCache()
+    try:
+        assert cache._get_config()["enable_cache"] is False
+        assert cache._get_config()["cache_ttl"] == 123
+        cache.set("legacy env ignored", [], k=1, model="test-model")
+        assert cache.size == 0
+    finally:
+        RAGCache.reset()
 
 
 def test_wordpress_reference_plugin_is_present():

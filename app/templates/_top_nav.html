@@ -7,26 +7,36 @@
 {%- endmacro %}
 
 {% if nav_mode == "admin" %}
-    <nav class="top-nav admin-nav">
-        {{ nav_link("admin_files", "RAG Files") }}
-        {{ nav_link("admin_data_sources", "Data Sources") }}
-        {% if current_user and current_user.role == "admin" %}
-            {{ nav_link("admin_config", "AI Settings") }}
-            {{ nav_link("admin_users", "Users") }}
-            {{ nav_link("admin_api_keys", "API Keys") }}
-            {{ nav_link("admin_my_prompts", "System Prompts") }}
-            {{ nav_link("admin_prompts", "Shared Prompts") }}
-        {% else %}
-            {{ nav_link("admin_my_prompts", "System Prompts") }}
-        {% endif %}
-        <a class="nav-close" href="{{ url_for('index') }}">Close</a>
+    <nav class="top-nav admin-nav" aria-label="Administration">
+        <div class="nav-track">
+            {{ nav_link("admin_files", "RAG Files") }}
+            {{ nav_link("admin_data_sources", "Data Sources") }}
+            {% if current_user and current_user.role == "admin" %}
+                {{ nav_link("admin_config", "AI Settings") }}
+                {{ nav_link("admin_users", "Users") }}
+                {{ nav_link("admin_api_keys", "API Keys") }}
+                {{ nav_link("admin_my_prompts", "System Prompts") }}
+                {{ nav_link("admin_prompts", "Shared Prompts") }}
+            {% else %}
+                {{ nav_link("admin_my_prompts", "System Prompts") }}
+            {% endif %}
+            <a class="nav-close" href="{{ url_for('index') }}">Close</a>
+        </div>
+    </nav>
+{% elif nav_mode == "login" %}
+    <nav class="top-nav" aria-label="Primary navigation">
+        <div class="nav-track">
+            <a href="{{ url_for('index') }}">Chat</a>
+        </div>
     </nav>
 {% else %}
-    <nav class="top-nav">
-        <span class="nav-item active" aria-current="page">Chat</span>
-        <a href="{{ url_for('admin_files') }}">Configuration</a>
-        <form method="post" action="{{ url_for('admin_logout') }}">
-            <button type="submit" class="link-button">Logout</button>
-        </form>
+    <nav class="top-nav" aria-label="Primary navigation">
+        <div class="nav-track">
+            <span class="nav-item active" aria-current="page">Chat</span>
+            <a href="{{ url_for('admin_files') }}">Configuration</a>
+            <form method="post" action="{{ url_for('admin_logout') }}">
+                <button type="submit" class="link-button">Logout</button>
+            </form>
+        </div>
     </nav>
 {% endif %}

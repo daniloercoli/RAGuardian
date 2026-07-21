@@ -8,6 +8,7 @@ from config import Config
 from utils.document_identity import source_hash
 from utils.logging_config import CHROMA_LOGGER as log
 from utils.providers import EmbeddingFactory
+from utils.settings_store import get_settings
 from .base import VectorStore
 
 
@@ -97,7 +98,7 @@ class ChromaPersistentVectorStore(VectorStore):
         return None
 
     def query(self, query: str, k: Optional[int] = None):
-        k = k or Config.rag.query_k
+        k = k or get_settings(Config.paths.settings_file)["rag"]["query_k"]
         log.info(f"Query: '{query}' (top {k})")
 
         docs, _, _ = self._query_documents(query, k=k, include_embeddings=False)

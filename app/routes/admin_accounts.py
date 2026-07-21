@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 from flask import flash, redirect, render_template, request, send_file, url_for
 
 from utils.api_key_logger import ApiKeyLogger
-from utils.auth import require_admin
+from utils.auth import current_user, require_admin
 from utils.user_store import UserStore
 from utils.validators import ValidationError
-from utils.workspace import workspace_for_user
+from utils.workspace import remove_workspace_files, workspace_for_user
 
 
 def register_admin_account_routes(app) -> None:
@@ -29,14 +29,38 @@ def register_admin_account_routes(app) -> None:
                     workspace_for_user(user, app=app)
                     flash("Utente creato", "success")
                 elif action == "update":
-                    store.update_user(
-                        request.form.get("user_id", ""),
+                    user_id = request.form.get("user_id", "")
+                    role = request.form.get("role", "user")
+                    enabled = request.form.get("enabled") == "on"
+                    current = current_user()
+                    if current and current.get("id") == user_id and (role != "admin" or not enabled):
+                        raise ValueError("Non puoi disabilitare il tuo account o rimuovere il tuo ruolo admin")
+                    updated = store.update_user(
+                        user_id,
                         display_name=request.form.get("display_name", ""),
-                        role=request.form.get("role", "user"),
-                        enabled=request.form.get("enabled") == "on",
+                        role=role,
+                        enabled=enabled,
                         password=request.form.get("password", ""),
                     )
+                    if not updated:
+                        raise ValueError("Utente non trovato")
                     flash("Utente aggiornato", "success")
+                elif action == "delete":
+                    user_id = request.form.get("user_id", "")
+                    current = current_user()
+                    if not store.get(user_id):
+                        raise ValueError("Utente non trovato")
+                    if current and current.get("id") == user_id:
+                        raise ValueError("Non puoi eliminare l'utente attualmente loggato")
+                    deleted = store.delete_user(
+                        user_id,
+                        before_delete=lambda user: remove_workspace_files(user["id"], app=app),
+                    )
+                    if not deleted:
+                        raise ValueError("Utente non trovato")
+                    flash("Utente eliminato con tutti i dati", "success")
+                else:
+                    raise ValueError("Azione utente non valida")
             except Exception as exc:
                 flash(str(exc), "error")
             return redirect(url_for("admin_users"))
@@ -95,15 +119,20 @@ def register_admin_account_routes(app) -> None:
                     return render_api_keys(revealed_key={"name": name, "key": created["key"]})
                 if action == "delete":
                     key_name = request.form.get("key_name", "").strip()
-                    store.delete_api_key(user_id=user_id, key_name=key_name)
+                    if not store.delete_api_key(user_id=user_id, key_name=key_name):
+                        raise ValueError("API key non trovata")
                     flash(f"API key '{key_name}' eliminata", "success")
                 elif action == "toggle":
                     key_name = request.form.get("key_name", "").strip()
                     existing = store.toggle_api_key_enabled(user_id=user_id, key_name=key_name)
+                    if not existing:
+                        raise ValueError("API key non trovata")
                     state = "abilitata" if existing and existing.get("enabled") else "disabilitata"
                     flash(f"API key '{key_name}' {state}", "success")
                 elif action == "download":
                     flash("Le API key sono mostrate solo al momento della creazione", "error")
+                elif action not in {"clear_show_key", None}:
+                    raise ValueError("Azione API key non valida")
             except Exception as exc:
                 flash(str(exc), "error")
             return redirect(url_for("admin_api_keys"))

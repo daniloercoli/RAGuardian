@@ -85,8 +85,45 @@ def collection_for_workspace(workspace_id: str) -> str:
 def remove_workspace_files(user_id: str, app=None) -> None:
     app = app or current_app
     workspace_id = safe_workspace_id(user_id)
-    for root_key in ("WORKSPACE_DATA_DIR", "WORKSPACE_UPLOAD_DIR"):
-        root = Path(app.config.get(root_key))
-        path = root / workspace_id
-        if path.exists():
-            shutil.rmtree(path)
+    from utils.conversation_memory import get_conversation_store
+    from utils.index_lock import index_write_lock
+    from utils.job_store import get_job_store
+    from utils.prompt_store import PromptStore
+    from utils.rag_engine import clear_cache
+    from utils.secret_store import SecretStore
+
+    with index_write_lock():
+        job_store = get_job_store()
+        if job_store.active_jobs_count(workspace_id):
+            raise RuntimeError("Impossibile eliminare l'utente mentre ha job attivi")
+
+        _delete_chroma_collection(collection_for_workspace(workspace_id))
+        get_conversation_store().clear_by_prefix(f"{workspace_id}:")
+        PromptStore(app.config.get("PROMPTS_DIR", "app/data")).delete_user_prompts(user_id)
+        SecretStore(
+            app.config.get("SECRETS_FILE"),
+            key=app.config.get("RAG_SECRET_KEY") or app.config.get("SECRET_KEY"),
+        ).delete_owner(workspace_id)
+        job_store.clear_by_workspace(workspace_id)
+
+        for root_key in ("WORKSPACE_DATA_DIR", "WORKSPACE_UPLOAD_DIR"):
+            root = Path(app.config[root_key])
+            path = root / workspace_id
+            if path.exists():
+                shutil.rmtree(path)
+
+        clear_cache()
+
+
+def _delete_chroma_collection(collection_name: str) -> bool:
+    from utils.chroma_manager import _get_chroma_client
+
+    client = _get_chroma_client()
+    collection_names = {
+        item if isinstance(item, str) else item.name
+        for item in client.list_collections()
+    }
+    if collection_name not in collection_names:
+        return False
+    client.delete_collection(collection_name)
+    return True

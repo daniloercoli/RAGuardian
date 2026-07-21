@@ -10,48 +10,12 @@
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
     <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <style>
-        .raw-key-box input {
-            font-family: monospace;
-            font-size: 0.95em;
-            padding: 8px;
-            width: 55%;
-            background-color: #f5f5f5;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-        }
-        .raw-key-box {
-            padding: 16px 10px;
-        }
-        .action-btn {
-            display: inline-block;
-            margin: 2px 4px;
-            padding: 4px 8px;
-            border: 1px solid #ccc;
-            background: #f9f9f9;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.85em;
-        }
-        .action-btn:hover {
-            background: #eee;
-        }
-        .action-btn.danger {
-            background: #f8d7da;
-            border-color: #f5c6cb;
-        }
-        .action-btn.danger:hover {
-            background: #f1a5ab;
-        }
-    </style>
 </head>
 <body>
     <div class="container wide">
-        <header class="page-header">
-            <h1>API Keys</h1>
-            {% set nav_mode = "admin" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "API Keys" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
@@ -61,12 +25,18 @@
 
         {% if revealed_key %}
         <section class="panel">
-            <h2>API Key Created</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>API key created</h2>
+                    <p class="muted">This is the only time the complete key will be visible.</p>
+                </div>
+                <span class="status-pill indexed">Ready to copy</span>
+            </div>
             <div class="raw-key-box">
                 <p>API key per "<strong>{{ revealed_key.name }}</strong>"</p>
                 <p class="muted">Copy it now: the server stores only its hash and cannot reveal it again.</p>
-                <input type="text" id="rawKeyInput" value="{{ revealed_key.key }}" readonly onclick="this.select()">
-                <button onclick="copyRawKey()">Copy</button>
+                <input type="text" id="rawKeyInput" value="{{ revealed_key.key }}" aria-label="Generated API key" readonly onclick="this.select()">
+                <button type="button" onclick="copyRawKey()">Copy key</button>
                 <form method="post">
                     <input type="hidden" name="action" value="clear_show_key">
                     <button type="submit">Close</button>
@@ -83,7 +53,12 @@
         </script>
 
         <section class="panel">
-            <h2>Create API Key</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>Create an API key</h2>
+                    <p class="muted">Grant only the scopes this integration needs. The secret is shown once.</p>
+                </div>
+            </div>
             <form method="post" class="form-grid compact">
                 <input type="hidden" name="action" value="create">
                 <label>
@@ -107,9 +82,9 @@
                     <input type="text" name="expires_in" placeholder="e.g. 30d, 24h, 60m" value="{{ request.form.get('expires_in', '') }}" pattern="[0-9]+[dhm]">
                     <small>Leave blank for never. Examples: 7d, 24h, 30m</small>
                 </label>
-                <label>
-                    Scopes
-                    <div>
+                <fieldset class="scope-field">
+                    <legend>Scopes</legend>
+                    <div class="scope-options">
                         <label class="checkbox-label">
                             <input type="checkbox" name="scopes" value="query" checked>
                             Query
@@ -123,7 +98,7 @@
                             Speech
                         </label>
                     </div>
-                </label>
+                </fieldset>
                 <label>
                     Status
                     <select name="enabled">
@@ -131,14 +106,20 @@
                         <option value="off">Disabled</option>
                     </select>
                 </label>
-                <button type="submit">Create</button>
+                <button type="submit">Create API key</button>
             </form>
         </section>
 
         <section class="panel">
-            <h2>Existing API Keys</h2>
+            <div class="panel-heading">
+                <div>
+                    <h2>Existing API keys</h2>
+                    <p class="muted">Review access, expiration, and usage for every integration.</p>
+                </div>
+                <span class="count-badge">{{ all_keys|length }} keys</span>
+            </div>
             <div class="table-wrap">
-                <table>
+                <table class="api-keys-table">
                     <thead>
                         <tr>
                             <th>User</th>
@@ -157,41 +138,53 @@
                     <tbody>
                         {% for key in all_keys %}
                             <tr>
-                                <td>{{ key.user_email }}<br><span class="muted">{{ key.user_id }}</span></td>
-                                <td>{{ key.name }}</td>
-                                <td>{{ key.description or '' }}</td>
-                                <td><code>{{ key.masked_key or '***' }}</code></td>
-                                <td>
+                                <td data-label="User">
+                                    <span class="cell-stack">
+                                        <span>{{ key.user_email }}</span>
+                                        <span class="muted">{{ key.user_id }}</span>
+                                    </span>
+                                </td>
+                                <td data-label="Name"><strong>{{ key.name }}</strong></td>
+                                <td data-label="Description">{{ key.description or '—' }}</td>
+                                <td data-label="Key"><code>{{ key.masked_key or '***' }}</code></td>
+                                <td data-label="Scopes">
                                     {% for scope in key.scopes %}
                                         <span class="badge">{{ scope }}</span>
                                     {% endfor %}
                                 </td>
-                            <td>{{ "enabled" if key.enabled else "disabled" }}</td>
-                            <td>{{ key.expires_at if key.get('expires_at') else "never" }}</td>
-                            <td>{{ key.created_at }}</td>
-                                <td>{{ key.last_used or "never" }}</td>
-                                <td>{{ key.usage_count or 0 }}</td>
-                                <td>
-                                    <form method="post" class="form-grid compact">
+                                <td data-label="Status">
+                                    <span class="status-pill {{ 'indexed' if key.enabled else 'empty' }}">
+                                        {{ "enabled" if key.enabled else "disabled" }}
+                                    </span>
+                                </td>
+                                <td data-label="Expires">{{ key.expires_at if key.get('expires_at') else "never" }}</td>
+                                <td data-label="Created">{{ key.created_at }}</td>
+                                <td data-label="Last used">{{ key.last_used or "never" }}</td>
+                                <td data-label="Count">{{ key.usage_count or 0 }}</td>
+                                <td data-label="Actions">
+                                    <div class="key-actions">
+                                    <form method="post">
                                         <input type="hidden" name="action" value="toggle">
                                         <input type="hidden" name="user_id" value="{{ key.user_id }}">
                                         <input type="hidden" name="key_name" value="{{ key.name }}">
-                                        <label class="checkbox-label">
-                                            <input type="checkbox" name="enabled" {% if key.enabled %}checked{% endif %}>
-                                            Enabled
-                                        </label>
-                                        <button type="submit" class="secondary">Toggle</button>
+                                        <button type="submit" class="secondary">{{ "Disable" if key.enabled else "Enable" }}</button>
                                     </form>
-                                    <form method="post" class="form-grid compact">
+                                    <form method="post" data-delete-api-key data-key-name="{{ key.name }}">
                                         <input type="hidden" name="action" value="delete">
                                         <input type="hidden" name="user_id" value="{{ key.user_id }}">
                                         <input type="hidden" name="key_name" value="{{ key.name }}">
-                                        <button type="submit" class="danger" onclick="return confirm('Sei sicuro di voler eliminare la chiave "{{ key.name }}" di {{ key.user_email }}?')">Delete</button>
+                                        <button type="submit" class="danger">Delete</button>
                                     </form>
+                                    </div>
                                 </td>
                             </tr>
                         {% else %}
-                            <tr><td colspan="11">No API keys yet. Create one above.</td></tr>
+                            <tr>
+                                <td colspan="11" class="empty-table-cell">
+                                    <strong>No API keys yet</strong>
+                                    <span>Create one above when an external integration needs access.</span>
+                                </td>
+                            </tr>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -199,16 +192,18 @@
         </section>
 
         <section class="panel">
-            <h2>Usage Statistics</h2>
-            <p class="muted">
-                Showing the latest {{ usage_entry_limit }} API key usage entries.
+            <div class="panel-heading">
+                <div>
+                    <h2>Usage activity</h2>
+                    <p class="muted">Showing the latest {{ usage_entry_limit }} API key usage entries.</p>
+                </div>
                 {% if usage_log_exists %}
-                    <a href="{{ url_for('admin_api_key_usage_log_download') }}">Download full JSON log</a>
-                    <br><code>{{ usage_log_path }}</code>
-                {% else %}
-                    Usage log file will be created after the first API key request.
+                    <a class="secondary-link" href="{{ url_for('admin_api_key_usage_log_download') }}">Download full JSON log</a>
                 {% endif %}
-            </p>
+            </div>
+            {% if usage_log_exists %}
+                <p class="muted log-path"><code>{{ usage_log_path }}</code></p>
+            {% endif %}
             <div class="table-wrap">
                 <table>
                     <thead>
@@ -248,12 +243,27 @@
                                 </td>
                             </tr>
                         {% else %}
-                            <tr><td colspan="8">No API key usage logged yet.</td></tr>
+                            <tr>
+                                <td colspan="8" class="empty-table-cell">
+                                    <strong>No activity logged yet</strong>
+                                    <span>Requests will appear here after an API key is used.</span>
+                                </td>
+                            </tr>
                         {% endfor %}
                     </tbody>
                 </table>
             </div>
         </section>
     </div>
+    <script>
+        document.querySelectorAll("[data-delete-api-key]").forEach((form) => {
+            form.addEventListener("submit", (event) => {
+                const name = form.dataset.keyName || "this key";
+                if (!window.confirm(`Delete API key "${name}"? This action cannot be undone.`)) {
+                    event.preventDefault();
+                }
+            });
+        });
+    </script>
 </body>
 </html>

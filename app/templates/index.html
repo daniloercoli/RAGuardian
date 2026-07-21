@@ -14,40 +14,38 @@
 </head>
 <body>
     <div class="container app-shell">
-        <header class="page-header">
-            <h1>RAGuardian | Enterprise RAG Service</h1>
-            {% set nav_mode = "main" %}
-            {% include "_top_nav.html" %}
-        </header>
+        {% set page_title = "Knowledge Assistant" %}
+        {% set nav_mode = "main" %}
+        {% include "_page_header.html" %}
 
         <section class="chat-section">
-            <div class="model-selector">
-                <label for="modelSelect">Model</label>
-                <select id="modelSelect">
-                    <option value="">Loading models...</option>
-                </select>
-                <button type="button" id="clearChatButton" class="secondary">New Chat</button>
-            </div>
-
-            <div class="model-selector">
-                <label for="promptSelect">System Prompt</label>
-                <select id="promptSelect">
-                    <option value="">No system prompt</option>
-                </select>
+            <div class="chat-toolbar" aria-label="Chat settings">
+                <label class="chat-control" for="modelSelect">
+                    <span>Model</span>
+                    <select id="modelSelect">
+                        <option value="">Loading models...</option>
+                    </select>
+                </label>
+                <label class="chat-control" for="promptSelect">
+                    <span>System prompt</span>
+                    <select id="promptSelect">
+                        <option value="">No system prompt</option>
+                    </select>
+                </label>
+                <button type="button" id="clearChatButton" class="secondary">New chat</button>
             </div>
 
             <div id="chatbox" class="chatbox" aria-live="polite">
                 <div id="emptyState" class="empty-state">
                     <div>
-                        <strong>Ready to query the enterprise knowledge base.</strong>
-<!-- Demo questions (commented out - kept for future reference)
-                        <p>Choose a demo question or write your own.</p>
+                        <span class="empty-state-mark" aria-hidden="true">R</span>
+                        <strong>Ask your knowledge base</strong>
+                        <p>Search indexed documents, compare sources, or request a concise summary.</p>
                         <div class="prompt-suggestions" aria-label="Suggested questions for the demo">
-                            <button type="button" data-prompt="Summarize the main messages from the uploaded documents.">Main Messages</button>
-                            <button type="button" data-prompt="What decisions or next steps emerge from the knowledge base?">Decisions and Next Steps</button>
-                            <button type="button" data-prompt="Prepare an executive summary for a manager.">Executive Summary</button>
+                            <button type="button" data-prompt="Summarize the main messages from the indexed documents.">Summarize documents</button>
+                            <button type="button" data-prompt="What decisions and next steps emerge from the knowledge base?">Find decisions</button>
+                            <button type="button" data-prompt="Prepare a concise executive brief from the available sources.">Executive brief</button>
                         </div>
-                        -->
                     </div>
                 </div>
             </div>
@@ -60,10 +58,10 @@
             </div>
             <div id="attachedFiles" class="attached-files"></div>
             <div class="input-area">
-                <textarea id="userInput" rows="2" placeholder="Ask a question about the documents..." autocomplete="off"></textarea>
-                <button type="button" id="uploadFileButton" class="icon-btn" title="Attach data file">&#128203;</button>
-                <button type="button" id="uploadOcrButton" class="icon-btn" title="Extract text from image or PDF" hidden>&#9633;</button>
-                <button type="button" id="uploadAudioButton" class="icon-btn" title="Record audio for transcription">&#9672;</button>
+                <textarea id="userInput" rows="2" aria-label="Message" placeholder="Ask a question about the documents..." autocomplete="off"></textarea>
+                <button type="button" id="uploadFileButton" class="icon-btn" title="Attach data file" aria-label="Attach data file"><span aria-hidden="true">+</span></button>
+                <button type="button" id="uploadOcrButton" class="icon-btn" title="Extract text from image or PDF" aria-label="Extract text from image or PDF" hidden><span aria-hidden="true">OCR</span></button>
+                <button type="button" id="uploadAudioButton" class="icon-btn" title="Record audio for transcription" aria-label="Record audio for transcription"><span aria-hidden="true">●</span></button>
                 <button id="sendButton">Send</button>
             </div>
 
