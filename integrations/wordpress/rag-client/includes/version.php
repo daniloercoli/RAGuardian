@@ -12,4 +12,4 @@ if (!defined('ABSPATH')) {
 }
 
 /** The plugin version. */
-define('EC_RAG_VERSION', '0.5.2');
+define('EC_RAG_VERSION', '0.5.3');

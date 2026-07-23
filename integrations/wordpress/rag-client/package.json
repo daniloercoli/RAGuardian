@@ -1,7 +1,7 @@
 {
   "name": "raguardian-wordpress-client",
   "private": true,
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Local WordPress test harness for the RAGuardian WordPress plugin.",
   "scripts": {
     "build:zip": "node scripts/build-plugin-zip.mjs",

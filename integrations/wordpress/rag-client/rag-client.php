@@ -2,8 +2,11 @@
 /**
  * Plugin Name: Raguardian
  * Description: Server-side WordPress client for a RAGuardian user/workspace API key.
- * Version: 0.5.2
+ * Version: 0.5.3
+ * Requires at least: 5.1
+ * Requires PHP: 7.4
  * Author: Danilo Ercoli
+ * Text Domain: ec-rag
  * License: MIT
  * License URI: https://opensource.org/license/mit/
  *
@@ -33,3 +36,4 @@ EC_Rag_Ajax::register();
 EC_Rag_Health_Check::register();
 
 register_deactivation_hook(__FILE__, [EC_Rag_Health_Check::class, 'deactivate']);
+register_deactivation_hook(__FILE__, [EC_Rag_Ingestion::class, 'deactivate']);

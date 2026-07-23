@@ -9,6 +9,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class EC_Rag_Utils_Tests extends TestCase {
@@ -26,7 +27,7 @@ final class EC_Rag_Utils_Tests extends TestCase {
         ];
     }
 
-    /** @dataProvider truthyProvider */
+    #[DataProvider('truthyProvider')]
     public function test_is_truthy($value, bool $expected): void {
         self::assertSame($expected, \EC_Rag_Utils::is_truthy($value));
     }

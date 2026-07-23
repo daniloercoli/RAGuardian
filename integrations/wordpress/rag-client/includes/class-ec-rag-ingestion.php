@@ -15,6 +15,8 @@ class EC_Rag_Ingestion {
 
     const IMPORT_OPTION = 'ec_rag_client_import_state';
     const CRON_HOOK     = 'ec_rag_process_import_batch';
+    const POST_SYNC_HOOK = 'ec_rag_sync_post';
+    const POST_SYNC_MAX_RETRIES = 3;
 
     /**
      * Register WordPress hooks for live sync.
@@ -29,6 +31,17 @@ class EC_Rag_Ingestion {
         add_action('save_post_post', [self::class, 'on_save_post'], 20, 3);
         add_action('before_delete_post', [self::class, 'on_delete_post'], 10, 2);
         add_action(self::CRON_HOOK, [self::class, 'cron_process_import_batch']);
+        add_action(self::POST_SYNC_HOOK, [self::class, 'cron_sync_post'], 10, 2);
+    }
+
+    /**
+     * Clear plugin-owned cron jobs on deactivation.
+     *
+     * @return void
+     */
+    public static function deactivate(): void {
+        wp_unschedule_hook(self::CRON_HOOK);
+        wp_unschedule_hook(self::POST_SYNC_HOOK);
     }
 
     /**
@@ -141,6 +154,7 @@ class EC_Rag_Ingestion {
             wp_delete_file($state['queue_path']);
         }
 
+        wp_clear_scheduled_hook(self::CRON_HOOK);
         delete_option(self::IMPORT_OPTION);
         self::admin_redirect(['ec_rag_notice' => __('Import queue cleared.', 'ec-rag')]);
     }
@@ -178,14 +192,14 @@ class EC_Rag_Ingestion {
         }
 
         if (EC_Rag_Utils::is_public_article($post)) {
-            self::sync_post($post);
+            self::schedule_post_sync($post->ID);
             self::mark_handled($post->ID);
 
             return;
         }
 
         if ($old_status === 'publish') {
-            self::delete_snapshot($post->ID);
+            self::schedule_post_sync($post->ID);
             self::mark_handled($post->ID);
         }
     }
@@ -212,7 +226,7 @@ class EC_Rag_Ingestion {
         }
 
         if (EC_Rag_Utils::is_public_article($post)) {
-            self::sync_post($post);
+            self::schedule_post_sync($post_id);
         }
     }
 
@@ -228,7 +242,81 @@ class EC_Rag_Ingestion {
             return;
         }
 
-        self::delete_snapshot($post_id);
+        self::schedule_post_sync($post_id);
+    }
+
+    /**
+     * Queue a post synchronization outside the editorial request.
+     *
+     * @param int $post_id Post ID.
+     * @param int $attempt Retry attempt.
+     * @param int $delay Delay in seconds.
+     * @return void
+     */
+    public static function schedule_post_sync(int $post_id, int $attempt = 0, int $delay = 1): void {
+        $post_id = absint($post_id);
+        $attempt = absint($attempt);
+        $args     = [$post_id, $attempt];
+
+        if (!$post_id) {
+            return;
+        }
+
+        if ($attempt === 0) {
+            for ($retry = 1; $retry <= self::POST_SYNC_MAX_RETRIES; $retry++) {
+                wp_clear_scheduled_hook(self::POST_SYNC_HOOK, [$post_id, $retry]);
+            }
+        }
+
+        if (wp_next_scheduled(self::POST_SYNC_HOOK, $args)) {
+            return;
+        }
+
+        wp_schedule_single_event(time() + max(1, $delay), self::POST_SYNC_HOOK, $args);
+    }
+
+    /**
+     * Synchronize the latest post state from WP-Cron.
+     *
+     * @param int $post_id Post ID.
+     * @param int $attempt Retry attempt.
+     * @return void
+     */
+    public static function cron_sync_post(int $post_id, int $attempt = 0): void {
+        $post = get_post($post_id);
+
+        if ($post && EC_Rag_Utils::is_public_article($post)) {
+            if (!self::is_enabled()) {
+                return;
+            }
+
+            $response = self::ingest_article(EC_Rag_Utils::article_from_post($post));
+            $operation = 'upload';
+        } else {
+            $response = self::delete_snapshot($post_id);
+            $operation = 'delete';
+        }
+
+        if (!is_wp_error($response)) {
+            return;
+        }
+
+        EC_Rag_Logger::log(
+            sprintf(
+                'Post %d %s failed on background attempt %d: %s',
+                $post_id,
+                $operation,
+                $attempt + 1,
+                $response->get_error_message()
+            ),
+            'post_sync',
+            2
+        );
+
+        if ($attempt < self::POST_SYNC_MAX_RETRIES) {
+            $retry_delay = min(HOUR_IN_SECONDS, MINUTE_IN_SECONDS * (2 ** $attempt));
+            self::schedule_post_sync($post_id, $attempt + 1, $retry_delay);
+        }
     }
 
     /**
@@ -348,7 +436,14 @@ class EC_Rag_Ingestion {
                 continue;
             }
 
-            fwrite($handle, wp_json_encode($article) . "\n");
+            $encoded = wp_json_encode($article);
+            if ($encoded === false || fwrite($handle, $encoded . "\n") === false) {
+                $reader->close();
+                fclose($handle);
+                wp_delete_file($queue_path);
+
+                return new WP_Error('ec_rag_queue_write_error', __('Cannot write import queue.', 'ec-rag'));
+            }
             $total++;
         }
 
@@ -356,16 +451,32 @@ class EC_Rag_Ingestion {
         fclose($handle);
 
         $state = [
-            'status'      => $total > 0 ? 'queued' : 'empty',
-            'queue_path'  => $queue_path,
-            'created_at'  => current_time('mysql'),
-            'total'       => $total,
-            'processed'   => 0,
-            'succeeded'   => 0,
-            'failed'      => 0,
-            'errors'      => [],
+            'status'       => $total > 0 ? 'queued' : 'empty',
+            'queue_path'   => $queue_path,
+            'queue_offset' => 0,
+            'created_at'   => current_time('mysql'),
+            'total'        => $total,
+            'processed'    => 0,
+            'succeeded'    => 0,
+            'failed'       => 0,
+            'errors'       => [],
         ];
 
+        $previous_state = self::get_import_state();
+        $previous_path  = is_array($previous_state) ? ($previous_state['queue_path'] ?? '') : '';
+        if ($previous_path
+            && $previous_path !== $queue_path
+            && is_file($previous_path)
+            && !wp_delete_file($previous_path)) {
+            wp_delete_file($queue_path);
+
+            return new WP_Error(
+                'ec_rag_previous_queue_delete_error',
+                __('Cannot replace the previous import queue. Clear it and retry.', 'ec-rag')
+            );
+        }
+
+        wp_clear_scheduled_hook(self::CRON_HOOK);
         self::save_import_state($state);
 
         return $state;
@@ -421,32 +532,67 @@ class EC_Rag_Ingestion {
      */
     public static function process_import_batch() {
         $state = self::get_import_state();
-        if (!$state || empty($state['queue_path']) || !is_readable($state['queue_path'])) {
-            return new WP_Error('ec_rag_no_import_queue', __('No readable import queue.', 'ec-rag'));
+        if ($state && ($state['status'] ?? '') === 'completed') {
+            return true;
         }
 
-        if (($state['status'] ?? '') === 'completed') {
-            return true;
+        if (!$state || empty($state['queue_path']) || !is_readable($state['queue_path'])) {
+            return new WP_Error('ec_rag_no_import_queue', __('No readable import queue.', 'ec-rag'));
         }
 
         $options    = EC_Rag_Options::get();
         $batch_size = max(1, min(50, absint($options['ingestion_batch_size'] ?? 10)));
         $processed  = absint($state['processed'] ?? 0);
+        $total      = absint($state['total'] ?? 0);
 
-        $lines = file($state['queue_path'], FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if (!is_array($lines)) {
+        if ($processed >= $total) {
+            self::complete_import($state);
+
+            return true;
+        }
+
+        $queue = fopen($state['queue_path'], 'r');
+        if (!$queue) {
             return new WP_Error('ec_rag_queue_read_error', __('Cannot read import queue.', 'ec-rag'));
         }
 
-        $state['status'] = 'running';
-        $end  = min(count($lines), $processed + $batch_size);
+        $queue_offset = absint($state['queue_offset'] ?? 0);
+        if ($queue_offset > 0) {
+            if (fseek($queue, $queue_offset) !== 0) {
+                fclose($queue);
 
-        for ($i = $processed; $i < $end; $i++) {
-            $article = json_decode($lines[$i], true);
+                return new WP_Error('ec_rag_queue_seek_error', __('Cannot resume import queue.', 'ec-rag'));
+            }
+        } elseif ($processed > 0) {
+            // Backward compatibility for queues created before byte offsets
+            // were persisted: advance line-by-line without loading the file.
+            for ($skipped = 0; $skipped < $processed; $skipped++) {
+                if (fgets($queue) === false) {
+                    fclose($queue);
+
+                    return new WP_Error('ec_rag_queue_seek_error', __('Cannot resume import queue.', 'ec-rag'));
+                }
+            }
+        }
+
+        $state['status'] = 'running';
+        $batch_processed = 0;
+
+        while ($batch_processed < $batch_size && $processed < $total) {
+            $raw_line = fgets($queue);
+            if ($raw_line === false) {
+                break;
+            }
+
+            $line = trim($raw_line);
+            $processed++;
+            $batch_processed++;
+
+            $article = $line !== '' ? json_decode($line, true) : null;
             if (!is_array($article)) {
                 $state['failed']    = absint($state['failed'] ?? 0) + 1;
-                $state['errors'][] = 'Invalid queue item at line ' . ($i + 1);
-                $state['processed']  = $i + 1;
+                $state['errors'][] = 'Invalid queue item at line ' . $processed;
+                $state['processed']  = $processed;
                 continue;
             }
 
@@ -459,19 +605,56 @@ class EC_Rag_Ingestion {
                 $state['succeeded'] = absint($state['succeeded'] ?? 0) + 1;
             }
 
-            $state['processed'] = $i + 1;
+            $state['processed'] = $processed;
+        }
+
+        $next_offset = ftell($queue);
+        if ($next_offset !== false) {
+            $state['queue_offset'] = $next_offset;
+        }
+        $ended_early = feof($queue) && $processed < $total;
+        fclose($queue);
+
+        if ($ended_early) {
+            $missing = $total - $processed;
+            $state['failed'] = absint($state['failed'] ?? 0) + $missing;
+            $state['errors'][] = sprintf('Import queue ended %d item(s) early.', $missing);
+            $processed = $total;
+            $state['processed'] = $processed;
         }
 
         $state['errors'] = array_slice($state['errors'] ?? [], -20);
-        $state['status'] = $state['processed'] >= count($lines) ? 'completed' : 'queued';
+        if ($processed >= $total) {
+            self::complete_import($state);
 
-        self::save_import_state($state);
-
-        if ($state['status'] !== 'completed') {
-            self::schedule_import();
+            return true;
         }
 
+        $state['status'] = 'queued';
+        self::save_import_state($state);
+        self::schedule_import();
+
         return true;
+    }
+
+    /**
+     * Mark an import complete and remove its local queue file.
+     *
+     * @param array $state Import state.
+     * @return void
+     */
+    protected static function complete_import(array $state): void {
+        $queue_path = $state['queue_path'] ?? '';
+        if ($queue_path && is_file($queue_path) && !wp_delete_file($queue_path)) {
+            $state['errors'][] = __('Import completed, but the local queue file could not be deleted.', 'ec-rag');
+        } else {
+            $state['queue_path'] = '';
+        }
+
+        $state['errors'] = array_slice($state['errors'] ?? [], -20);
+        $state['status'] = 'completed';
+        wp_clear_scheduled_hook(self::CRON_HOOK);
+        self::save_import_state($state);
     }
 
     /**

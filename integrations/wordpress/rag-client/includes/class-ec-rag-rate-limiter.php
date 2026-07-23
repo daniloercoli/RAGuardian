@@ -25,8 +25,13 @@ class EC_Rag_Rate_Limiter {
         $max_requests = max(1, $max_requests);
         $window_secs  = max(10, $window_seconds);
 
-        $identity  = md5(EC_Rag_Utils::client_ip() . '|' . EC_Rag_Utils::conversation_id_from_request());
-        $key       = 'ec_rag_rl_' . md5($action . '|' . $identity);
+        // Never include the client-controlled conversation ID in the bucket key:
+        // callers could otherwise rotate it to bypass every configured limit.
+        $identity = is_user_logged_in()
+            ? 'user:' . absint(get_current_user_id())
+            : 'ip:' . EC_Rag_Utils::client_ip();
+        $identity = (string) apply_filters('ec_rag_rate_limit_identity', $identity, $action);
+        $key      = 'ec_rag_rl_' . md5($action . '|' . $identity);
 
         $bucket = get_transient($key);
         $now    = time();

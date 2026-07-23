@@ -77,8 +77,8 @@ The chat header includes compact controls for downloading the current conversati
 The plugin has two article ingestion sources plus a local batching step:
 
 1. **Initial import from WordPress export**: In WordPress, go to **Tools -> Export**, download the standard WordPress XML/WXR export, then upload it in **Settings -> Raguardian -> Initial WordPress export import**. The plugin parses the WXR file, extracts only public `post` articles, ignores password-protected content, author records, author emails, comments, user data, and post meta, and stores a local JSONL queue of sanitized text snapshots.
-2. **Queued batch processing**: Import work is processed in small WordPress cron batches, with a manual **Process next batch** fallback in the settings page. This avoids one long blocking request for large sites.
-3. **Live synchronization**: When **Keep public articles synchronized** is enabled, WordPress hooks update RAGuardian when a public article is published, updated, unpublished, password-protected, or deleted.
+2. **Queued batch processing**: Import work is processed in small WordPress cron batches, with a manual **Process next batch** fallback in the settings page. Each batch seeks directly to its position in the JSONL queue instead of loading the whole export into memory; the local queue file is deleted when processing completes.
+3. **Live synchronization**: When **Keep public articles synchronized** is enabled, WordPress hooks enqueue a background WP-Cron job when a public article is published, updated, unpublished, password-protected, or deleted. Editorial save requests therefore do not wait for the remote RAG service.
 
 Snapshots are uploaded to RAGuardian with stable paths such as:
 
@@ -206,6 +206,8 @@ Every query can include safe page metadata:
 - post type;
 - WordPress locale;
 - global admin context and optional shortcode context.
+
+The page URL is sent without its query string so reset tokens, campaign parameters, email addresses, and other URL parameters are not forwarded to RAGuardian.
 
 This context is sent from WordPress to RAGuardian in `client_context`. It is used only in the model prompt, is never indexed, and is not returned as a source.
 

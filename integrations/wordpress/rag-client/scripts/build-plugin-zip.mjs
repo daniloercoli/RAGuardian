@@ -1,5 +1,5 @@
 import {execFileSync} from "node:child_process";
-import {cpSync, existsSync, mkdirSync, rmSync} from "node:fs";
+import {cpSync, existsSync, mkdirSync, readFileSync, rmSync} from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -9,6 +9,19 @@ const distDir = path.join(pluginRoot, "dist");
 const stagingRoot = path.join(distDir, "staging");
 const stagingPlugin = path.join(stagingRoot, "rag-client");
 const zipPath = path.join(distDir, "rag-client.zip");
+
+const packageVersion = JSON.parse(readFileSync(path.join(pluginRoot, "package.json"), "utf8")).version;
+const pluginHeader = readFileSync(path.join(pluginRoot, "rag-client.php"), "utf8");
+const versionFile = readFileSync(path.join(pluginRoot, "includes", "version.php"), "utf8");
+const headerVersion = pluginHeader.match(/^\s*\*\s*Version:\s*(\S+)/m)?.[1];
+const constantVersion = versionFile.match(/EC_RAG_VERSION',\s*'([^']+)'/)?.[1];
+
+if (!packageVersion || packageVersion !== headerVersion || packageVersion !== constantVersion) {
+  throw new Error(
+    `Plugin version mismatch: package=${packageVersion || "missing"}, `
+    + `header=${headerVersion || "missing"}, constant=${constantVersion || "missing"}`,
+  );
+}
 
 const entries = [
   "assets",

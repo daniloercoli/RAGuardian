@@ -94,10 +94,15 @@ class EC_Rag_Utils {
      */
     public static function page_context(): array {
         $post = get_queried_object();
+        $request_uri = wp_unslash($_SERVER['REQUEST_URI'] ?? '/');
+        $page_path   = parse_url($request_uri, PHP_URL_PATH);
+        $page_path   = is_string($page_path) && $page_path !== '' ? $page_path : '/';
 
         return [
             'page_title'  => $post ? get_the_title($post) : wp_get_document_title(),
-            'page_url'    => home_url(add_query_arg([], $_SERVER['REQUEST_URI'] ?? '')),
+            // Do not forward query parameters: they can contain reset tokens,
+            // email addresses, campaign identifiers, or other personal data.
+            'page_url'    => esc_url_raw(home_url($page_path)),
             'post_type'   => $post ? $post->post_type : '',
             'locale'      => determine_locale(),
         ];

@@ -67,6 +67,15 @@ async function configurePlugin(page, options = {}) {
     await setCheckbox(page, 'input[name="ec_rag_client_options[ingest_public_posts]"]', options.liveIngestion ?? true);
     await setCheckbox(page, 'input[name="ec_rag_client_options[enable_tts]"]', options.tts ?? false);
     await setCheckbox(page, 'input[name="ec_rag_client_options[enable_audio_upload]"]', options.audio ?? false);
+    await setCheckbox(page, 'input[name="ec_rag_client_options[show_sources]"]', options.showSources ?? true);
+    await page.fill(
+        'input[name="ec_rag_client_options[rate_limit_requests]"]',
+        String(options.rateLimit ?? 10),
+    );
+    await page.fill(
+        'input[name="ec_rag_client_options[rate_limit_window]"]',
+        String(options.rateLimitWindow ?? 60),
+    );
     await page.click("#submit");
     await expect(page.locator(".notice-success, #setting-error-settings_updated")).toBeVisible();
 }
@@ -88,6 +97,7 @@ function wpCli(args) {
 
 test.beforeEach(async () => {
     await resetFakeRag();
+    wpCli(["transient", "delete", "--all"]);
 });
 
 test.beforeAll(() => {
@@ -108,7 +118,7 @@ test("admin can configure the plugin and test RAG health", async ({page}) => {
 test("guest visitor can use the chatbot without seeing the API key", async ({page}) => {
     await configurePlugin(page, {allowGuest: true});
     await page.context().clearCookies();
-    await page.goto("/");
+    await page.goto("/?reset_token=must-not-leave-wordpress");
     await page.locator(".ec-rag-launcher").click({force: true});
     await page.locator("[data-ec-rag-input]").fill("What is in the knowledge base?");
     await page.locator(".ec-rag-form button[type='submit']").click({force: true});
@@ -117,7 +127,87 @@ test("guest visitor can use the chatbot without seeing the API key", async ({pag
     const pageHtml = await page.content();
     expect(pageHtml).not.toContain("wp-e2e-key");
     const requests = await fakeRagRequests();
-    expect(requests.some((request) => request.type === "query" && request.body.query === "What is in the knowledge base?")).toBe(true);
+    const queryRequest = requests.find(
+        (request) => request.type === "query" && request.body.query === "What is in the knowledge base?",
+    );
+    expect(queryRequest).toBeTruthy();
+    expect(queryRequest.body.client_context.page_url).not.toContain("reset_token");
+});
+
+test("disabled sources are removed from the AJAX response", async ({page}) => {
+    await configurePlugin(page, {allowGuest: true, showSources: false});
+    await page.context().clearCookies();
+    await page.goto("/");
+    await page.locator(".ec-rag-launcher").click({force: true});
+    await page.locator("[data-ec-rag-input]").fill("Hide the source metadata");
+
+    const responsePromise = page.waitForResponse((response) => (
+        response.url().includes("/wp-admin/admin-ajax.php")
+        && (response.request().postData() || "").includes("action=ec_rag_query")
+    ));
+    await page.locator(".ec-rag-form button[type='submit']").click({force: true});
+
+    const ajaxResponse = await responsePromise;
+    const payload = await ajaxResponse.json();
+    expect(payload.success).toBe(true);
+    expect(payload.data.sources).toBeUndefined();
+    await expect(page.locator(".ec-rag-sources")).toHaveCount(0);
+});
+
+test("rotating conversation IDs does not bypass guest rate limits", async ({page}) => {
+    await configurePlugin(page, {allowGuest: true, rateLimit: 1});
+    await page.context().clearCookies();
+    await page.goto("/");
+    const nonce = await page.evaluate(() => window.ecRagClient.nonce);
+    const endpoint = "/wp-admin/admin-ajax.php";
+
+    const first = await page.request.post(endpoint, {
+        form: {
+            action: "ec_rag_query",
+            nonce,
+            query: "First allowed request",
+            conversation_id: "conversation-one",
+        },
+    });
+    expect(first.status()).toBe(200);
+
+    const second = await page.request.post(endpoint, {
+        form: {
+            action: "ec_rag_query",
+            nonce,
+            query: "Second blocked request",
+            conversation_id: "conversation-two",
+        },
+    });
+    expect(second.status()).toBe(429);
+    expect((await second.json()).success).toBe(false);
+});
+
+test("guest TTS and audio upload proxy through WordPress", async ({page}) => {
+    await configurePlugin(page, {allowGuest: true, tts: true, audio: true});
+    await page.context().clearCookies();
+    await page.goto("/");
+    await page.locator(".ec-rag-launcher").click({force: true});
+    await page.locator("[data-ec-rag-input]").fill("Read this answer aloud");
+    await page.locator(".ec-rag-form button[type='submit']").click({force: true});
+    await expect(page.getByText(/Fake RAG answer for:/i)).toBeVisible();
+
+    await page.getByRole("button", {name: "Listen"}).click({force: true});
+    await waitForFakeRag((entries) => entries.some((entry) => entry.type === "tts"));
+
+    await page.locator("[data-ec-rag-audio]").setInputFiles({
+        name: "sample.wav",
+        mimeType: "audio/wav",
+        buffer: Buffer.from("RIFF-fake-wave-data"),
+    });
+    await expect(page.getByText(/Audio queued for transcription/i)).toBeVisible();
+
+    const requests = await fakeRagRequests();
+    expect(requests.some((entry) => entry.type === "tts")).toBe(true);
+    expect(requests.some((entry) => (
+        entry.type === "audio_upload"
+        && entry.multipart.file.filename === "sample.wav"
+    ))).toBe(true);
 });
 
 test("initial WXR import queues only public articles", async ({page}) => {
@@ -135,6 +225,10 @@ test("initial WXR import queues only public articles", async ({page}) => {
     expect(uploads[0].multipart.file.text).toContain("Public Article One");
     expect(uploads[0].multipart.file.text).not.toContain("Draft Article");
     expect(uploads[0].multipart.file.text).not.toContain("Password Protected Article");
+
+    const state = JSON.parse(wpCli(["option", "get", "ec_rag_client_import_state", "--format=json"]));
+    expect(state.status).toBe("completed");
+    expect(state.queue_path).toBe("");
 });
 
 test("live publish and unpublish hooks sync public posts", async ({page}) => {
@@ -150,12 +244,14 @@ test("live publish and unpublish hooks sync public posts", async ({page}) => {
         "--post_content=Live article body for RAG.",
         "--porcelain",
     ]);
+    wpCli(["cron", "event", "run", "ec_rag_sync_post"]);
 
     let requests = await waitForFakeRag((entries) => entries.some((entry) => entry.type === "file_upload"));
     expect(requests.some((entry) => entry.type === "file_upload" && entry.multipart.fields.relative_path === `wordpress/posts/post-${postId}.txt`)).toBe(true);
 
     await resetFakeRag();
     wpCli(["post", "update", postId, "--post_status=draft"]);
+    wpCli(["cron", "event", "run", "ec_rag_sync_post"]);
     requests = await waitForFakeRag((entries) => entries.some((entry) => entry.type === "file_delete"));
     expect(requests.some((entry) => entry.type === "file_delete" && entry.filename === `wordpress/posts/post-${postId}.txt`)).toBe(true);
 });

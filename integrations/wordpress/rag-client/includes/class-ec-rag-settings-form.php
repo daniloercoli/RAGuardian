@@ -132,7 +132,11 @@ class EC_Rag_Settings_Form {
                         name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[api_key]"
                         value="<?php echo esc_attr($options['api_key'] ?? ''); ?>">
                     <p class="description">
-                        <?php esc_html_e('Required scopes: <code>query</code> for chat, <code>ingest</code> for article import/sync, <code>speech</code> for TTS or audio.', 'ec-rag'); ?>
+                        <?php
+                        echo wp_kses_post(
+                            __('Required scopes: <code>query</code> for chat and health, <code>ingest</code> for article import/sync and audio upload, <code>speech</code> for TTS.', 'ec-rag')
+                        );
+                        ?>
                     </p>
                 </td>
             </tr>

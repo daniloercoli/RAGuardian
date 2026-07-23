@@ -81,6 +81,12 @@ class EC_Rag_Ajax {
             wp_send_json_error(['message' => $response->get_error_message()], 502);
         }
 
+        // Source visibility is a server-side policy. Hiding sources only in
+        // JavaScript would still expose filenames/snippets in the AJAX body.
+        if (($options['show_sources'] ?? '0') !== '1' && is_array($response)) {
+            unset($response['sources']);
+        }
+
         wp_send_json_success($response);
     }
 

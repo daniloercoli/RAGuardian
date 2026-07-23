@@ -5,6 +5,12 @@
 
 define('ABSPATH', dirname(__DIR__));
 define('EC_RAG_TESTING', true);
+if (!defined('MINUTE_IN_SECONDS')) {
+    define('MINUTE_IN_SECONDS', 60);
+}
+if (!defined('HOUR_IN_SECONDS')) {
+    define('HOUR_IN_SECONDS', 3600);
+}
 require_once dirname(__DIR__) . '/vendor/autoload.php';
 
 // Stub plugin_dir_path so the autoloader works.
@@ -37,6 +43,11 @@ if (!function_exists('sanitize_hex_color')) {
 if (!function_exists('sanitize_textarea_field')) {
     function sanitize_textarea_field($value) { return trim(strip_tags($value)); }
 }
+if (!function_exists('sanitize_file_name')) {
+    function sanitize_file_name($value) {
+        return preg_replace('/[^A-Za-z0-9._-]/', '-', basename((string) $value));
+    }
+}
 if (!function_exists('wp_strip_all_tags')) {
     function wp_strip_all_tags($value, $_ = false) { return strip_tags($value); }
 }
@@ -61,13 +72,33 @@ if (!function_exists('absint')) {
     function absint($value) { return abs((int) $value); }
 }
 if (!function_exists('get_option')) {
-    function get_option($key, $default = false) { return $default; }
+    function get_option($key, $default = false) {
+        return array_key_exists($key, $GLOBALS['ec_rag_test_options'] ?? [])
+            ? $GLOBALS['ec_rag_test_options'][$key]
+            : $default;
+    }
 }
 if (!function_exists('update_option')) {
-    function update_option($key, $value, $autoload = null) { return true; }
+    function update_option($key, $value, $autoload = null) {
+        $GLOBALS['ec_rag_test_options'][$key] = $value;
+        return true;
+    }
 }
 if (!function_exists('delete_option')) {
-    function delete_option($key) { return true; }
+    function delete_option($key) {
+        unset($GLOBALS['ec_rag_test_options'][$key]);
+        return true;
+    }
+}
+if (!function_exists('is_user_logged_in')) {
+    function is_user_logged_in() {
+        return !empty($GLOBALS['ec_rag_test_user_id']);
+    }
+}
+if (!function_exists('get_current_user_id')) {
+    function get_current_user_id() {
+        return (int) ($GLOBALS['ec_rag_test_user_id'] ?? 0);
+    }
 }
 if (!function_exists('set_transient')) {
     function set_transient($key, $value, $ttl) {
@@ -88,6 +119,53 @@ if (!function_exists('get_transient')) {
             return false;
         }
         return $GLOBALS['ec_rag_test_transients'][$key]['value'];
+    }
+}
+if (!function_exists('wp_next_scheduled')) {
+    function wp_next_scheduled($hook, $args = []) {
+        foreach ($GLOBALS['ec_rag_test_scheduled_events'] ?? [] as $event) {
+            if ($event['hook'] === $hook && $event['args'] === $args) {
+                return $event['timestamp'];
+            }
+        }
+        return false;
+    }
+}
+if (!function_exists('wp_schedule_single_event')) {
+    function wp_schedule_single_event($timestamp, $hook, $args = []) {
+        $GLOBALS['ec_rag_test_scheduled_events'][] = [
+            'timestamp' => (int) $timestamp,
+            'hook'      => $hook,
+            'args'      => $args,
+        ];
+        return true;
+    }
+}
+if (!function_exists('wp_clear_scheduled_hook')) {
+    function wp_clear_scheduled_hook($hook, $args = []) {
+        $GLOBALS['ec_rag_test_scheduled_events'] = array_values(
+            array_filter(
+                $GLOBALS['ec_rag_test_scheduled_events'] ?? [],
+                fn ($event) => $event['hook'] !== $hook || $event['args'] !== $args
+            )
+        );
+        return 1;
+    }
+}
+if (!function_exists('wp_unschedule_hook')) {
+    function wp_unschedule_hook($hook) {
+        $GLOBALS['ec_rag_test_scheduled_events'] = array_values(
+            array_filter(
+                $GLOBALS['ec_rag_test_scheduled_events'] ?? [],
+                fn ($event) => $event['hook'] !== $hook
+            )
+        );
+        return 1;
+    }
+}
+if (!function_exists('wp_delete_file')) {
+    function wp_delete_file($path) {
+        return is_file($path) ? unlink($path) : false;
     }
 }
 if (!function_exists('wp_json_encode')) {
