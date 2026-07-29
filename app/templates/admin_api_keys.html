@@ -97,6 +97,28 @@
                             <input type="checkbox" name="scopes" value="speech">
                             Speech
                         </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="scopes" value="kb_manage">
+                            KB Manage
+                        </label>
+                    </div>
+                </fieldset>
+                <fieldset class="scope-field">
+                    <legend>Knowledge bases</legend>
+                    <div class="scope-options" id="createKeyKnowledgeBases">
+                        {% for user in users %}
+                            {% for kb in knowledge_bases_by_user.get(user.id, []) %}
+                                <label class="checkbox-label" data-api-key-user="{{ user.id }}">
+                                    <input
+                                        type="checkbox"
+                                        name="knowledge_base_ids"
+                                        value="{{ kb.id }}"
+                                        {% if kb.is_default %}checked{% endif %}
+                                    >
+                                    {{ user.email }} · {{ kb.name }}
+                                </label>
+                            {% endfor %}
+                        {% endfor %}
                     </div>
                 </fieldset>
                 <label>
@@ -127,6 +149,7 @@
                             <th>Description</th>
                             <th>Key</th>
                             <th>Scopes</th>
+                            <th>Knowledge Bases</th>
                             <th>Status</th>
                             <th>Expires</th>
                             <th>Created</th>
@@ -152,6 +175,13 @@
                                         <span class="badge">{{ scope }}</span>
                                     {% endfor %}
                                 </td>
+                                <td data-label="Knowledge bases">
+                                    {% for kb_id in key.knowledge_base_ids %}
+                                        <span class="badge">{{ kb_id }}</span>
+                                    {% else %}
+                                        <span class="muted">none</span>
+                                    {% endfor %}
+                                </td>
                                 <td data-label="Status">
                                     <span class="status-pill {{ 'indexed' if key.enabled else 'empty' }}">
                                         {{ "enabled" if key.enabled else "disabled" }}
@@ -169,6 +199,27 @@
                                         <input type="hidden" name="key_name" value="{{ key.name }}">
                                         <button type="submit" class="secondary">{{ "Disable" if key.enabled else "Enable" }}</button>
                                     </form>
+                                    <details>
+                                        <summary>Edit access</summary>
+                                        <form method="post" class="form-grid compact">
+                                            <input type="hidden" name="action" value="update_access">
+                                            <input type="hidden" name="user_id" value="{{ key.user_id }}">
+                                            <input type="hidden" name="key_name" value="{{ key.name }}">
+                                            {% for scope in ["query", "ingest", "speech", "kb_manage"] %}
+                                                <label class="checkbox-label">
+                                                    <input type="checkbox" name="scopes" value="{{ scope }}" {% if scope in key.scopes %}checked{% endif %}>
+                                                    {{ scope }}
+                                                </label>
+                                            {% endfor %}
+                                            {% for kb in knowledge_bases_by_user.get(key.user_id, []) %}
+                                                <label class="checkbox-label">
+                                                    <input type="checkbox" name="knowledge_base_ids" value="{{ kb.id }}" {% if kb.id in key.knowledge_base_ids %}checked{% endif %}>
+                                                    {{ kb.name }}
+                                                </label>
+                                            {% endfor %}
+                                            <button type="submit" class="secondary">Save access</button>
+                                        </form>
+                                    </details>
                                     <form method="post" data-delete-api-key data-key-name="{{ key.name }}">
                                         <input type="hidden" name="action" value="delete">
                                         <input type="hidden" name="user_id" value="{{ key.user_id }}">
@@ -180,7 +231,7 @@
                             </tr>
                         {% else %}
                             <tr>
-                                <td colspan="11" class="empty-table-cell">
+                                <td colspan="12" class="empty-table-cell">
                                     <strong>No API keys yet</strong>
                                     <span>Create one above when an external integration needs access.</span>
                                 </td>
@@ -256,6 +307,20 @@
         </section>
     </div>
     <script>
+        const userSelect = document.querySelector('select[name="user_id"]');
+        const userKnowledgeBaseLabels = document.querySelectorAll("[data-api-key-user]");
+        function filterCreateKeyKnowledgeBases() {
+            if (!userSelect) return;
+            userKnowledgeBaseLabels.forEach((label) => {
+                const visible = label.dataset.apiKeyUser === userSelect.value;
+                label.hidden = !visible;
+                label.querySelector("input").disabled = !visible;
+            });
+        }
+        if (userSelect) {
+            userSelect.addEventListener("change", filterCreateKeyKnowledgeBases);
+            filterCreateKeyKnowledgeBases();
+        }
         document.querySelectorAll("[data-delete-api-key]").forEach((form) => {
             form.addEventListener("submit", (event) => {
                 const name = form.dataset.keyName || "this key";

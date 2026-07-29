@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <script src="{{ url_for('static', filename='csrf.js') }}"></script>
+    <title>Knowledge Bases - RAGuardian</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container wide">
+        {% set page_title = "Knowledge Bases" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
+
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <h2>Your knowledge bases</h2>
+                    <p class="muted">Documents, vector indexes, and data sources are isolated in each base.</p>
+                </div>
+                <button type="button" id="showCreateKbButton">Create knowledge base</button>
+            </div>
+            <form id="createKbForm" class="form-grid compact kb-editor" hidden>
+                <label>
+                    Name
+                    <input type="text" name="name" minlength="1" maxlength="120" required>
+                </label>
+                <label>
+                    Description
+                    <textarea name="description" maxlength="1000" rows="3"></textarea>
+                </label>
+                <div class="modal-actions">
+                    <button type="submit">Create</button>
+                    <button type="button" class="secondary" id="cancelCreateKbButton">Cancel</button>
+                </div>
+            </form>
+            <div id="kbNotice" class="notice" hidden></div>
+            <div id="knowledgeBaseList" class="knowledge-base-grid" aria-live="polite">
+                <p class="muted">Loading knowledge bases...</p>
+            </div>
+        </section>
+    </div>
+    <script src="{{ url_for('static', filename='knowledge_bases.js') }}"></script>
+</body>
+</html>

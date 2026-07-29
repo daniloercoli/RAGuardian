@@ -18,6 +18,7 @@ final class EC_Rag_Options_Tests extends TestCase {
         self::assertArrayHasKey('base_url', $defaults);
         self::assertArrayHasKey('api_key', $defaults);
         self::assertArrayHasKey('response_language', $defaults);
+        self::assertSame('', $defaults['knowledge_base_id']);
         self::assertSame('45', $defaults['request_timeout']);
         self::assertSame('auto', $defaults['response_language']);
     }
@@ -73,5 +74,21 @@ final class EC_Rag_Options_Tests extends TestCase {
         ]);
         self::assertSame('#ff0000', $result['primary_color']);
         self::assertSame('#00ff00', $result['text_color']);
+    }
+
+    public function test_sanitize_knowledge_base_id(): void {
+        $valid = 'kb_11111111111111111111111111111111';
+        self::assertSame(
+            $valid,
+            \EC_Rag_Options::sanitize(['knowledge_base_id' => $valid])['knowledge_base_id']
+        );
+        self::assertSame(
+            '',
+            \EC_Rag_Options::sanitize(['knowledge_base_id' => 'default'])['knowledge_base_id']
+        );
+        self::assertSame(
+            '',
+            \EC_Rag_Options::sanitize(['knowledge_base_id' => '../other'])['knowledge_base_id']
+        );
     }
 }

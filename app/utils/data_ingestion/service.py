@@ -8,14 +8,19 @@ from typing import Callable
 from utils.data_ingestion.base import IngestionItem, SyncContext
 from utils.data_ingestion.registry import available_plugins, get_ingester
 from utils.data_ingestion.storage import IngestionStorage
-from utils.document_indexer import index_saved_document, normalize_metadata_values
+from utils.document_indexer import index_staged_document, normalize_metadata_values
 from utils.file_index import FileIndex
+from utils.index_lock import DistributedLockLeaseLostError
 from utils.secret_store import SecretStore
 from utils.settings_store import SettingsStore
 from utils.validators import ValidationError
 
 
-def data_source_summaries(settings: dict, file_index_path: str) -> list[dict]:
+def data_source_summaries(
+    settings: dict,
+    file_index_path: str,
+    knowledge_base_id: str = "default",
+) -> list[dict]:
     entries = FileIndex(file_index_path).list()
     counts: dict[str, int] = {}
     for entry in entries:
@@ -25,6 +30,8 @@ def data_source_summaries(settings: dict, file_index_path: str) -> list[dict]:
     plugin_names = {plugin["id"]: plugin["display_name"] for plugin in available_plugins()}
     summaries = []
     for source in settings.get("data_sources", []):
+        if (source.get("knowledge_base_id") or "default") != knowledge_base_id:
+            continue
         summaries.append(
             {
                 **source,
@@ -44,6 +51,13 @@ def sync_data_source(
     store = SettingsStore(config["SETTINGS_FILE"])
     settings = store.load()
     source = _find_data_source(settings, data_source_id)
+    source_knowledge_base_id = source.get("knowledge_base_id") or "default"
+    if source_knowledge_base_id != config.get("KNOWLEDGE_BASE_ID", "default"):
+        raise ValidationError(
+            "Data source non trovata",
+            "data_source_id",
+            code="not_found",
+        )
     if not source.get("enabled", True):
         raise ValidationError("Data source disabilitata", "data_source_id")
 
@@ -75,11 +89,16 @@ def sync_data_source(
     for item in result.items:
         item_metadata = _item_metadata(source, ingester.plugin_id, item)
         try:
-            stored = storage.materialize_item(source["id"], item)
-            outcome = index_saved_document(
+            stored = storage.materialize_item(
+                source["id"],
+                item,
+                staged=True,
+            )
+            outcome = index_staged_document(
                 config,
                 stored["filename"],
                 stored["file_path"],
+                stored["staged_file_path"],
                 stored["extension"],
                 extra_metadata=item_metadata,
             )
@@ -87,6 +106,8 @@ def sync_data_source(
                 duplicates += 1
             else:
                 indexed += 1
+        except DistributedLockLeaseLostError:
+            raise
         except Exception as exc:
             errors.append({"remote_id": item.remote_id, "error": str(exc)})
         processed += 1
@@ -102,15 +123,21 @@ def sync_data_source(
                 }
             )
             try:
-                stored_attachment = storage.materialize_attachment(source["id"], item, attachment)
+                stored_attachment = storage.materialize_attachment(
+                    source["id"],
+                    item,
+                    attachment,
+                    staged=True,
+                )
                 if not stored_attachment:
                     processed += 1
                     report(attachment.filename)
                     continue
-                outcome = index_saved_document(
+                outcome = index_staged_document(
                     config,
                     stored_attachment["filename"],
                     stored_attachment["file_path"],
+                    stored_attachment["staged_file_path"],
                     stored_attachment["extension"],
                     extra_metadata=attachment_metadata,
                 )
@@ -118,6 +145,8 @@ def sync_data_source(
                     duplicates += 1
                 else:
                     indexed += 1
+            except DistributedLockLeaseLostError:
+                raise
             except Exception as exc:
                 errors.append({"remote_id": attachment.remote_id, "error": str(exc)})
             processed += 1
@@ -127,6 +156,7 @@ def sync_data_source(
     _update_data_source_state(
         store,
         source["id"],
+        knowledge_base_id=source_knowledge_base_id,
         cursor=result.cursor or source.get("cursor", {}),
         last_error=f"{len(errors)} errore/i durante la sync" if errors else "",
         last_sync_status=final_status,
@@ -136,6 +166,7 @@ def sync_data_source(
     return {
         "status": final_status,
         "data_source_id": source["id"],
+        "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
         "items": len(result.items),
         "processed": processed,
         "total": total,
@@ -150,6 +181,7 @@ def mark_data_source_sync_queued(config: dict, data_source_id: str) -> None:
     _update_data_source_state(
         SettingsStore(config["SETTINGS_FILE"]),
         data_source_id,
+        knowledge_base_id=config.get("KNOWLEDGE_BASE_ID", "default"),
         last_error="",
         last_sync_status="queued",
         schedule_next=True,
@@ -160,6 +192,7 @@ def mark_data_source_sync_running(config: dict, data_source_id: str) -> None:
     _update_data_source_state(
         SettingsStore(config["SETTINGS_FILE"]),
         data_source_id,
+        knowledge_base_id=config.get("KNOWLEDGE_BASE_ID", "default"),
         last_sync_status="running",
     )
 
@@ -168,6 +201,7 @@ def mark_data_source_sync_failed(config: dict, data_source_id: str, message: str
     _update_data_source_state(
         SettingsStore(config["SETTINGS_FILE"]),
         data_source_id,
+        knowledge_base_id=config.get("KNOWLEDGE_BASE_ID", "default"),
         last_error=message,
         last_sync_status="failed",
         touch_last_sync=True,
@@ -179,29 +213,47 @@ def toggle_data_source_enabled(
     store: SettingsStore,
     data_source_id: str,
     enabled: bool,
+    knowledge_base_id: str = "default",
 ) -> dict:
     """Enable or disable a data source."""
-    settings = store.load()
-    updated_sources = []
     matched: dict | None = None
     now = datetime.now(timezone.utc)
-    for source in settings.get("data_sources", []):
-        if source.get("id") == data_source_id:
-            source = {**source, "enabled": bool(enabled)}
-            if not enabled:
-                source["last_sync_status"] = "disabled"
-                source["next_sync_at"] = ""
-            elif source.get("sync_enabled") and source.get("sync_interval_seconds", 0) > 0:
-                source["next_sync_at"] = source.get("next_sync_at") or (
-                    now + timedelta(seconds=int(source["sync_interval_seconds"]))
-                ).isoformat(timespec="seconds")
-            else:
-                source["next_sync_at"] = ""
-            matched = source
-        updated_sources.append(source)
-    if matched is None:
-        raise ValidationError("Data source non trovata", "data_source_id", code="not_found")
-    store.save({**settings, "data_sources": updated_sources})
+
+    def mutate(settings: dict) -> None:
+        nonlocal matched
+        updated_sources = []
+        for source in settings.get("data_sources", []):
+            if (
+                source.get("id") == data_source_id
+                and (source.get("knowledge_base_id") or "default")
+                == knowledge_base_id
+            ):
+                source = {**source, "enabled": bool(enabled)}
+                if not enabled:
+                    source["last_sync_status"] = "disabled"
+                    source["next_sync_at"] = ""
+                elif (
+                    source.get("sync_enabled")
+                    and source.get("sync_interval_seconds", 0) > 0
+                ):
+                    source["next_sync_at"] = source.get("next_sync_at") or (
+                        now + timedelta(
+                            seconds=int(source["sync_interval_seconds"])
+                        )
+                    ).isoformat(timespec="seconds")
+                else:
+                    source["next_sync_at"] = ""
+                matched = source
+            updated_sources.append(source)
+        if matched is None:
+            raise ValidationError(
+                "Data source non trovata",
+                "data_source_id",
+                code="not_found",
+            )
+        settings["data_sources"] = updated_sources
+
+    store.mutate(mutate)
     return matched
 
 
@@ -241,6 +293,7 @@ def _update_data_source_state(
     store: SettingsStore,
     data_source_id: str,
     *,
+    knowledge_base_id: str | None = None,
     cursor: dict | None = None,
     last_error: str | None = None,
     last_sync_status: str | None = None,
@@ -248,28 +301,38 @@ def _update_data_source_state(
     touch_last_sync: bool = False,
     schedule_next: bool = False,
 ) -> None:
-    settings = store.load()
-    updated_sources = []
     now = datetime.now(timezone.utc)
-    for source in settings.get("data_sources", []):
-        if source.get("id") == data_source_id:
-            source = {
-                **source,
-            }
-            if cursor is not None:
-                source["cursor"] = cursor or {}
-            if touch_last_sync:
-                source["last_sync"] = now.isoformat(timespec="seconds")
-            if last_error is not None:
-                source["last_error"] = last_error
-            if last_sync_status is not None:
-                source["last_sync_status"] = last_sync_status
-            if next_sync_at is not None:
-                source["next_sync_at"] = next_sync_at
-            elif schedule_next:
-                source["next_sync_at"] = _next_sync_at(source, now)
-        updated_sources.append(source)
-    store.save({**settings, "data_sources": updated_sources})
+
+    def mutate(settings: dict) -> None:
+        updated_sources = []
+        for source in settings.get("data_sources", []):
+            source_knowledge_base_id = (
+                source.get("knowledge_base_id") or "default"
+            )
+            if (
+                source.get("id") == data_source_id
+                and (
+                    knowledge_base_id is None
+                    or source_knowledge_base_id == knowledge_base_id
+                )
+            ):
+                source = {**source}
+                if cursor is not None:
+                    source["cursor"] = cursor or {}
+                if touch_last_sync:
+                    source["last_sync"] = now.isoformat(timespec="seconds")
+                if last_error is not None:
+                    source["last_error"] = last_error
+                if last_sync_status is not None:
+                    source["last_sync_status"] = last_sync_status
+                if next_sync_at is not None:
+                    source["next_sync_at"] = next_sync_at
+                elif schedule_next:
+                    source["next_sync_at"] = _next_sync_at(source, now)
+            updated_sources.append(source)
+        settings["data_sources"] = updated_sources
+
+    store.mutate(mutate)
 
 
 def _next_sync_at(source: dict, now: datetime) -> str:

@@ -25,6 +25,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const fileErrorModal = document.getElementById("fileErrorModal");
     const fileErrorModalMessage = document.getElementById("fileErrorModalMessage");
     const closeFileErrorModalButton = document.getElementById("closeFileErrorModalButton");
+    const knowledgeBaseId = (
+        new FormData(form).get("knowledge_base_id") || "default"
+    ).toString();
 
     if (!form || !fileInput || !folderInput || !startButton || !cancelButton || !progressPanel || !queueList) {
         return;
@@ -233,11 +236,14 @@ document.addEventListener("DOMContentLoaded", () => {
     async function pollRebuild(jobId) {
         let done = false;
         while (!done) {
-            const response = await fetch(`/admin/files/rebuild/${encodeURIComponent(jobId)}`, {
+            const query = new URLSearchParams({knowledge_base_id: knowledgeBaseId});
+            const response = await fetch(`/admin/files/rebuild/${encodeURIComponent(jobId)}` + `?${query.toString()}`,
+                {
                 method: "GET",
                 headers: {"Accept": "application/json"},
                 credentials: "same-origin"
-            });
+                }
+            );
             const job = await parseJsonResponse(response);
             if (!response.ok) {
                 throw new Error(job.error || response.statusText);
@@ -366,6 +372,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const formData = new FormData();
         formData.append("file", file, file.name);
         formData.append("relative_path", uploadItem.relativePath || file.name);
+        formData.append("knowledge_base_id", knowledgeBaseId);
         const endpoint = isAudioFile(file.name) ? "/api/v1/audio" : "/api/v1/files";
 
         const response = await fetch(endpoint, {

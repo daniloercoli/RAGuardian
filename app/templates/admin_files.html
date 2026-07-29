@@ -23,9 +23,23 @@
             {% endfor %}
         {% endwith %}
 
+        <form method="get" class="panel form-grid compact kb-page-selector">
+            <label>
+                Knowledge base
+                <select name="knowledge_base_id" onchange="this.form.submit()">
+                    {% for kb in knowledge_bases %}
+                        <option value="{{ kb.id }}" {% if kb.id == knowledge_base_id %}selected{% endif %}>
+                            {{ kb.name }}{% if kb.is_default %} (Default){% endif %}
+                        </option>
+                    {% endfor %}
+                </select>
+            </label>
+        </form>
+
         <section class="panel">
             <h2>Upload</h2>
             <form method="post" enctype="multipart/form-data" id="ragUploadForm" class="rag-upload-form">
+                <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                 <label class="upload-dropzone" for="ragFileInput">
                     <span class="upload-dropzone-title">Select files</span>
                     <span class="upload-dropzone-copy">Choose multiple PDF, TXT, Markdown, CSV, or audio files at once.</span>
@@ -103,7 +117,7 @@
                 </div>
             {% endif %}
             {% if index_status.needs_rebuild %}
-                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}">
+                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index', knowledge_base_id=knowledge_base_id) }}">
                     <button type="button" id="startRebuildButton" data-rebuild-trigger>Rebuild Index</button>
                     <p class="muted">
                         Delete and recreate the vector collection using the files on disk.
@@ -120,7 +134,7 @@
                     <code>{{ index_status.current_profile.embedding_model }}</code>,
                     chunk <code>{{ index_status.current_profile.chunk_size }}</code>/<code>{{ index_status.current_profile.chunk_overlap }}</code>.
                 </p>
-                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}"></div>
+                <div class="rebuild-index-actions" data-rebuild-url="{{ url_for('admin_rebuild_index', knowledge_base_id=knowledge_base_id) }}"></div>
             {% endif %}
         </section>
 
@@ -172,6 +186,7 @@
                         {% endfor %}
                     </select>
                     <input type="hidden" name="page" value="1">
+                    <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                 </form>
             </div>
             <p class="muted">
@@ -238,10 +253,11 @@
                                 <td class="actions-cell">
                                     <div class="table-actions">
                                         {% if file.status == "indexed" %}
-                                            <a class="secondary-link" href="{{ url_for('admin_download_file', filename=file.filename) }}">Download</a>
+                                            <a class="secondary-link" href="{{ url_for('admin_download_file', filename=file.filename, knowledge_base_id=knowledge_base_id) }}">Download</a>
                                         {% endif %}
                                         <form method="post" action="{{ url_for('admin_delete_file') }}">
                                             <input type="hidden" name="filename" value="{{ file.filename }}">
+                                            <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                                             <button type="submit" class="danger">Remove</button>
                                         </form>
                                     </div>
@@ -256,7 +272,7 @@
             {% if files_pagination.page_count > 1 %}
                 <nav class="pagination-nav" aria-label="Indexed files pages">
                     {% if files_pagination.has_prev %}
-                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.prev_page, per_page=files_pagination.per_page) }}">Previous</a>
+                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.prev_page, per_page=files_pagination.per_page, knowledge_base_id=knowledge_base_id) }}">Previous</a>
                     {% else %}
                         <span class="pagination-link disabled">Previous</span>
                     {% endif %}
@@ -264,11 +280,11 @@
                         {% if page_number == files_pagination.page %}
                             <span class="pagination-link active" aria-current="page">{{ page_number }}</span>
                         {% else %}
-                            <a class="pagination-link" href="{{ url_for('admin_files', page=page_number, per_page=files_pagination.per_page) }}">{{ page_number }}</a>
+                            <a class="pagination-link" href="{{ url_for('admin_files', page=page_number, per_page=files_pagination.per_page, knowledge_base_id=knowledge_base_id) }}">{{ page_number }}</a>
                         {% endif %}
                     {% endfor %}
                     {% if files_pagination.has_next %}
-                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.next_page, per_page=files_pagination.per_page) }}">Next</a>
+                        <a class="pagination-link" href="{{ url_for('admin_files', page=files_pagination.next_page, per_page=files_pagination.per_page, knowledge_base_id=knowledge_base_id) }}">Next</a>
                     {% else %}
                         <span class="pagination-link disabled">Next</span>
                     {% endif %}
@@ -282,7 +298,7 @@
                 Use this when you want to force a full re-index even if the embedding configuration has not changed.
                 This is separate from the rebuild warning above, which appears only when the current index is stale.
             </p>
-            <div class="rebuild-index-actions manual-rebuild-actions" data-rebuild-url="{{ url_for('admin_rebuild_index') }}">
+            <div class="rebuild-index-actions manual-rebuild-actions" data-rebuild-url="{{ url_for('admin_rebuild_index', knowledge_base_id=knowledge_base_id) }}">
                 <button type="button" id="manualRebuildButton" class="secondary" data-rebuild-trigger>Force Re-index All Files</button>
                 <p class="muted">
                     The current vector collection will be deleted and recreated from all tracked document/audio files on disk.

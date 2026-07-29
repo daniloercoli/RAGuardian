@@ -9,6 +9,7 @@ import secrets
 import tempfile
 import threading
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -19,6 +20,11 @@ from utils.file_lock import ProcessSafeFileLock
 
 
 USER_ROLES = {"admin", "user"}
+USER_DELETION_STATUSES = {"deleting", "delete_failed"}
+
+
+class UserDeletionPreflightError(RuntimeError):
+    """Raised when deletion is rejected before any user data is removed."""
 
 
 class UserStore:
@@ -100,6 +106,15 @@ class UserStore:
                 if "role" in patch and patch["role"] in USER_ROLES:
                     user["role"] = patch["role"]
                 if "enabled" in patch:
+                    if (
+                        patch["enabled"]
+                        and user.get("deletion_status")
+                        in USER_DELETION_STATUSES
+                    ):
+                        raise ValueError(
+                            "Un utente con cancellazione incompleta non può "
+                            "essere riabilitato; ripeti la cancellazione"
+                        )
                     user["enabled"] = bool(patch["enabled"])
                 if patch.get("password"):
                     user["password_hash"] = generate_password_hash(str(patch["password"]))
@@ -187,10 +202,12 @@ class UserStore:
         user_id: str,
         name: str,
         scopes: list[str],
+        knowledge_base_ids: list[str] | None = None,
         api_key_value: str | None = None,
         enabled: bool = True,
         description: str = "",
         expires_at: str | None = None,
+        validate: Callable[[], None] | None = None,
     ) -> dict:
         """Create a new API key for a user. Returns the key with masked value."""
         name = name.strip()
@@ -200,17 +217,21 @@ class UserStore:
             api_key_value = _generate_api_key()
         api_key_value = api_key_value.strip()
 
-        if not self.get(user_id):
-            raise ValueError("User not found")
-
         now = _now()
+        normalized_scopes = self._normalize_api_scopes(scopes)
+        normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(
+            knowledge_base_ids
+        )
+        if {"query", "ingest"} & set(normalized_scopes) and not normalized_knowledge_base_ids:
+            raise ValueError("At least one knowledge base is required for query or ingest")
         new_key = {
             "id": uuid.uuid4().hex,
             "name": name,
             "key_hash": api_key_hash(api_key_value),
             "key_prefix": api_key_value[:8],
             "key_suffix": api_key_value[-4:],
-            "scopes": self._normalize_api_scopes(scopes),
+            "scopes": normalized_scopes,
+            "knowledge_base_ids": normalized_knowledge_base_ids,
             "enabled": bool(enabled),
             "created_at": now,
             "last_used": "",
@@ -224,6 +245,8 @@ class UserStore:
             for usr in users:
                 if usr.get("id") != user_id:
                     continue
+                if validate is not None:
+                    validate()
                 existing = usr.get("api_keys") or []
                 if any(k.get("name") == new_key["name"] for k in existing):
                     raise ValueError(f"API key name '{new_key['name']}' already exists for this user")
@@ -231,12 +254,15 @@ class UserStore:
                 usr["updated_at"] = now
                 self._save_unlocked(users)
                 break
+            else:
+                raise ValueError("User not found")
 
         return {
             "name": new_key["name"],
             "key": api_key_value,
             "masked_key": _mask_api_key(api_key_value),
             "scopes": new_key["scopes"],
+            "knowledge_base_ids": new_key["knowledge_base_ids"],
             "enabled": new_key["enabled"],
             "created_at": new_key["created_at"],
             "description": new_key["description"],
@@ -288,13 +314,59 @@ class UserStore:
         before_delete: Callable[[dict], None] | None = None,
     ) -> bool:
         """Delete a user after an optional cleanup succeeds."""
+        if before_delete is None:
+            with self._lock:
+                users = self._list_unlocked()
+                if not any(user.get("id") == user_id for user in users):
+                    return False
+                users = [
+                    user for user in users if user.get("id") != user_id
+                ]
+                self._save_unlocked(users)
+                return True
+
         with self._lock:
             users = self._list_unlocked()
             target = next((user for user in users if user.get("id") == user_id), None)
             if target is None:
                 return False
-            if before_delete is not None:
-                before_delete(_public_user(target))
+            original_target = deepcopy(target)
+            target["enabled"] = False
+            target["deletion_status"] = "deleting"
+            target["deletion_error"] = ""
+            target["updated_at"] = _now()
+            self._save_unlocked(users)
+
+        try:
+            before_delete(_public_user(target))
+        except UserDeletionPreflightError:
+            with self._lock:
+                users = self._list_unlocked()
+                for index, current in enumerate(users):
+                    if current.get("id") == user_id:
+                        users[index] = original_target
+                        self._save_unlocked(users)
+                        break
+            raise
+        except Exception as exc:
+            with self._lock:
+                users = self._list_unlocked()
+                current = next(
+                    (user for user in users if user.get("id") == user_id),
+                    None,
+                )
+                if current is not None:
+                    current["enabled"] = False
+                    current["deletion_status"] = "delete_failed"
+                    current["deletion_error"] = str(exc)
+                    current["updated_at"] = _now()
+                    self._save_unlocked(users)
+            raise
+
+        with self._lock:
+            users = self._list_unlocked()
+            if not any(user.get("id") == user_id for user in users):
+                return False
             users = [user for user in users if user.get("id") != user_id]
             self._save_unlocked(users)
             return True
@@ -322,19 +394,27 @@ class UserStore:
             return None
 
     def migrate_legacy_api_keys(self) -> int:
-        """Hash API keys created by versions that stored raw values."""
+        """Hash legacy keys and make their default-only access explicit."""
         migrated = 0
         with self._lock:
             users = self._list_unlocked()
             for user in users:
                 for key in user.get("api_keys") or []:
+                    changed = False
+                    if not key.get("id"):
+                        key["id"] = uuid.uuid4().hex
+                        changed = True
                     raw = str(key.pop("key", "") or "")
-                    if not raw:
-                        continue
-                    key["key_hash"] = api_key_hash(raw)
-                    key["key_prefix"] = raw[:8]
-                    key["key_suffix"] = raw[-4:]
-                    migrated += 1
+                    if raw:
+                        key["key_hash"] = api_key_hash(raw)
+                        key["key_prefix"] = raw[:8]
+                        key["key_suffix"] = raw[-4:]
+                        changed = True
+                    if "knowledge_base_ids" not in key:
+                        key["knowledge_base_ids"] = ["default"]
+                        changed = True
+                    if changed:
+                        migrated += 1
             if migrated:
                 self._save_unlocked(users)
         return migrated
@@ -381,9 +461,220 @@ class UserStore:
                 return _public_api_key(key, user_id=user_id)
             return None
 
+    def update_api_key_knowledge_bases(
+        self,
+        *,
+        user_id: str,
+        key_name: str,
+        knowledge_base_ids: list[str],
+    ) -> dict | None:
+        normalized = self._normalize_knowledge_base_ids(knowledge_base_ids)
+        with self._lock:
+            users = self._list_unlocked()
+            for usr in users:
+                if usr.get("id") != user_id:
+                    continue
+                for key in (usr.get("api_keys") or []):
+                    if key.get("name") != key_name:
+                        continue
+                    scopes = set(key.get("scopes") or ["query"])
+                    if {"query", "ingest"} & scopes and not normalized:
+                        raise ValueError(
+                            "At least one knowledge base is required for query or ingest"
+                        )
+                    key["knowledge_base_ids"] = normalized
+                    usr["updated_at"] = _now()
+                    self._save_unlocked(users)
+                    return _public_api_key(key, user_id=user_id)
+                return None
+            return None
+
+    def update_api_key_access(
+        self,
+        *,
+        user_id: str,
+        key_name: str,
+        scopes: list[str],
+        knowledge_base_ids: list[str],
+        validate: Callable[[], None] | None = None,
+    ) -> dict | None:
+        """Atomically update scopes and KB grants after in-lock validation."""
+
+        normalized_scopes = self._normalize_api_scopes(scopes)
+        normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(
+            knowledge_base_ids
+        )
+        if (
+            {"query", "ingest"} & set(normalized_scopes)
+            and not normalized_knowledge_base_ids
+        ):
+            raise ValueError(
+                "At least one knowledge base is required for query or ingest"
+            )
+        with self._lock:
+            users = self._list_unlocked()
+            for usr in users:
+                if usr.get("id") != user_id:
+                    continue
+                for key in (usr.get("api_keys") or []):
+                    if key.get("name") != key_name:
+                        continue
+                    if validate is not None:
+                        validate()
+                    key["scopes"] = normalized_scopes
+                    key["knowledge_base_ids"] = normalized_knowledge_base_ids
+                    usr["updated_at"] = _now()
+                    self._save_unlocked(users)
+                    return _public_api_key(key, user_id=user_id)
+                return None
+            return None
+
+    def add_knowledge_base_to_api_key(
+        self,
+        *,
+        user_id: str,
+        key_name: str,
+        knowledge_base_id: str,
+        key_id: str | None = None,
+        required_scope: str | None = None,
+        validate: Callable[[], None] | None = None,
+    ) -> dict | None:
+        """Grant one KB without replacing grants added by concurrent writers."""
+        normalized_id = self._normalize_knowledge_base_ids(
+            [knowledge_base_id]
+        )[0]
+        with self._lock:
+            users = self._list_unlocked()
+            for usr in users:
+                if usr.get("id") != user_id:
+                    continue
+                for key in (usr.get("api_keys") or []):
+                    if key_id:
+                        if str(key.get("id") or "") != str(key_id):
+                            continue
+                    elif key.get("name") != key_name:
+                        continue
+                    if not key.get("enabled", True):
+                        return None
+                    if (
+                        required_scope
+                        and required_scope not in set(key.get("scopes") or [])
+                    ):
+                        return None
+                    if validate is not None:
+                        validate()
+                    allowed = self._normalize_knowledge_base_ids(
+                        key.get("knowledge_base_ids")
+                    )
+                    if normalized_id not in allowed:
+                        allowed.append(normalized_id)
+                        key["knowledge_base_ids"] = allowed
+                        usr["updated_at"] = _now()
+                        self._save_unlocked(users)
+                    return _public_api_key(key, user_id=user_id)
+                return None
+            return None
+
+    def ensure_api_key_knowledge_base_ids(
+        self,
+        *,
+        default_knowledge_base_id: str = "default",
+        user_ids: set[str] | None = None,
+    ) -> int:
+        """Make legacy API-key KB grants explicit under the users-file lock."""
+        normalized_default = self._normalize_knowledge_base_ids(
+            [default_knowledge_base_id]
+        )
+        updated = 0
+        with self._lock:
+            users = self._list_unlocked()
+            for usr in users:
+                if user_ids is not None and str(usr.get("id") or "") not in user_ids:
+                    continue
+                user_changed = False
+                for key in (usr.get("api_keys") or []):
+                    if "knowledge_base_ids" in key:
+                        continue
+                    key["knowledge_base_ids"] = list(normalized_default)
+                    updated += 1
+                    user_changed = True
+                if user_changed:
+                    usr["updated_at"] = _now()
+            if updated:
+                self._save_unlocked(users)
+        return updated
+
+    def remove_knowledge_base_from_api_keys(
+        self,
+        *,
+        user_id: str,
+        knowledge_base_id: str,
+        finalize: Callable[[], None] | None = None,
+        lease_check: Callable[[], None] | None = None,
+    ) -> dict:
+        from utils.index_lock import DistributedLockLeaseLostError
+
+        updated = 0
+        disabled = 0
+        with self._lock:
+            users = self._list_unlocked()
+            original_users = deepcopy(users)
+            owner_found = False
+            for usr in users:
+                if usr.get("id") != user_id:
+                    continue
+                owner_found = True
+                for key in (usr.get("api_keys") or []):
+                    allowed = self._normalize_knowledge_base_ids(
+                        key.get("knowledge_base_ids")
+                    )
+                    if knowledge_base_id not in allowed:
+                        continue
+                    key["knowledge_base_ids"] = [
+                        item for item in allowed if item != knowledge_base_id
+                    ]
+                    updated += 1
+                    scopes = set(key.get("scopes") or ["query"])
+                    if (
+                        not key["knowledge_base_ids"]
+                        and "kb_manage" not in scopes
+                    ):
+                        key["enabled"] = False
+                        disabled += 1
+                if updated:
+                    usr["updated_at"] = _now()
+                    if lease_check is not None:
+                        lease_check()
+                    self._save_unlocked(users)
+                break
+            if not owner_found:
+                raise ValueError("User not found")
+            try:
+                if lease_check is not None:
+                    lease_check()
+                if finalize is not None:
+                    finalize()
+            except DistributedLockLeaseLostError:
+                # A rollback is itself a live write. Once the lease is known
+                # to be lost, leave recovery to the next protected run.
+                raise
+            except Exception:
+                if updated:
+                    try:
+                        self._save_unlocked(original_users)
+                    except Exception as rollback_exc:
+                        raise RuntimeError(
+                            "API key cleanup failed and rollback was not completed"
+                        ) from rollback_exc
+                raise
+        return {
+            "updated": updated,
+            "disabled": disabled,
+        }
+
     def _normalize_api_scopes(self, scopes: list[str]) -> list[str]:
-        """Normalize scopes to known values (query, ingest, speech)."""
-        valid: set[str] = {"query", "ingest", "speech"}
+        """Normalize scopes to known values."""
+        valid: set[str] = {"query", "ingest", "speech", "kb_manage"}
         result: list[str] = []
         for s in scopes:
             cleaned = str(s).strip().lower()
@@ -391,6 +682,20 @@ class UserStore:
                 result.append(cleaned)
         if not result:
             result = ["query"]
+        return result
+
+    def _normalize_knowledge_base_ids(self, values) -> list[str]:
+        from utils.knowledge_base_store import validate_knowledge_base_id
+
+        if values is None:
+            values = ["default"]
+        if isinstance(values, str):
+            values = values.replace(",", "\n").splitlines()
+        result: list[str] = []
+        for value in values:
+            knowledge_base_id = validate_knowledge_base_id(value)
+            if knowledge_base_id not in result:
+                result.append(knowledge_base_id)
         return result
 
     def _public_list_unlocked(self) -> list[dict]:
@@ -402,10 +707,12 @@ class UserStore:
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return []
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid user store: {self.path}") from exc
         users = data.get("users") if isinstance(data, dict) else data
-        return users if isinstance(users, list) else []
+        if not isinstance(users, list):
+            raise ValueError(f"Invalid user store: {self.path}")
+        return users
 
     def _save_unlocked(self, users: list[dict]) -> None:
         fd, tmp_name = tempfile.mkstemp(
@@ -472,6 +779,12 @@ def _public_api_key(key: dict, *, user_id: str, include_raw: bool = False) -> di
     prefix = str(key.get("key_prefix") or raw[:8])
     suffix = str(key.get("key_suffix") or raw[-4:])
     result["masked_key"] = f"{prefix}...{suffix}" if prefix or suffix else ""
+    knowledge_base_ids = (
+        key.get("knowledge_base_ids")
+        if "knowledge_base_ids" in key
+        else ["default"]
+    )
+    result["knowledge_base_ids"] = list(knowledge_base_ids or [])
     result["user_id"] = user_id
     if include_raw and raw:
         result["key"] = raw

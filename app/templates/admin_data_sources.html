@@ -23,6 +23,19 @@
             {% endfor %}
         {% endwith %}
 
+        <form method="get" class="panel form-grid compact kb-page-selector">
+            <label>
+                Knowledge base
+                <select name="knowledge_base_id" onchange="this.form.submit()">
+                    {% for kb in knowledge_bases %}
+                        <option value="{{ kb.id }}" {% if kb.id == knowledge_base_id %}selected{% endif %}>
+                            {{ kb.name }}{% if kb.is_default %} (Default){% endif %}
+                        </option>
+                    {% endfor %}
+                </select>
+            </label>
+        </form>
+
         <div class="source-configurations" aria-label="Available source types">
         <details class="panel disclosure-panel">
             <summary>
@@ -38,6 +51,7 @@
             </summary>
             <div class="disclosure-content">
             <form method="post" class="form-grid compact">
+                <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                 <input type="hidden" name="plugin" value="email_imap">
                 <label>
                     Source ID
@@ -133,6 +147,7 @@
                 Leave Drive ID empty for <code>/me/drive</code>; set it for SharePoint or a specific drive.
             </p>
             <form method="post" class="form-grid compact">
+                <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                 <input type="hidden" name="plugin" value="microsoft_drive">
                 <label>
                     Source ID
@@ -209,6 +224,7 @@
             </summary>
             <div class="disclosure-content">
             <form method="post" class="form-grid compact">
+                <input type="hidden" name="knowledge_base_id" value="{{ knowledge_base_id }}">
                 <input type="hidden" name="plugin" value="folder_watch">
                 <label>
                     Source ID
@@ -314,7 +330,7 @@
                                         class="secondary"
                                         data-sync-source="{{ source.id }}"
                                         data-sync-disabled="{{ 'true' if not source.enabled else 'false' }}"
-                                        data-sync-url="{{ url_for('admin_sync_data_source', data_source_id=source.id) }}"
+                                        data-sync-url="{{ url_for('admin_sync_data_source', data_source_id=source.id, knowledge_base_id=knowledge_base_id) }}"
                                         {% if not source.enabled %}disabled title="Enable this data source before syncing"{% endif %}
                                     >{{ "Sync disabled" if not source.enabled else "Sync now" }}</button>
                                     <button
@@ -322,7 +338,7 @@
                                         class="secondary toggle-btn"
                                         data-toggle-source="{{ source.id }}"
                                         data-toggle-enabled="{{ 'true' if not source.enabled else 'false' }}"
-                                        data-toggle-url="{{ url_for('admin_toggle_data_source', data_source_id=source.id) }}"
+                                        data-toggle-url="{{ url_for('admin_toggle_data_source', data_source_id=source.id, knowledge_base_id=knowledge_base_id) }}"
                                     >{{ "Enable" if not source.enabled else "Disable" }}</button>
                                 </td>
                             </tr>

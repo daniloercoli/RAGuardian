@@ -85,7 +85,14 @@
                                 <td data-label="Email"><code>{{ user.email }}</code><br><span class="muted">{{ user.id }}</span></td>
                                 <td data-label="Name">{{ user.display_name }}</td>
                                 <td data-label="Role"><span class="role-pill">{{ user.role }}</span></td>
-                                <td data-label="Status"><span class="status-pill {{ 'indexed' if user.enabled else 'error' }}">{{ "enabled" if user.enabled else "disabled" }}</span></td>
+                                <td data-label="Status">
+                                    <span class="status-pill {{ 'indexed' if user.enabled else 'error' }}">
+                                        {{ user.deletion_status or ("enabled" if user.enabled else "disabled") }}
+                                    </span>
+                                    {% if user.deletion_error %}
+                                        <br><span class="muted">{{ user.deletion_error }}</span>
+                                    {% endif %}
+                                </td>
                                 <td data-label="Update">
                                     <form method="post" class="form-grid compact">
                                         <input type="hidden" name="action" value="update">
@@ -97,7 +104,12 @@
                                         </select>
                                         <input type="password" name="password" placeholder="New password optional">
                                         <label class="checkbox-label">
-                                            <input type="checkbox" name="enabled" {% if user.enabled %}checked{% endif %}>
+                                            <input
+                                                type="checkbox"
+                                                name="enabled"
+                                                {% if user.enabled %}checked{% endif %}
+                                                {% if user.deletion_status in ["deleting", "delete_failed"] %}disabled title="Ripeti la cancellazione per completare il cleanup"{% endif %}
+                                            >
                                             Enabled
                                         </label>
                                         <button type="submit" class="secondary">Save</button>

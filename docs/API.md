@@ -37,8 +37,10 @@ Supported scopes:
 | `query` | health, models, RAG queries, OCR extraction, conversation cleanup |
 | `ingest` | PDF upload, audio upload, file deletion |
 | `speech` | text-to-speech synthesis |
+| `kb_manage` | knowledge-base catalog creation, update, and deletion |
 
-The `RAG_API_KEY` environment key has all scopes.
+Each user key also has a `knowledge_base_ids` allowlist. The legacy
+`RAG_API_KEY` environment key is default-only and has no `kb_manage` scope.
 
 In multi-user deployments, create a dedicated user for each external integration when that integration needs its own knowledge boundary. For example, a WordPress public site can use a `website@example.com` RAGuardian user and one API key from that user's workspace. Grant that key `query` for chat, add `ingest` for article import/sync or audio upload, and add `speech` only for text-to-speech.
 
@@ -72,6 +74,8 @@ Common statuses:
 |---:|---|---|
 | 400 | `validation_error` | Invalid payload or field out of range |
 | 401 | `unauthorized` | Missing or invalid API key |
+| 404 | `knowledge_base_not_found` | Missing, foreign, or unauthorized KB |
+| 409 | `knowledge_base_deleting` | KB is unavailable for new work |
 | 429 | `rate_limited` | Too many requests in the configured window |
 | 500 | `server_error` | Internal error or provider unavailable |
 | 500 | `model_configuration_error` | Missing provider/models file or no models |
@@ -100,6 +104,27 @@ When the limit is exceeded:
 Returns the service status.
 
 The response is scoped to the workspace resolved by the API key.
+
+Append `?knowledge_base_id=kb_...` for an authorized secondary KB. Omitting
+the selector preserves the legacy default behavior.
+
+## Knowledge bases
+
+`GET/POST /api/v1/knowledge-bases` and
+`GET/PATCH/DELETE /api/v1/knowledge-bases/{knowledge_base_id}` expose the
+catalog. List/get accept `query`, `ingest`, or `kb_manage`; mutations require
+`kb_manage`. DELETE returns a `delete_knowledge_base` job. An authorized
+default target returns 409, while an unauthorized target (including default)
+is hidden with 404. Poll deletion jobs through `/api/v1/jobs/{job_id}`; the
+initiating API key can continue polling with `kb_manage` after target cleanup
+removes that knowledge base from its allowlist. Other keys cannot poll that
+deletion job, even when they have `kb_manage` in the same workspace.
+
+Existing operations accept `knowledge_base_id` in the JSON query body, as a
+multipart field for file/audio uploads, and as a query parameter for health,
+conversation clear, and file delete. Jobs freeze the target at creation.
+Omitted or null means `default`; malformed IDs return 400; missing or
+unauthorized IDs return 404 without fallback.
 
 ### Request
 
@@ -134,6 +159,7 @@ curl http://127.0.0.1:5000/api/v1/health \
   "queue_ready": true,
   "queue_depth": 0,
   "active_jobs_count": 0,
+  "knowledge_base_id": "default",
   "collection": "documents",
   "documents_count": 128
 }
@@ -161,9 +187,10 @@ PYTHONPATH=app rq worker rag-default
 
 Returns the status of an async ingest or rebuild job.
 
-Requires an API key with `ingest` scope.
+Requires an API key with `ingest` scope. Knowledge-base deletion jobs instead
+require `kb_manage` and are visible only to the API key that initiated DELETE.
 
-Jobs are visible only to the workspace that created them.
+Ingest jobs are visible only to their workspace and current target allowlist.
 
 ### Request
 
@@ -245,6 +272,8 @@ The query runs only against the Chroma collection and FileIndex of the workspace
 | `provider` | string | no | runtime configuration | Must exist in registry |
 | `model` | string | no | default model | Must belong to provider |
 | `conversation_id` | string | no | stateless | 8-80 characters; if present enables conversational memory |
+| `knowledge_base_id` | string | no | `default` | `default` or an authorized opaque `kb_...` ID |
+| `system_prompt_id` | string | no | active/default prompt | ID of a saved system prompt |
 | `client_context` | object | no | none | Safe site/page metadata used only in the prompt |
 | `response_language` | string | no | `auto` | `auto` answers in the question language; `it` forces Italian; `en` forces English |
 | `stream` | boolean | no | `false` | `true` enables streaming |
@@ -271,6 +300,8 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
     "provider": "mistral",
     "model": "mistral-medium",
     "conversation_id": "chat-20260616-demo",
+    "knowledge_base_id": "kb_11111111111111111111111111111111",
+    "system_prompt_id": "support",
     "response_language": "auto",
     "client_context": {
       "site_name": "Example Site",
@@ -294,6 +325,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
   "provider": "mistral",
   "provider_name": "Mistral AI",
   "conversation_id": "chat-20260616-demo",
+  "knowledge_base_id": "kb_11111111111111111111111111111111",
   "response_language": "auto",
   "context": [
     {
@@ -351,10 +383,10 @@ curl -N -X POST http://127.0.0.1:5000/api/v1/query \
 The response is `application/x-ndjson`: one JSON line per event.
 
 ```json
-{"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo"}
+{"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_id":"default"}
 {"type":"token","text":"Progressive "}
 {"type":"token","text":"response..."}
-{"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","context":[],"sources":[],"usage":null}
+{"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_id":"default","context":[],"sources":[],"usage":null}
 ```
 
 In case of error during streaming, the server sends an event:
@@ -368,7 +400,7 @@ In case of error during streaming, the server sends an event:
 Deletes the conversational memory associated with a `conversation_id`.
 
 ```bash
-curl -X DELETE http://127.0.0.1:5000/api/v1/conversations/chat-20260616-demo \
+curl -X DELETE 'http://127.0.0.1:5000/api/v1/conversations/chat-20260616-demo?knowledge_base_id=kb_11111111111111111111111111111111' \
   -H "X-API-Key: $RAG_API_KEY"
 ```
 
@@ -377,7 +409,8 @@ Response:
 ```json
 {
   "conversation_id": "chat-20260616-demo",
-  "cleared": true
+  "cleared": true,
+  "knowledge_base_id": "kb_11111111111111111111111111111111"
 }
 ```
 
@@ -412,6 +445,8 @@ This avoids collisions when the same content is uploaded with different names or
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `file` | file | yes | Supported extensions: `pdf`, `txt`, `md` |
+| `knowledge_base_id` | string | no | Omit for default; otherwise an authorized `kb_...` ID |
+| `relative_path` | string | no | Safe workspace-relative source path, useful for folders and integrations |
 
 Maximum size is configured with `MAX_UPLOAD_SIZE_MB`.
 
@@ -420,7 +455,9 @@ Maximum size is configured with `MAX_UPLOAD_SIZE_MB`.
 ```bash
 curl -X POST http://127.0.0.1:5000/api/v1/files \
   -H "X-API-Key: $RAG_API_KEY" \
-  -F "file=@documento.pdf"
+  -F "file=@documento.pdf" \
+  -F "relative_path=manuali/documento.pdf" \
+  -F "knowledge_base_id=kb_11111111111111111111111111111111"
 ```
 
 ### Response 200
@@ -430,7 +467,8 @@ curl -X POST http://127.0.0.1:5000/api/v1/files \
   "message": "documento.pdf uploaded and indexed",
   "filename": "documento.pdf",
   "source_type": "pdf",
-  "chunks": 18
+  "chunks": 18,
+  "knowledge_base_id": "kb_11111111111111111111111111111111"
 }
 ```
 
@@ -604,7 +642,7 @@ Requires an API key with `ingest` scope.
 ### Request
 
 ```bash
-curl -X DELETE http://127.0.0.1:5000/api/v1/files/documento.pdf \
+curl -X DELETE 'http://127.0.0.1:5000/api/v1/files/manuali/documento.pdf?knowledge_base_id=kb_11111111111111111111111111111111' \
   -H "X-API-Key: $RAG_API_KEY"
 ```
 
@@ -616,7 +654,8 @@ curl -X DELETE http://127.0.0.1:5000/api/v1/files/documento.pdf \
   "filename": "documento.pdf",
   "source": "app/uploads/workspaces/user_123/documento.pdf",
   "chunks_deleted": 18,
-  "file_deleted": true
+  "file_deleted": true,
+  "knowledge_base_id": "kb_11111111111111111111111111111111"
 }
 ```
 

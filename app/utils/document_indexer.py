@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import uuid
+from copy import deepcopy
 from typing import Any, Callable
 
 from utils.file_index import FileIndex
@@ -37,6 +41,8 @@ INGESTION_METADATA_KEYS = {
     "relative_path",
 }
 
+log = logging.getLogger(__name__)
+
 
 def source_type_for_extension(extension: str) -> str:
     extension = extension.lower().lstrip(".")
@@ -63,7 +69,8 @@ def index_saved_document(
     """Parse, deduplicate, index, and record a saved document file."""
 
     from utils.chroma_manager import add_documents_to_chroma, delete_documents_by_source, find_document_by_id
-    from utils.rag_engine import clear_cache
+    from utils.index_lock import assert_distributed_locks_healthy
+    from utils.rag_engine import clear_cache_for_collection
 
     extension = extension.lower().lstrip(".")
     if extension not in DOCUMENT_INDEX_EXTENSIONS:
@@ -85,7 +92,6 @@ def index_saved_document(
         parse_error = str(exc)
 
     collection_name = config.get("CHROMA_COLLECTION")
-    replaced_chunks = delete_documents_by_source(file_path, collection_name=collection_name)
     index_extra = normalize_metadata_values({"source_type": source_type, **(extra_metadata or {})})
     ocr_error = ""
     if extension == "pdf" and ocr_documents_func:
@@ -101,8 +107,14 @@ def index_saved_document(
 
     apply_extra_metadata_to_documents(documents, index_extra)
 
+    assert_distributed_locks_healthy()
+    replaced_chunks = delete_documents_by_source(
+        file_path,
+        collection_name=collection_name,
+    )
     if not documents:
         empty_error = ocr_error or parse_error or "Il file non contiene testo indicizzabile"
+        assert_distributed_locks_healthy()
         FileIndex(config["FILE_INDEX"]).record(
             filename,
             file_path,
@@ -112,15 +124,16 @@ def index_saved_document(
             metadata=index_record_metadata_for_config(config, extra=index_extra),
         )
         if replaced_chunks:
-            clear_cache()
+            clear_cache_for_collection(collection_name or "documents")
         raise ValidationError(empty_error, "file")
 
     document_id = str(documents[0].metadata.get("document_id") or "")
     source_id = str(documents[0].metadata.get("source_id") or "")
     duplicate = find_document_by_id(document_id, exclude_source=file_path, collection_name=collection_name) if document_id else None
     if duplicate:
+        assert_distributed_locks_healthy()
         if replaced_chunks:
-            clear_cache()
+            clear_cache_for_collection(collection_name or "documents")
         duplicate_source = duplicate.get("source") or ""
         FileIndex(config["FILE_INDEX"]).record(
             filename,
@@ -149,8 +162,10 @@ def index_saved_document(
             "duplicate_of_source": duplicate_source,
         }
 
+    assert_distributed_locks_healthy()
     add_documents_to_chroma(documents, collection_name=collection_name)
-    clear_cache()
+    clear_cache_for_collection(collection_name or "documents")
+    assert_distributed_locks_healthy()
     FileIndex(config["FILE_INDEX"]).record(
         filename,
         file_path,
@@ -172,6 +187,148 @@ def index_saved_document(
         "document_id": document_id,
         "ocr_used": bool(index_extra.get("ocr_used")),
     }
+
+
+def index_staged_document(
+    config: dict,
+    filename: str,
+    file_path: str,
+    staged_file_path: str,
+    extension: str,
+    *,
+    ocr_documents_func: Callable | None = None,
+    extra_metadata: dict | None = None,
+) -> dict:
+    """Atomically replace one saved document and roll back its index on error."""
+
+    from utils.chroma_manager import (
+        restore_documents_by_source,
+        snapshot_documents_by_source,
+    )
+    from utils.index_lock import (
+        DistributedLockLeaseLostError,
+        assert_distributed_locks_healthy,
+    )
+    from utils.rag_engine import clear_cache_for_collection
+
+    upload_root = os.path.abspath(config["UPLOAD_FOLDER"])
+    final_path = os.path.abspath(str(file_path))
+    staged_path = os.path.abspath(str(staged_file_path))
+    if (
+        not final_path.startswith(upload_root + os.sep)
+        or not staged_path.startswith(upload_root + os.sep)
+        or os.path.dirname(final_path) != os.path.dirname(staged_path)
+    ):
+        raise ValidationError("Path staging data source non valido", "file")
+    if not os.path.isfile(staged_path):
+        raise ValidationError("File staging data source non trovato", "file")
+
+    file_index = FileIndex(config["FILE_INDEX"])
+    previous_entry = deepcopy(file_index.get(filename))
+    had_existing_file = os.path.isfile(final_path)
+    backup_path = (
+        os.path.join(
+            os.path.dirname(final_path),
+            f".{os.path.basename(final_path)}.{uuid.uuid4().hex}.rollback-ingestion",
+        )
+        if had_existing_file
+        else ""
+    )
+    collection_name = config.get("CHROMA_COLLECTION")
+    vector_snapshot = None
+    snapshot_captured = False
+    backup_created = False
+    replacement_committed = False
+
+    try:
+        assert_distributed_locks_healthy()
+        vector_snapshot = snapshot_documents_by_source(
+            final_path,
+            collection_name=collection_name,
+        )
+        snapshot_captured = True
+        if backup_path:
+            os.replace(final_path, backup_path)
+            backup_created = True
+        os.replace(staged_path, final_path)
+        replacement_committed = True
+        result = index_saved_document(
+            config,
+            filename,
+            final_path,
+            extension,
+            ocr_documents_func=ocr_documents_func,
+            extra_metadata=extra_metadata,
+        )
+        assert_distributed_locks_healthy()
+    except DistributedLockLeaseLostError:
+        preserved_backup = (
+            backup_path
+            if backup_created and os.path.isfile(backup_path)
+            else ""
+        )
+        log.critical(
+            "Indicizzazione data source %s interrotta dopo la perdita della "
+            "lease; nessun rollback live eseguito. Backup preservato: %s. "
+            "Rilanciare la sincronizzazione per il recovery.",
+            filename,
+            preserved_backup or "nessuno",
+        )
+        raise
+    except Exception as exc:
+        if snapshot_captured:
+            rollback_errors = []
+            try:
+                if replacement_committed and os.path.isfile(final_path):
+                    os.remove(final_path)
+                if backup_created:
+                    if not os.path.isfile(backup_path):
+                        raise FileNotFoundError(
+                            f"Backup data source non trovato: {backup_path}"
+                        )
+                    os.replace(backup_path, final_path)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"file: {rollback_exc}")
+            try:
+                restore_documents_by_source(
+                    final_path,
+                    vector_snapshot or {},
+                    collection_name=collection_name,
+                )
+                clear_cache_for_collection(collection_name or "documents")
+            except Exception as rollback_exc:
+                rollback_errors.append(f"vettori: {rollback_exc}")
+            try:
+                file_index.restore_entry(filename, previous_entry)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"file index: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"{exc}; rollback data source fallito: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+        raise
+    else:
+        if backup_created and os.path.isfile(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError as cleanup_error:
+                log.warning(
+                    "Impossibile rimuovere il backup data source %s: %s",
+                    backup_path,
+                    cleanup_error,
+                )
+        return result
+    finally:
+        if os.path.isfile(staged_path):
+            try:
+                os.remove(staged_path)
+            except OSError as cleanup_error:
+                log.warning(
+                    "Impossibile rimuovere lo staging data source %s: %s",
+                    staged_path,
+                    cleanup_error,
+                )
 
 
 def apply_extra_metadata_to_documents(documents: list, extra_metadata: dict | None) -> None:

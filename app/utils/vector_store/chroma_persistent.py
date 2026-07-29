@@ -25,9 +25,42 @@ except ImportError:
     chromadb = None
 
 
+def reset_chroma_system_cache() -> None:
+    """Stop process-local Chroma systems after a persistence-path swap."""
+
+    if chromadb is None:
+        return
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+    except (ImportError, AttributeError):
+        return
+
+    systems = getattr(SharedSystemClient, "_identifier_to_system", {})
+    stop_errors = []
+    for system in {id(item): item for item in systems.values()}.values():
+        try:
+            system.stop()
+        except Exception as exc:
+            stop_errors.append(exc)
+    SharedSystemClient.clear_system_cache()
+    if stop_errors:
+        raise RuntimeError(
+            f"Unable to stop {len(stop_errors)} cached Chroma system(s)"
+        ) from stop_errors[0]
+
+
+from utils.index_lock import (  # noqa: E402
+    register_lifecycle_invalidator,
+    synchronize_lifecycle_generation,
+)
+
+register_lifecycle_invalidator("chroma-system", reset_chroma_system_cache)
+
+
 def _default_chroma_client():
     if chromadb is None:
         raise RuntimeError("chromadb non installato. Installa le dipendenze runtime con requirements.txt.")
+    synchronize_lifecycle_generation()
     return chromadb.PersistentClient(path=Config.paths.chroma_persist_dir)
 
 
@@ -78,6 +111,57 @@ class ChromaPersistentVectorStore(VectorStore):
         collection.delete(ids=ids)
         log.info(f"Cancellati {len(ids)} chunk Chroma per source={source}")
         return len(ids)
+
+    def snapshot_by_source(self, source: str) -> dict:
+        """Capture enough collection data to restore one source without re-embedding."""
+        existing = self._collection().get(
+            where={"source": source},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        existing = existing or {}
+        return {
+            "ids": _collection_values(existing.get("ids")),
+            "documents": _collection_values(existing.get("documents")),
+            "metadatas": _collection_values(existing.get("metadatas")),
+            "embeddings": _collection_values(existing.get("embeddings")),
+        }
+
+    def restore_source_snapshot(self, source: str, snapshot: dict) -> int:
+        """Restore a source snapshot and remove chunks created after the snapshot."""
+        collection = self._collection()
+        current = collection.get(where={"source": source}) or {}
+        current_ids = _collection_values(current.get("ids"))
+        snapshot_ids = _collection_values((snapshot or {}).get("ids"))
+
+        if snapshot_ids:
+            documents = _collection_values((snapshot or {}).get("documents"))
+            metadatas = _collection_values((snapshot or {}).get("metadatas"))
+            embeddings = _collection_values((snapshot or {}).get("embeddings"))
+            expected = len(snapshot_ids)
+            if not (
+                len(documents) == expected
+                and len(metadatas) == expected
+                and len(embeddings) == expected
+            ):
+                raise ValueError("Snapshot vettoriale incompleto")
+            collection.upsert(
+                ids=snapshot_ids,
+                documents=documents,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
+
+        snapshot_id_set = set(snapshot_ids)
+        stale_ids = [chunk_id for chunk_id in current_ids if chunk_id not in snapshot_id_set]
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+        log.info(
+            "Ripristinati %s chunk Chroma per source=%s; rimossi %s chunk successivi",
+            len(snapshot_ids),
+            source,
+            len(stale_ids),
+        )
+        return len(snapshot_ids)
 
     def find_document_by_id(self, document_id: str, exclude_source: Optional[str] = None) -> Optional[dict]:
         collection = self._collection()
@@ -222,6 +306,14 @@ class ChromaPersistentVectorStore(VectorStore):
 
     def _embedding_provider(self):
         return self._embedding_provider_factory()
+
+
+def _collection_values(value) -> list:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return list(value)
 
 
 def document_chunk_id(metadata: dict, fallback_index: int) -> str:

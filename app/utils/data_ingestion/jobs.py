@@ -7,7 +7,13 @@ import threading
 import time
 import uuid
 
-from utils.job_store import get_job_store, queue_name
+from utils.job_store import (
+    JobTargetUnavailableError,
+    ensure_knowledge_base_target_active,
+    ensure_job_target_active,
+    get_job_store,
+    queue_name,
+)
 from utils.settings_store import SettingsStore
 from utils.state_backend import configured_queue_backend, redis_connection
 from utils.validators import ValidationError, validate_string
@@ -22,6 +28,23 @@ def start_data_source_sync_job(
     *,
     trigger: str = "manual",
 ) -> tuple[dict, int]:
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config.get("CHROMA_COLLECTION")):
+        ensure_knowledge_base_target_active(config)
+        return _start_data_source_sync_job_admitted(
+            config,
+            data_source_id,
+            trigger=trigger,
+        )
+
+
+def _start_data_source_sync_job_admitted(
+    config: dict,
+    data_source_id: str,
+    *,
+    trigger: str,
+) -> tuple[dict, int]:
     settings = SettingsStore(config["SETTINGS_FILE"]).load()
     data_source_id = validate_string(data_source_id, "data_source_id", min_length=1, max_length=120)
     source = next(
@@ -29,6 +52,11 @@ def start_data_source_sync_job(
         None,
     )
     if source is None:
+        raise ValidationError("Data source non trovata", "data_source_id", code="not_found")
+    if (source.get("knowledge_base_id") or "default") != config.get(
+        "KNOWLEDGE_BASE_ID",
+        "default",
+    ):
         raise ValidationError("Data source non trovata", "data_source_id", code="not_found")
     if not source.get("enabled", True):
         raise ValidationError("Data source disabilitata", "data_source_id")
@@ -47,6 +75,7 @@ def start_data_source_sync_job(
         "trigger": trigger,
         "user_id": config.get("USER_ID"),
         "workspace_id": config.get("WORKSPACE_ID"),
+        "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
         "errors": [],
         "result": None,
         "started_at": time.time(),
@@ -98,17 +127,13 @@ def enqueue_data_source_sync_job(job_id: str, config: dict, data_source_id: str)
 
 def run_data_source_sync_job(job_id: str, config: dict, data_source_id: str) -> None:
     from utils.data_ingestion.service import mark_data_source_sync_running, sync_data_source
-    from utils.index_lock import index_write_lock
-
-    update_job(
-        job_id,
-        status="running",
-        message=f"Sync data source {data_source_id}",
-        current_file="",
+    from utils.index_lock import (
+        assert_distributed_locks_healthy,
+        index_write_lock,
     )
-    mark_data_source_sync_running(config, data_source_id)
 
     def progress(patch: dict) -> None:
+        assert_distributed_locks_healthy()
         update_job(
             job_id,
             processed=patch.get("processed", 0),
@@ -118,7 +143,17 @@ def run_data_source_sync_job(job_id: str, config: dict, data_source_id: str) -> 
 
     try:
         with index_write_lock():
+            assert_distributed_locks_healthy()
+            ensure_job_target_active(job_id, config)
+            update_job(
+                job_id,
+                status="running",
+                message=f"Sync data source {data_source_id}",
+                current_file="",
+            )
+            mark_data_source_sync_running(config, data_source_id)
             result = sync_data_source(config, data_source_id, progress_callback=progress)
+            assert_distributed_locks_healthy()
         for error in result.get("errors", []):
             append_job_error(job_id, error.get("remote_id", data_source_id), error.get("error", "Errore sync"))
         update_job(
@@ -132,6 +167,13 @@ def run_data_source_sync_job(job_id: str, config: dict, data_source_id: str) -> 
             finish_job(job_id, "completed_with_errors", result.get("status", "Sync completata con errori"))
         else:
             finish_job(job_id, "completed", "Sync data source completata")
+    except JobTargetUnavailableError as exc:
+        append_job_error(job_id, data_source_id, str(exc))
+        update_job(
+            job_id,
+            result={"error": str(exc), "status": "knowledge_base_unavailable"},
+        )
+        finish_job(job_id, "failed", str(exc))
     except ValidationError as exc:
         append_job_error(job_id, data_source_id, exc.message)
         update_job(job_id, result=exc.to_dict())
@@ -147,7 +189,16 @@ def run_data_source_sync_job(job_id: str, config: dict, data_source_id: str) -> 
 
 def _run_polled_data_source_sync_job(job_id: str, config: dict, data_source_id: str) -> None:
     try:
+        ensure_job_target_active(job_id, config)
         _mark_sync_queued(config, data_source_id)
+    except JobTargetUnavailableError as exc:
+        append_job_error(job_id, data_source_id, str(exc))
+        update_job(
+            job_id,
+            result={"error": str(exc), "status": "knowledge_base_unavailable"},
+        )
+        finish_job(job_id, "failed", str(exc))
+        return
     except Exception as exc:
         log.error("Errore stato queued data source %s: %s", data_source_id, exc)
         append_job_error(job_id, data_source_id, str(exc))

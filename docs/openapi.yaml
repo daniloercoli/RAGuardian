@@ -21,6 +21,8 @@ tags:
     description: RAG question answering.
   - name: Files
     description: RAG file upload and indexing.
+  - name: Knowledge Bases
+    description: Catalog and lifecycle management for isolated knowledge bases.
   - name: OCR
     description: Text extraction from images and PDFs.
   - name: Speech
@@ -37,6 +39,8 @@ paths:
       description: |
         Returns runtime health for model configuration, settings, embeddings,
         cache and ChromaDB.
+      parameters:
+        - $ref: "#/components/parameters/KnowledgeBaseId"
       responses:
         "200":
           description: Service health payload.
@@ -242,6 +246,112 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/ServerError"
+  /api/v1/knowledge-bases:
+    get:
+      tags:
+        - Knowledge Bases
+      operationId: listApiV1KnowledgeBases
+      summary: List knowledge bases authorized to the API key
+      description: Requires at least one of `query`, `ingest`, or `kb_manage`.
+      responses:
+        "200":
+          description: Authorized knowledge bases with file/source statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [knowledge_bases]
+                properties:
+                  knowledge_bases:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/KnowledgeBase"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags:
+        - Knowledge Bases
+      operationId: createApiV1KnowledgeBase
+      summary: Create a knowledge base
+      description: Requires `kb_manage`. The creating key receives access; other keys are unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KnowledgeBaseCreateInput"
+      responses:
+        "201":
+          description: Knowledge base created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeBase"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Duplicate name or configured KB limit reached.
+  /api/v1/knowledge-bases/{knowledge_base_id}:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeBaseIdPath"
+    get:
+      tags:
+        - Knowledge Bases
+      operationId: getApiV1KnowledgeBase
+      summary: Get one authorized knowledge base
+      responses:
+        "200":
+          description: Knowledge base.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeBase"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags:
+        - Knowledge Bases
+      operationId: updateApiV1KnowledgeBase
+      summary: Rename or describe a knowledge base
+      description: Requires `kb_manage`; IDs, status, paths and default role are immutable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KnowledgeBaseUpdateInput"
+      responses:
+        "200":
+          description: Updated knowledge base.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeBase"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Duplicate name or deletion already in progress.
+    delete:
+      tags:
+        - Knowledge Bases
+      operationId: deleteApiV1KnowledgeBase
+      summary: Start asynchronous cascade deletion
+      description: |
+        Requires `kb_manage`. An authorized default KB always returns 409;
+        an unauthorized default target is hidden with 404.
+      responses:
+        "202":
+          description: Cascade deletion job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncJobResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Default KB, deleting KB, or active jobs prevent deletion.
   /api/v1/conversations/{conversation_id}:
     delete:
       tags:
@@ -259,6 +369,7 @@ paths:
             maxLength: 80
             pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
           example: chat-20260616-demo
+        - $ref: "#/components/parameters/KnowledgeBaseId"
       responses:
         "200":
           description: Conversation memory reset result.
@@ -319,6 +430,11 @@ paths:
                   type: string
                   format: binary
                   description: PDF, TXT, or Markdown file to index.
+                relative_path:
+                  type: string
+                  description: Optional safe relative path, including the filename.
+                knowledge_base_id:
+                  $ref: "#/components/schemas/KnowledgeBaseId"
       responses:
         "200":
           description: File uploaded and indexed.
@@ -377,6 +493,11 @@ paths:
                 language:
                   type: string
                   description: Optional STT language hint, such as it or en. Empty or omitted enables fallback to configured language/autodetect.
+                relative_path:
+                  type: string
+                  description: Optional safe relative path, including the filename.
+                knowledge_base_id:
+                  $ref: "#/components/schemas/KnowledgeBaseId"
       responses:
         "200":
           description: Audio transcribed and indexed.
@@ -402,7 +523,13 @@ paths:
         - Jobs
       operationId: getApiV1Job
       summary: Get async job status
-      description: Returns the current state, errors, and final result for async ingest and rebuild jobs.
+      description: |
+        Returns the current state, errors, and final result for async ingest,
+        rebuild, sync, and knowledge-base deletion jobs. Ingest jobs require
+        `ingest` plus current target authorization. Delete jobs require
+        `kb_manage` and are visible only to the API key that initiated DELETE.
+        That key can keep polling after deletion cleanup removes the target
+        from its allowlist.
       parameters:
         - name: job_id
           in: path
@@ -507,6 +634,7 @@ paths:
           schema:
             type: string
           example: documento.pdf
+        - $ref: "#/components/parameters/KnowledgeBaseId"
       responses:
         "200":
           description: File removed from the knowledge base.
@@ -547,6 +675,20 @@ components:
       in: header
       name: X-API-Key
       description: User/workspace API key configured from `/admin/api-keys`. `RAG_API_KEY` remains available as a legacy global compatibility key.
+  parameters:
+    KnowledgeBaseId:
+      name: knowledge_base_id
+      in: query
+      required: false
+      description: Omit or use `default` for the legacy-compatible default KB.
+      schema:
+        $ref: "#/components/schemas/KnowledgeBaseId"
+    KnowledgeBaseIdPath:
+      name: knowledge_base_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/KnowledgeBaseId"
   responses:
     Unauthorized:
       description: Missing or invalid API key.
@@ -628,6 +770,81 @@ components:
                 error: Upstream provider unavailable
                 status: server_error
   schemas:
+    KnowledgeBaseId:
+      type: string
+      pattern: "^(default|kb_[0-9a-f]{32})$"
+      default: default
+    KnowledgeBaseCreateInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 1000
+      additionalProperties: false
+    KnowledgeBaseUpdateInput:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 1000
+      additionalProperties: false
+    KnowledgeBase:
+      type: object
+      required:
+        - id
+        - name
+        - description
+        - is_default
+        - status
+        - created_at
+        - updated_at
+        - stats
+      properties:
+        id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
+        name:
+          type: string
+        description:
+          type: string
+        is_default:
+          type: boolean
+        status:
+          type: string
+          enum: [active, deleting, delete_failed]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        delete_error:
+          type: string
+        stats:
+          type: object
+          required: [tracked_files, indexed_files, chunks, data_sources]
+          properties:
+            tracked_files:
+              type: integer
+              minimum: 0
+            indexed_files:
+              type: integer
+              minimum: 0
+            chunks:
+              type: integer
+              minimum: 0
+            data_sources:
+              type: integer
+              minimum: 0
     ErrorResponse:
       type: object
       required:
@@ -676,12 +893,17 @@ components:
             - file_upload
             - audio_upload
             - rebuild_index
+            - data_source_sync
+            - delete_knowledge_base
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         status:
           type: string
           examples:
             - queued
             - running
             - completed
+            - completed_with_errors
             - failed
         message:
           type: string
@@ -732,6 +954,8 @@ components:
         - cache_enabled
         - database_ready
       properties:
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         status:
           type: string
           enum:
@@ -885,6 +1109,8 @@ components:
       required:
         - query
       properties:
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         query:
           type: string
           minLength: 3
@@ -902,6 +1128,9 @@ components:
           maxLength: 80
           pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
           description: Optional conversation memory id. Reuse it across requests to enable follow-up context.
+        system_prompt_id:
+          type: string
+          description: Optional personal or shared system prompt identifier.
         client_context:
           $ref: "#/components/schemas/ClientContext"
         response_language:
@@ -966,6 +1195,8 @@ components:
         - context
         - usage
       properties:
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         answer:
           type: string
         model:
@@ -1042,6 +1273,8 @@ components:
         - chunks
         - source_type
       properties:
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         message:
           type: string
         filename:
@@ -1067,6 +1300,8 @@ components:
         - source_type
         - transcript
       properties:
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
         message:
           type: string
         filename:

@@ -14,6 +14,14 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
+    def snapshot_by_source(self, source: str) -> dict:
+        pass
+
+    @abstractmethod
+    def restore_source_snapshot(self, source: str, snapshot: dict) -> int:
+        pass
+
+    @abstractmethod
     def find_document_by_id(self, document_id: str, exclude_source: Optional[str] = None) -> Optional[dict]:
         pass
 

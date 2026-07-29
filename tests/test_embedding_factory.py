@@ -136,3 +136,16 @@ def test_embedding_factory_builds_custom_embedding_provider(monkeypatch):
     assert provider.provider_config["base_url"] == "https://embed.example.com/v1"
     assert provider.provider_config["api_key"] == "embed-key"
     EmbeddingFactory.reset_cache()
+
+
+def test_embedding_factory_registers_its_lifecycle_cache_invalidator():
+    from utils import index_lock
+
+    callback = index_lock._LIFECYCLE_INVALIDATORS[
+        "embedding-provider-runtime"
+    ]
+    EmbeddingFactory._instances["stale"] = object()
+
+    callback()
+
+    assert EmbeddingFactory._instances == {}

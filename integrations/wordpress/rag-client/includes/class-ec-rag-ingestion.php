@@ -31,7 +31,7 @@ class EC_Rag_Ingestion {
         add_action('save_post_post', [self::class, 'on_save_post'], 20, 3);
         add_action('before_delete_post', [self::class, 'on_delete_post'], 10, 2);
         add_action(self::CRON_HOOK, [self::class, 'cron_process_import_batch']);
-        add_action(self::POST_SYNC_HOOK, [self::class, 'cron_sync_post'], 10, 2);
+        add_action(self::POST_SYNC_HOOK, [self::class, 'cron_sync_post'], 10, 3);
     }
 
     /**
@@ -253,10 +253,19 @@ class EC_Rag_Ingestion {
      * @param int $delay Delay in seconds.
      * @return void
      */
-    public static function schedule_post_sync(int $post_id, int $attempt = 0, int $delay = 1): void {
+    public static function schedule_post_sync(
+        int $post_id,
+        int $attempt = 0,
+        int $delay = 1,
+        ?string $knowledge_base_id = null
+    ): void {
         $post_id = absint($post_id);
         $attempt = absint($attempt);
-        $args     = [$post_id, $attempt];
+        if ($knowledge_base_id === null) {
+            $options = EC_Rag_Options::get();
+            $knowledge_base_id = sanitize_text_field($options['knowledge_base_id'] ?? '');
+        }
+        $args = [$post_id, $attempt, $knowledge_base_id];
 
         if (!$post_id) {
             return;
@@ -264,7 +273,10 @@ class EC_Rag_Ingestion {
 
         if ($attempt === 0) {
             for ($retry = 1; $retry <= self::POST_SYNC_MAX_RETRIES; $retry++) {
-                wp_clear_scheduled_hook(self::POST_SYNC_HOOK, [$post_id, $retry]);
+                wp_clear_scheduled_hook(
+                    self::POST_SYNC_HOOK,
+                    [$post_id, $retry, $knowledge_base_id]
+                );
             }
         }
 
@@ -282,7 +294,11 @@ class EC_Rag_Ingestion {
      * @param int $attempt Retry attempt.
      * @return void
      */
-    public static function cron_sync_post(int $post_id, int $attempt = 0): void {
+    public static function cron_sync_post(
+        int $post_id,
+        int $attempt = 0,
+        string $knowledge_base_id = ''
+    ): void {
         $post = get_post($post_id);
 
         if ($post && EC_Rag_Utils::is_public_article($post)) {
@@ -290,10 +306,13 @@ class EC_Rag_Ingestion {
                 return;
             }
 
-            $response = self::ingest_article(EC_Rag_Utils::article_from_post($post));
+            $response = self::ingest_article(
+                EC_Rag_Utils::article_from_post($post),
+                $knowledge_base_id
+            );
             $operation = 'upload';
         } else {
-            $response = self::delete_snapshot($post_id);
+            $response = self::delete_snapshot($post_id, $knowledge_base_id);
             $operation = 'delete';
         }
 
@@ -315,7 +334,12 @@ class EC_Rag_Ingestion {
 
         if ($attempt < self::POST_SYNC_MAX_RETRIES) {
             $retry_delay = min(HOUR_IN_SECONDS, MINUTE_IN_SECONDS * (2 ** $attempt));
-            self::schedule_post_sync($post_id, $attempt + 1, $retry_delay);
+            self::schedule_post_sync(
+                $post_id,
+                $attempt + 1,
+                $retry_delay,
+                $knowledge_base_id
+            );
         }
     }
 
@@ -336,7 +360,10 @@ class EC_Rag_Ingestion {
      * @param array $article The article data.
      * @return array|WP_Error|null
      */
-    public static function ingest_article(array $article) {
+    public static function ingest_article(
+        array $article,
+        ?string $knowledge_base_id = null
+    ) {
         $post_id = absint($article['post_id'] ?? 0);
 
         if (!$post_id) {
@@ -347,7 +374,12 @@ class EC_Rag_Ingestion {
         $relative_path = 'wordpress/posts/' . $filename;
         $content     = EC_Rag_Utils::snapshot_content($article);
 
-        return self::upload_snapshot($filename, $relative_path, $content);
+        return self::upload_snapshot(
+            $filename,
+            $relative_path,
+            $content,
+            $knowledge_base_id
+        );
     }
 
     /**
@@ -358,8 +390,22 @@ class EC_Rag_Ingestion {
      * @param string $content
      * @return array|WP_Error|null
      */
-    public static function upload_snapshot(string $filename, string $relative_path, string $content) {
-        $api = new EC_Rag_Api_Client(fn() => EC_Rag_Options::get());
+    public static function upload_snapshot(
+        string $filename,
+        string $relative_path,
+        string $content,
+        ?string $knowledge_base_id = null
+    ) {
+        $api = new EC_Rag_Api_Client(
+            function () use ($knowledge_base_id) {
+                $options = EC_Rag_Options::get();
+                if ($knowledge_base_id !== null) {
+                    $options['knowledge_base_id'] = $knowledge_base_id;
+                }
+
+                return $options;
+            }
+        );
 
         return $api->post_multipart(
             '/api/v1/files?async=true',
@@ -378,8 +424,20 @@ class EC_Rag_Ingestion {
      * @param int $post_id
      * @return array|WP_Error|null
      */
-    public static function delete_snapshot(int $post_id) {
-        $api      = new EC_Rag_Api_Client(fn() => EC_Rag_Options::get());
+    public static function delete_snapshot(
+        int $post_id,
+        ?string $knowledge_base_id = null
+    ) {
+        $api = new EC_Rag_Api_Client(
+            function () use ($knowledge_base_id) {
+                $options = EC_Rag_Options::get();
+                if ($knowledge_base_id !== null) {
+                    $options['knowledge_base_id'] = $knowledge_base_id;
+                }
+
+                return $options;
+            }
+        );
         $path     = EC_Rag_Utils::sanitize_file_path('wordpress/posts/post-' . $post_id . '.txt');
 
         return $api->delete('/api/v1/files/' . $path);
@@ -460,6 +518,9 @@ class EC_Rag_Ingestion {
             'succeeded'    => 0,
             'failed'       => 0,
             'errors'       => [],
+            'knowledge_base_id' => sanitize_text_field(
+                (EC_Rag_Options::get())['knowledge_base_id'] ?? ''
+            ),
         ];
 
         $previous_state = self::get_import_state();
@@ -596,7 +657,10 @@ class EC_Rag_Ingestion {
                 continue;
             }
 
-            $response = self::ingest_article($article);
+            $response = self::ingest_article(
+                $article,
+                sanitize_text_field($state['knowledge_base_id'] ?? '')
+            );
 
             if (is_wp_error($response)) {
                 $state['failed']    = absint($state['failed'] ?? 0) + 1;

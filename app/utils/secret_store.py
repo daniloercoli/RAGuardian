@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,15 @@ class SecretStore:
             self._save_unlocked(data)
         return ref
 
+    def create_secret(self, owner_id: str, name: str, value: str) -> str:
+        """Create an immutable, versioned reference for transactional swaps."""
+        ref = f"{secret_ref(owner_id, name)}:v:{uuid.uuid4().hex}"
+        with self._lock:
+            data = self._load_unlocked()
+            data[ref] = self._encrypt(value)
+            self._save_unlocked(data)
+        return ref
+
     def get_secret(self, ref: str) -> str:
         with self._lock:
             payload = self._load_unlocked().get(ref)
@@ -50,6 +60,18 @@ class SecretStore:
                 data.pop(key, None)
             self._save_unlocked(data)
         return len(keys)
+
+    def delete_secret(self, ref: str) -> bool:
+        """Delete one exact secret reference without touching sibling secrets."""
+        if not ref:
+            return False
+        with self._lock:
+            data = self._load_unlocked()
+            if ref not in data:
+                return False
+            data.pop(ref, None)
+            self._save_unlocked(data)
+            return True
 
     def _encrypt(self, value: str) -> dict:
         raw = str(value or "").encode("utf-8")
@@ -80,9 +102,13 @@ class SecretStore:
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Archivio segreti non valido: {self.path}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Archivio segreti non valido: {self.path}")
+        return data
 
     def _save_unlocked(self, data: dict) -> None:
         fd, tmp_name = tempfile.mkstemp(

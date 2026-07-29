@@ -13,7 +13,11 @@ from typing import Iterable
 from utils.data_ingestion.jobs import start_data_source_sync_job
 from utils.settings_store import SettingsStore
 from utils.user_store import UserStore
-from utils.workspace import workspace_for_user
+from utils.workspace import (
+    knowledge_base_context,
+    knowledge_base_store,
+    workspace_for_user,
+)
 
 
 log = logging.getLogger(__name__)
@@ -34,7 +38,12 @@ def poll_due_data_sources(app=None, *, now: datetime | None = None) -> dict:
     for config in workspace_configs(app):
         summary["workspaces"] += 1
         settings = SettingsStore(config["SETTINGS_FILE"]).load()
-        sources = settings.get("data_sources", [])
+        sources = [
+            source
+            for source in settings.get("data_sources", [])
+            if (source.get("knowledge_base_id") or "default")
+            == config.get("KNOWLEDGE_BASE_ID", "default")
+        ]
         summary["sources_checked"] += len(sources)
         for source in due_data_sources(sources, now=now):
             source_id = source.get("id", "")
@@ -98,7 +107,61 @@ def workspace_configs(app) -> Iterable[dict]:
     for user in users:
         if not user.get("enabled", True):
             continue
-        yield workspace_for_user(user, app=app).as_config()
+        from utils.index_lock import lifecycle_read_lock
+
+        with lifecycle_read_lock():
+            current = UserStore(app.config["USERS_FILE"]).get(user["id"])
+            if not current or not current.get("enabled", True):
+                continue
+            workspace = workspace_for_user(current, app=app)
+            records = knowledge_base_store(workspace, app=app).list()
+            _mark_unavailable_data_sources(
+                workspace.settings_file,
+                records,
+            )
+            configs = []
+            for record in records:
+                if record.get("status") != "active":
+                    continue
+                config = knowledge_base_context(
+                    workspace,
+                    record["id"],
+                    create_dirs=True,
+                ).as_config()
+                config["USERS_FILE"] = app.config["USERS_FILE"]
+                configs.append(config)
+        yield from configs
+
+
+def _mark_unavailable_data_sources(
+    settings_file: str,
+    knowledge_bases: list[dict],
+) -> None:
+    statuses = {
+        item["id"]: item.get("status", "active")
+        for item in knowledge_bases
+    }
+    store = SettingsStore(settings_file)
+
+    def mutate(settings: dict) -> None:
+        for source in settings.get("data_sources", []):
+            knowledge_base_id = source.get("knowledge_base_id") or "default"
+            status = statuses.get(knowledge_base_id, "missing")
+            if status == "active":
+                continue
+            message = (
+                f"Knowledge base non disponibile: {knowledge_base_id} ({status})"
+            )
+            if (
+                source.get("last_sync_status") != "failed"
+                or source.get("last_error") != message
+                or source.get("next_sync_at")
+            ):
+                source["last_sync_status"] = "failed"
+                source["last_error"] = message
+                source["next_sync_at"] = ""
+
+    store.mutate(mutate)
 
 
 def run_forever(app=None, *, interval_seconds: int | None = None) -> None:

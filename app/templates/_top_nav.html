@@ -9,6 +9,7 @@
 {% if nav_mode == "admin" %}
     <nav class="top-nav admin-nav" aria-label="Administration">
         <div class="nav-track">
+            {{ nav_link("knowledge_bases_page", "Knowledge Bases") }}
             {{ nav_link("admin_files", "RAG Files") }}
             {{ nav_link("admin_data_sources", "Data Sources") }}
             {% if current_user and current_user.role == "admin" %}

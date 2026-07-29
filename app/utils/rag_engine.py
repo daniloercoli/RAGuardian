@@ -6,6 +6,7 @@ from config import Config
 from utils import RAG_LOGGER as log
 from utils.cache import RAGCache
 from utils.chroma_manager import query_chroma, query_chroma_with_rerank
+from utils.index_lock import register_lifecycle_invalidator
 from utils.conversation_memory import (
     fallback_summary,
     format_turns,
@@ -14,6 +15,7 @@ from utils.conversation_memory import (
 from utils.reranker import get_reranker
 from utils.file_index import FileIndex
 from utils.providers.provider_factory import ProviderFactory
+from utils.providers.embedding_factory import EmbeddingFactory
 from utils.providers.registry import ProviderRegistry
 from utils.provider_config import resolve_api_key
 from utils.retry import ErrorUtils
@@ -22,6 +24,17 @@ from .model_defaults import load_builtin_reranker_providers
 
 
 _cache = RAGCache()
+
+
+def _invalidate_lifecycle_runtime_caches() -> None:
+    clear_cache()
+    ProviderFactory.reset_cache()
+
+
+register_lifecycle_invalidator(
+    "rag-provider-runtime",
+    _invalidate_lifecycle_runtime_caches,
+)
 
 
 def query_rag(
@@ -539,6 +552,10 @@ def get_cache_stats():
 
 def clear_cache():
     _cache.clear()
+
+
+def clear_cache_for_collection(collection_name: str) -> int:
+    return _cache.clear_collection(collection_name)
 
 
 def _conversation_context(conversation_id: Optional[str]) -> str:

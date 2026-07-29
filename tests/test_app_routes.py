@@ -1,10 +1,13 @@
+import concurrent.futures
 import importlib
 import io
 import json
 import re
 import sys
+import threading
 import time
 import types
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
@@ -164,6 +167,60 @@ def test_admin_files_paginates_indexed_files(client, flask_app, tmp_path):
     assert 'aria-current="page">2</span>' in html
 
 
+def test_admin_create_backup_uses_configured_workspace_roots(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    backup_manager = importlib.import_module(
+        "utils.vector_store.backup_manager"
+    )
+    captured = {}
+
+    def fake_create_backup(**kwargs):
+        captured.update(kwargs)
+        return {"id": "backup-1", "document_count": 0}
+
+    monkeypatch.setattr(backup_manager, "create_backup", fake_create_backup)
+    _login(client)
+
+    response = client.post("/admin/backup/create")
+
+    assert response.status_code == 302
+    assert captured == {
+        "workspace_data_dir": flask_app.config["WORKSPACE_DATA_DIR"],
+        "workspace_upload_dir": flask_app.config["WORKSPACE_UPLOAD_DIR"],
+    }
+
+
+def test_admin_restore_backup_uses_configured_workspace_roots(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    backup_manager = importlib.import_module(
+        "utils.vector_store.backup_manager"
+    )
+    captured = {}
+
+    def fake_restore_backup(backup_id, **kwargs):
+        captured["backup_id"] = backup_id
+        captured.update(kwargs)
+        return {"status": "success", "document_count": 0}
+
+    monkeypatch.setattr(backup_manager, "restore_backup", fake_restore_backup)
+    _login(client)
+
+    response = client.post("/admin/backup/restore/backup-1")
+
+    assert response.status_code == 302
+    assert captured == {
+        "backup_id": "backup-1",
+        "workspace_data_dir": flask_app.config["WORKSPACE_DATA_DIR"],
+        "workspace_upload_dir": flask_app.config["WORKSPACE_UPLOAD_DIR"],
+    }
+
+
 def test_user_api_key_expiration_uses_full_timestamp(flask_app):
     store = UserStore(flask_app.config["USERS_FILE"])
     user = store.create_user(email="api-user@example.com", password="secret-pass")
@@ -187,6 +244,116 @@ def test_user_api_key_expiration_uses_full_timestamp(flask_app):
 
         assert find_api_key("fresh-key") is not None
         assert find_api_key("expired-key") is None
+
+
+def test_disabled_user_api_keys_are_revoked(flask_app):
+    store = UserStore(flask_app.config["USERS_FILE"])
+    user = store.create_user(
+        email="disabled-api-user@example.com",
+        password="secret-pass",
+    )
+    store.create_api_key(
+        user_id=user["id"],
+        name="disabled-owner",
+        scopes=["query", "ingest", "kb_manage"],
+        api_key_value="disabled-owner-key",
+    )
+    assert store.update_user(user["id"], enabled=False)["enabled"] is False
+
+    with flask_app.app_context():
+        from utils.auth import find_api_key
+
+        assert find_api_key("disabled-owner-key") is None
+
+
+def test_api_key_lookup_does_not_provision_its_owner_workspace(flask_app):
+    from utils.auth import find_api_key
+    from utils.workspace import safe_workspace_id
+
+    store = UserStore(flask_app.config["USERS_FILE"])
+    user = store.create_user(
+        email="lookup-only@example.com",
+        password="secret-pass",
+    )
+    store.create_api_key(
+        user_id=user["id"],
+        name="lookup-only",
+        scopes=["query"],
+        api_key_value="lookup-only-key",
+    )
+    workspace_id = safe_workspace_id(user["id"])
+    data_path = Path(flask_app.config["WORKSPACE_DATA_DIR"]) / workspace_id
+    upload_path = Path(flask_app.config["WORKSPACE_UPLOAD_DIR"]) / workspace_id
+
+    assert not data_path.exists()
+    assert not upload_path.exists()
+    with flask_app.app_context():
+        principal = find_api_key("lookup-only-key")
+
+    assert principal["workspace_id"] == workspace_id
+    assert not data_path.exists()
+    assert not upload_path.exists()
+
+
+def test_api_key_lookup_does_not_bootstrap_an_empty_user_store(
+    flask_app,
+    tmp_path,
+):
+    from utils.auth import find_api_key
+
+    empty_users_file = tmp_path / "empty-users.json"
+    flask_app.config["USERS_FILE"] = str(empty_users_file)
+
+    with flask_app.app_context():
+        assert find_api_key("unknown-key") is None
+
+    assert UserStore(empty_users_file).list() == []
+    assert not empty_users_file.exists()
+
+
+def test_session_request_does_not_log_an_unselected_api_key(
+    client,
+    flask_app,
+):
+    from utils.api_key_logger import ApiKeyLogger
+    from utils.job_store import get_job_store
+    from utils.workspace import workspace_for_user
+
+    store = UserStore(flask_app.config["USERS_FILE"])
+    session_user = store.list()[0]
+    workspace = workspace_for_user(session_user, app=flask_app)
+    foreign_user = store.create_user(
+        email="foreign-key@example.com",
+        password="secret-pass",
+    )
+    store.create_api_key(
+        user_id=foreign_user["id"],
+        name="foreign",
+        scopes=["ingest"],
+        api_key_value="foreign-key",
+    )
+    get_job_store().create_job(
+        {
+            "id": "session-owned-job",
+            "type": "file_upload",
+            "status": "completed",
+            "workspace_id": workspace.workspace_id,
+            "knowledge_base_id": "default",
+        }
+    )
+    _login(client)
+
+    response = client.get(
+        "/api/v1/jobs/session-owned-job",
+        headers={"X-API-Key": "foreign-key"},
+    )
+
+    assert response.status_code == 200
+    foreign_key = store.get_api_key(foreign_user["id"], "foreign")
+    assert foreign_key["usage_count"] == 0
+    assert ApiKeyLogger(
+        flask_app.config["API_KEY_USAGE_FILE"]
+    ).recent_entries() == []
 
 
 def test_admin_cannot_reveal_api_key_after_creation(client, flask_app):
@@ -490,7 +657,11 @@ def test_conversation_clear_endpoint_resets_memory(client, flask_app):
     response = client.delete(f"/conversation/{conversation_id}")
 
     assert response.status_code == 200
-    assert response.get_json() == {"conversation_id": conversation_id, "cleared": True}
+    assert response.get_json() == {
+        "conversation_id": conversation_id,
+        "cleared": True,
+        "knowledge_base_id": "default",
+    }
     assert get_conversation_store().render_for_prompt(scoped_id) == ""
 
 
@@ -733,6 +904,69 @@ def test_health_status_includes_system_readiness_fields(flask_app, monkeypatch):
     assert status["queue_ready"] is True
     assert status["queue_depth"] == 0
     assert status["active_jobs_count"] == 0
+
+
+def test_health_status_reads_runtime_dependencies_under_the_lifecycle_gate(
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    chroma_manager = importlib.import_module("utils.chroma_manager")
+    embedding_factory = importlib.import_module(
+        "utils.providers.embedding_factory"
+    )
+    index_lock = importlib.import_module("utils.index_lock")
+    state = {"locked": False, "scope": "", "embedding_checked": False}
+
+    @contextmanager
+    def fake_lifecycle_lock(*, scope=None):
+        assert state["locked"] is False
+        state["locked"] = True
+        state["scope"] = scope
+        try:
+            yield
+        finally:
+            state["locked"] = False
+
+    def fake_collection_status(*, collection_name=None):
+        assert state["locked"] is True
+        return {
+            "collection": collection_name,
+            "documents_count": 0,
+        }
+
+    def fake_embedding_provider():
+        assert state["locked"] is True
+        state["embedding_checked"] = True
+        return object()
+
+    monkeypatch.setattr(
+        index_lock,
+        "lifecycle_read_lock",
+        fake_lifecycle_lock,
+    )
+    monkeypatch.setattr(
+        chroma_manager,
+        "get_collection_status",
+        fake_collection_status,
+    )
+    monkeypatch.setattr(
+        embedding_factory.EmbeddingFactory,
+        "get_provider",
+        fake_embedding_provider,
+    )
+    config = {
+        **flask_app.config,
+        "CHROMA_COLLECTION": "documents_health",
+    }
+
+    app_module._health_status(flask_app, deep=True, config=config)
+
+    assert state == {
+        "locked": False,
+        "scope": "documents_health",
+        "embedding_checked": True,
+    }
 
 
 def test_health_status_degrades_when_configured_redis_is_unavailable(flask_app, monkeypatch):
@@ -1451,6 +1685,83 @@ def test_admin_ocr_save_updates_existing_workspace_for_upload(client, flask_app,
     assert payload["ocr_used"] is True
 
 
+def test_concurrent_admin_config_posts_propagate_latest_snapshot(
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    workspace = _workspace_context(flask_app)
+    first_client = flask_app.test_client()
+    second_client = flask_app.test_client()
+    _login(first_client)
+    _login(second_client)
+
+    first_sync_started = threading.Event()
+    release_first_sync = threading.Event()
+    second_request_started = threading.Event()
+    second_sync_started = threading.Event()
+    original_sync = app_module._sync_admin_settings_to_workspaces
+
+    def controlled_sync(app, settings):
+        query_k = settings["rag"]["query_k"]
+        if query_k == 3:
+            first_sync_started.set()
+            if not release_first_sync.wait(timeout=5):
+                raise AssertionError("Timed out waiting to release first config sync")
+        elif query_k == 9:
+            second_sync_started.set()
+        original_sync(app, settings)
+
+    def save_config(test_client, query_k, started=None):
+        if started is not None:
+            started.set()
+        return test_client.post(
+            "/admin/config",
+            data={
+                "action": "save_rag",
+                "embedding_model": (
+                    "local/sentence-transformers/all-MiniLM-L6-v2"
+                ),
+                "chunk_size": "1000",
+                "chunk_overlap": "150",
+                "query_k": str(query_k),
+                "temperature": "0.3",
+                "cache_ttl": "3600",
+            },
+        )
+
+    monkeypatch.setattr(
+        app_module,
+        "_sync_admin_settings_to_workspaces",
+        controlled_sync,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(save_config, first_client, 3)
+        assert first_sync_started.wait(timeout=2)
+        second = executor.submit(
+            save_config,
+            second_client,
+            9,
+            second_request_started,
+        )
+        assert second_request_started.wait(timeout=2)
+        try:
+            assert not second_sync_started.wait(timeout=0.2)
+        finally:
+            release_first_sync.set()
+        first_response = first.result(timeout=5)
+        second_response = second.result(timeout=5)
+
+    global_settings = SettingsStore(flask_app.config["SETTINGS_FILE"]).load()
+    workspace_settings = SettingsStore(workspace.settings_file).load()
+    assert first_response.status_code == 302
+    assert second_response.status_code == 302
+    assert second_sync_started.is_set()
+    assert global_settings["rag"]["query_k"] == 9
+    assert workspace_settings["rag"]["query_k"] == 9
+
+
 def test_admin_config_does_not_render_full_provider_or_reranker_secrets(client, flask_app):
     client.post("/admin/login", data={"password": "admin"})
     SettingsStore(flask_app.config["SETTINGS_FILE"]).update(
@@ -1678,6 +1989,287 @@ def test_api_audio_upload_async_queues_redis_job(client, monkeypatch):
     assert enqueued[0]["upload"]["language_override"] == "it"
     assert status.status_code == 200
     assert status.get_json()["current_file"] == "meeting.mp3"
+
+
+@pytest.mark.parametrize("failure_mode", ["admission", "enqueue", "thread_start"])
+@pytest.mark.parametrize(
+    ("endpoint", "filename", "existing_content", "new_content", "mimetype"),
+    [
+        (
+            "/api/v1/files?async=true",
+            "existing.txt",
+            b"existing document",
+            b"replacement document",
+            "text/plain",
+        ),
+        (
+            "/api/v1/audio?async=true",
+            "existing.mp3",
+            b"existing audio",
+            MP3_BYTES,
+            "audio/mpeg",
+        ),
+    ],
+)
+def test_async_upload_start_failure_preserves_existing_file(
+    client,
+    flask_app,
+    monkeypatch,
+    failure_mode,
+    endpoint,
+    filename,
+    existing_content,
+    new_content,
+    mimetype,
+):
+    app_module = importlib.import_module("app.app")
+    workspace = _workspace_context(flask_app)
+    existing_path = Path(workspace.upload_folder) / filename
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path.write_bytes(existing_content)
+
+    if failure_mode == "admission":
+        class BrokenJobStore:
+            def create_job(self, _job):
+                raise RuntimeError("job admission failed")
+
+        monkeypatch.setattr(
+            app_module,
+            "get_job_store",
+            lambda: BrokenJobStore(),
+        )
+    elif failure_mode == "enqueue":
+        monkeypatch.setattr(
+            app_module,
+            "configured_queue_backend",
+            lambda: "redis",
+        )
+
+        def fail_enqueue(*_args, **_kwargs):
+            raise RuntimeError("queue unavailable")
+
+        monkeypatch.setattr(app_module, "_enqueue_upload_job", fail_enqueue)
+    else:
+        monkeypatch.setattr(
+            app_module,
+            "configured_queue_backend",
+            lambda: "inline",
+        )
+
+        class BrokenThread:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        monkeypatch.setattr(app_module.threading, "Thread", BrokenThread)
+
+    response = client.post(
+        endpoint,
+        data={"file": (io.BytesIO(new_content), filename, mimetype)},
+        headers={"X-API-Key": "test-api-key"},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 500
+    assert existing_path.read_bytes() == existing_content
+    assert not list(
+        existing_path.parent.glob(f".{filename}.*.pending-upload")
+    )
+
+
+def test_async_replacement_failure_restores_file_vectors_and_file_index(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    import utils.chroma_manager as chroma_manager
+    import utils.rag_engine as rag_engine
+
+    workspace = _workspace_context(flask_app)
+    filename = "existing.txt"
+    existing_path = Path(workspace.upload_folder) / filename
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path.write_bytes(b"existing document")
+    old_entry = FileIndex(workspace.file_index).record(
+        filename,
+        str(existing_path),
+        2,
+        status="indexed",
+        metadata={"document_id": "old-document"},
+    )
+    vector_state = {"chunks": ["old-0", "old-1"]}
+    restored_snapshots = []
+
+    monkeypatch.setattr(
+        chroma_manager,
+        "snapshot_documents_by_source",
+        lambda source, **kwargs: {
+            "source": source,
+            "chunks": list(vector_state["chunks"]),
+        },
+    )
+
+    def restore_vectors(source, snapshot, **kwargs):
+        restored_snapshots.append((source, snapshot))
+        vector_state["chunks"] = list(snapshot["chunks"])
+        return len(vector_state["chunks"])
+
+    monkeypatch.setattr(
+        chroma_manager,
+        "restore_documents_by_source",
+        restore_vectors,
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "clear_cache_for_collection",
+        lambda collection_name: None,
+    )
+
+    def fail_index(config, filename, file_path, **kwargs):
+        assert Path(file_path).read_bytes() == b"replacement document"
+        vector_state["chunks"] = ["replacement-partial"]
+        FileIndex(config["FILE_INDEX"]).record(
+            filename,
+            file_path,
+            0,
+            status="empty",
+            error="replacement failed",
+        )
+        raise app_module.ValidationError("replacement failed", "file")
+
+    monkeypatch.setattr(app_module, "_index_saved_document_upload", fail_index)
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(app_module.threading, "Thread", ImmediateThread)
+
+    response = client.post(
+        "/api/v1/files?async=true",
+        data={
+            "file": (
+                io.BytesIO(b"replacement document"),
+                filename,
+                "text/plain",
+            )
+        },
+        headers={"X-API-Key": "test-api-key"},
+        content_type="multipart/form-data",
+    )
+
+    payload = response.get_json()
+    restored_entry = FileIndex(workspace.file_index).get(filename)
+    assert response.status_code == 202
+    assert payload["status"] == "failed"
+    assert existing_path.read_bytes() == b"existing document"
+    assert vector_state["chunks"] == ["old-0", "old-1"]
+    assert restored_snapshots[0][0] == str(existing_path)
+    assert restored_entry == old_entry
+    assert not list(existing_path.parent.glob(f".{filename}.*.pending-upload"))
+    assert not list(existing_path.parent.glob(f".{filename}.*.rollback-upload"))
+
+
+def test_async_replacement_success_discards_rollback_snapshot(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    import utils.chroma_manager as chroma_manager
+
+    workspace = _workspace_context(flask_app)
+    filename = "existing.txt"
+    existing_path = Path(workspace.upload_folder) / filename
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path.write_bytes(b"existing document")
+    FileIndex(workspace.file_index).record(
+        filename,
+        str(existing_path),
+        1,
+        status="indexed",
+        metadata={"document_id": "old-document"},
+    )
+    vector_state = {"chunks": ["old"]}
+    restore_calls = []
+
+    monkeypatch.setattr(
+        chroma_manager,
+        "snapshot_documents_by_source",
+        lambda source, **kwargs: {"chunks": list(vector_state["chunks"])},
+    )
+    monkeypatch.setattr(
+        chroma_manager,
+        "restore_documents_by_source",
+        lambda *args, **kwargs: restore_calls.append((args, kwargs)),
+    )
+
+    def index_replacement(config, filename, file_path, **kwargs):
+        assert Path(file_path).read_bytes() == b"replacement document"
+        vector_state["chunks"] = ["new-0", "new-1"]
+        FileIndex(config["FILE_INDEX"]).record(
+            filename,
+            file_path,
+            2,
+            status="indexed",
+            metadata={"document_id": "new-document"},
+        )
+        return {
+            "message": "replacement indexed",
+            "filename": filename,
+            "chunks": 2,
+            "status": "indexed",
+            "document_id": "new-document",
+        }
+
+    monkeypatch.setattr(
+        app_module,
+        "_index_saved_document_upload",
+        index_replacement,
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(app_module.threading, "Thread", ImmediateThread)
+
+    response = client.post(
+        "/api/v1/files?async=true",
+        data={
+            "file": (
+                io.BytesIO(b"replacement document"),
+                filename,
+                "text/plain",
+            )
+        },
+        headers={"X-API-Key": "test-api-key"},
+        content_type="multipart/form-data",
+    )
+
+    payload = response.get_json()
+    indexed_entry = FileIndex(workspace.file_index).get(filename)
+    assert response.status_code == 202
+    assert payload["status"] == "completed"
+    assert existing_path.read_bytes() == b"replacement document"
+    assert vector_state["chunks"] == ["new-0", "new-1"]
+    assert indexed_entry["document_id"] == "new-document"
+    assert restore_calls == []
+    assert not list(existing_path.parent.glob(f".{filename}.*.pending-upload"))
+    assert not list(existing_path.parent.glob(f".{filename}.*.rollback-upload"))
 
 
 def test_api_file_upload_rejects_extension_spoofed_pdf(client, monkeypatch):
@@ -2013,7 +2605,11 @@ def test_rebuild_index_job_resets_collection_and_reindexes_files(flask_app, monk
     cache_clears = []
     monkeypatch.setattr(chroma_manager, "reset_chroma_collection", lambda **kwargs: reset_calls.append(True))
     monkeypatch.setattr(chroma_manager, "add_documents_to_chroma", lambda documents, **kwargs: added_documents.extend(documents))
-    monkeypatch.setattr(rag_engine, "clear_cache", lambda: cache_clears.append(True))
+    monkeypatch.setattr(
+        rag_engine,
+        "clear_cache_for_collection",
+        lambda collection_name: cache_clears.append(collection_name),
+    )
     monkeypatch.setattr(EmbeddingFactory, "reset_cache", lambda: None)
     fake_pdf_processor = types.ModuleType("utils.pdf_processor")
     fake_pdf_processor.process_pdf = lambda file_path, settings_path=None: [
@@ -2057,13 +2653,67 @@ def test_rebuild_index_job_resets_collection_and_reindexes_files(flask_app, monk
     entry = FileIndex(workspace.file_index).get("demo.pdf")
     assert reset_calls == [True]
     assert len(added_documents) == 1
-    assert cache_clears
+    assert cache_clears == [
+        workspace_config["CHROMA_COLLECTION"],
+        workspace_config["CHROMA_COLLECTION"],
+    ]
     assert job["status"] == "completed"
     assert job["processed"] == 1
     assert entry["status"] == "indexed"
     assert entry["chunks"] == 1
     assert entry["document_id"] == "doc123"
     assert entry["index_profile"] == profile
+
+
+def test_rebuild_index_job_finishes_when_index_lock_times_out(
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    import utils.index_lock as index_lock
+
+    workspace_config = _workspace_context(flask_app).as_config()
+    job_store = app_module.get_job_store()
+    job = {
+        "id": "lock-timeout-job",
+        "type": "rebuild_index",
+        "status": "queued",
+        "message": "",
+        "processed": 0,
+        "total": 0,
+        "current_file": "",
+        "errors": [],
+        "profile": {},
+        "workspace_id": workspace_config["WORKSPACE_ID"],
+        "knowledge_base_id": workspace_config["KNOWLEDGE_BASE_ID"],
+        "started_at": 0,
+        "finished_at": None,
+    }
+    assert job_store.create_rebuild_job(job)[1] == 202
+
+    class TimedOutLock:
+        def __enter__(self):
+            raise TimeoutError("index lock timeout")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(index_lock, "index_write_lock", TimedOutLock)
+
+    app_module._run_rebuild_index_job(
+        job["id"],
+        workspace_config,
+        {},
+        [],
+    )
+
+    failed = job_store.get(job["id"])
+    assert failed["status"] == "failed"
+    assert failed["finished_at"] is not None
+    assert failed["errors"][-1]["error"] == "index lock timeout"
+    assert job_store.create_rebuild_job(
+        {**job, "id": "next-rebuild", "status": "queued"}
+    )[1] == 202
 
 
 def test_rebuild_index_start_uses_redis_queue_backend(flask_app, monkeypatch):
@@ -2413,6 +3063,42 @@ def test_ask_with_attachment_and_code_interpreter_off_uses_ephemeral_rag(client,
         for doc in captured["context_docs"]
     )
     assert any(ctx["metadata"].get("temporary_attachment") is True for ctx in payload["context"])
+
+
+def test_staged_upload_checks_distributed_lease_between_mutation_phases(
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    index_lock = importlib.import_module("utils.index_lock")
+    checks = []
+
+    monkeypatch.setattr(
+        index_lock,
+        "assert_distributed_locks_healthy",
+        lambda: checks.append("healthy"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_commit_staged_upload",
+        lambda upload, **_kwargs: (dict(upload), None),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_index_saved_document_upload",
+        lambda _config, **upload: {
+            "filename": upload["filename"],
+            "status": "indexed",
+        },
+    )
+
+    result = app_module._index_staged_upload(
+        {},
+        "file",
+        {"filename": "lease.txt"},
+    )
+
+    assert result == {"filename": "lease.txt", "status": "indexed"}
+    assert checks == ["healthy", "healthy", "healthy"]
 
 
 def test_missing_default_provider_file_is_visible_on_app_load(tmp_path, monkeypatch):

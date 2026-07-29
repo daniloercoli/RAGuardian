@@ -20,6 +20,15 @@ class EC_Rag_Api_Client {
     /** Initial backoff delay in seconds. */
     const INITIAL_DELAY = 1;
 
+    /** Settings-page catalog lookups must never inherit the normal request timeout. */
+    const KNOWLEDGE_BASE_CATALOG_TIMEOUT = 3;
+
+    /** Cache a successful authorized catalog for five minutes. */
+    const KNOWLEDGE_BASE_CATALOG_TTL = 300;
+
+    /** Briefly cache failures so an unavailable service does not stall every page load. */
+    const KNOWLEDGE_BASE_CATALOG_ERROR_TTL = 30;
+
     /** The options array (injected via dependency). */
     public $options = [];
 
@@ -68,6 +77,9 @@ class EC_Rag_Api_Client {
             return $result;
         }
 
+        if (strpos($path, '/api/v1/health') === 0) {
+            $path = $this->append_knowledge_base_query($path);
+        }
         $url = $this->options['base_url'] . $path;
         $args = [
             'timeout' => absint($this->options['request_timeout'] ?? 45),
@@ -85,6 +97,84 @@ class EC_Rag_Api_Client {
     }
 
     /**
+     * Fetch the API-key-authorized knowledge-base catalog for the settings UI.
+     *
+     * Unlike normal API traffic, this lookup is short, single-attempt, and
+     * cached by endpoint + API key. A failed lookup is also cached briefly so
+     * repeatedly rendering wp-admin cannot multiply a network outage into a
+     * long delay.
+     *
+     * @return array|WP_Error
+     */
+    public function get_knowledge_base_catalog() {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+
+        $cache_key = $this->knowledge_base_catalog_cache_key();
+        $cached = get_transient($cache_key);
+        if (is_array($cached) && array_key_exists('ok', $cached)) {
+            if ($cached['ok'] && is_array($cached['payload'] ?? null)) {
+                return $cached['payload'];
+            }
+
+            return new WP_Error(
+                'ec_rag_catalog_unavailable',
+                sanitize_text_field(
+                    $cached['message'] ?? __('Knowledge-base catalog is unavailable', 'ec-rag')
+                )
+            );
+        }
+
+        $url = $this->options['base_url'] . '/api/v1/knowledge-bases';
+        $args = [
+            'timeout' => self::KNOWLEDGE_BASE_CATALOG_TIMEOUT,
+            'blocking' => true,
+            'headers' => [
+                'X-API-Key'    => $this->options['api_key'],
+                'X-Request-ID' => $this->request_id,
+            ],
+        ];
+        $response = $this->do_request('GET', $url, $args);
+        $decoded = self::decode_response($response);
+        $valid_catalog = (
+            is_array($decoded)
+            && array_key_exists('knowledge_bases', $decoded)
+            && is_array($decoded['knowledge_bases'])
+        );
+
+        if (is_wp_error($decoded) || !$valid_catalog) {
+            $message = is_wp_error($decoded)
+                ? $decoded->get_error_message()
+                : __('Knowledge-base catalog returned an invalid response', 'ec-rag');
+            set_transient(
+                $cache_key,
+                [
+                    'ok'      => false,
+                    'message' => sanitize_text_field($message),
+                ],
+                self::KNOWLEDGE_BASE_CATALOG_ERROR_TTL
+            );
+
+            return is_wp_error($decoded)
+                ? $decoded
+                : new WP_Error('ec_rag_invalid_catalog', $message);
+        }
+
+        set_transient(
+            $cache_key,
+            [
+                'ok'      => true,
+                'payload' => $decoded,
+            ],
+            self::KNOWLEDGE_BASE_CATALOG_TTL
+        );
+
+        return $decoded;
+    }
+
+    /**
      * JSON POST request with retry logic.
      *
      * @param string $path The API path.
@@ -98,6 +188,12 @@ class EC_Rag_Api_Client {
             return $result;
         }
 
+        if (
+            strpos($path, '/api/v1/query') === 0
+            && $this->knowledge_base_id() !== ''
+        ) {
+            $payload['knowledge_base_id'] = $this->knowledge_base_id();
+        }
         $url = $this->options['base_url'] . $path;
         $args = [
             'timeout' => absint($this->options['request_timeout'] ?? 45),
@@ -132,6 +228,15 @@ class EC_Rag_Api_Client {
 
         $boundary = 'ec-rag-' . wp_generate_uuid4();
         $body     = '';
+        if (
+            (
+                strpos($path, '/api/v1/files') === 0
+                || strpos($path, '/api/v1/audio') === 0
+            )
+            && $this->knowledge_base_id() !== ''
+        ) {
+            $fields['knowledge_base_id'] = $this->knowledge_base_id();
+        }
 
         foreach ($fields as $name => $value) {
             $body .= '--' . $boundary . "\r\n";
@@ -178,6 +283,9 @@ class EC_Rag_Api_Client {
             return $result;
         }
 
+        if (strpos($path, '/api/v1/files/') === 0) {
+            $path = $this->append_knowledge_base_query($path);
+        }
         $url = $this->options['base_url'] . $path;
         $args = [
             'method'  => 'DELETE',
@@ -270,6 +378,45 @@ class EC_Rag_Api_Client {
         );
 
         return new WP_Error('ec_rag_request_failed', __('HTTP request failed after retries', 'ec-rag'));
+    }
+
+    /**
+     * Return the server-side configured target. An empty value means default.
+     *
+     * @return string
+     */
+    protected function knowledge_base_id(): string {
+        $value = sanitize_text_field($this->options['knowledge_base_id'] ?? '');
+
+        return preg_match('/^kb_[0-9a-f]{32}$/', $value) ? $value : '';
+    }
+
+    /**
+     * Append the configured target as a query parameter when non-default.
+     *
+     * @param string $path API path.
+     * @return string
+     */
+    protected function append_knowledge_base_query(string $path): string {
+        $knowledge_base_id = $this->knowledge_base_id();
+        if ($knowledge_base_id === '') {
+            return $path;
+        }
+
+        return add_query_arg('knowledge_base_id', $knowledge_base_id, $path);
+    }
+
+    /**
+     * Return a credential-scoped transient key without exposing the API key.
+     *
+     * @return string
+     */
+    protected function knowledge_base_catalog_cache_key(): string {
+        $identity = rtrim((string) $this->options['base_url'], '/')
+            . "\0"
+            . (string) $this->options['api_key'];
+
+        return 'ec_rag_kb_catalog_' . hash('sha256', $identity);
     }
 
     /**

@@ -79,6 +79,18 @@ class FileIndex:
                 self._save_unlocked(entries)
         return removed
 
+    def restore_entry(self, filename: str, entry: Optional[dict]) -> None:
+        """Restore one entry exactly while preserving unrelated index updates."""
+        with self._lock:
+            entries = [
+                item
+                for item in self._list_unlocked()
+                if item.get("filename") != filename
+            ]
+            if entry:
+                entries.insert(0, dict(entry))
+            self._save_unlocked(entries)
+
     def _save(self, entries: List[dict]) -> None:
         with self._lock:
             self._save_unlocked(entries)

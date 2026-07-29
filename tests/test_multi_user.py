@@ -1,5 +1,6 @@
 import importlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -227,7 +228,56 @@ def test_secret_store_encrypts_values_without_plaintext(tmp_path):
     assert json.loads(raw)[ref]["ciphertext"]
 
 
-def test_data_source_password_is_saved_as_user_secret(client, flask_app):
+def test_secret_store_never_overwrites_a_corrupt_store(tmp_path):
+    path = tmp_path / "secrets.json"
+    corrupt_payload = "{not-valid-json"
+    path.write_text(corrupt_payload, encoding="utf-8")
+    store = SecretStore(str(path), key="test-secret-key")
+
+    with pytest.raises(ValueError, match="Archivio segreti non valido"):
+        store.delete_owner("workspace-a")
+    assert path.read_text(encoding="utf-8") == corrupt_payload
+
+    with pytest.raises(ValueError, match="Archivio segreti non valido"):
+        store.set_secret("workspace-a", "mail:password", "new-secret")
+    assert path.read_text(encoding="utf-8") == corrupt_payload
+
+
+def test_data_source_password_is_saved_as_user_secret(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    index_lock = importlib.import_module("utils.index_lock")
+    secret_store_module = importlib.import_module("utils.secret_store")
+    state = {"depth": 0, "scopes": []}
+
+    @contextmanager
+    def fake_lifecycle_lock(*, scope=None):
+        if state["depth"] == 0:
+            state["scopes"].append(scope)
+        state["depth"] += 1
+        try:
+            yield
+        finally:
+            state["depth"] -= 1
+
+    original_create_secret = secret_store_module.SecretStore.create_secret
+
+    def guarded_create_secret(store, *args, **kwargs):
+        assert state["depth"] > 0
+        return original_create_secret(store, *args, **kwargs)
+
+    monkeypatch.setattr(
+        index_lock,
+        "lifecycle_read_lock",
+        fake_lifecycle_lock,
+    )
+    monkeypatch.setattr(
+        secret_store_module.SecretStore,
+        "create_secret",
+        guarded_create_secret,
+    )
     client.post("/admin/login", data={"password": "admin"})
 
     response = client.post(
@@ -261,6 +311,110 @@ def test_data_source_password_is_saved_as_user_secret(client, flask_app):
     assert SecretStore(flask_app.config["SECRETS_FILE"], key=flask_app.config["SECRET_KEY"]).get_secret(
         source["secrets"]["password"]["ref"]
     ) == "mail-secret-value"
+
+    saved_ref = source["secrets"]["password"]["ref"]
+    updated = client.post(
+        "/admin/data-sources",
+        data={
+            "id": "legal-mailbox",
+            "name": "Legal Mailbox Updated",
+            "plugin": "email_imap",
+            "enabled": "on",
+            "host": "imap.example.com",
+            "port": "993",
+            "use_ssl": "on",
+            "username": "legal@example.com",
+            "folder": "INBOX",
+            "include_body": "on",
+            "include_attachments": "on",
+            "max_messages": "10",
+        },
+    )
+    preserved = SettingsStore(workspace.settings_file).load()["data_sources"][0]
+
+    assert updated.status_code == 302
+    assert preserved["secrets"]["password"]["ref"] == saved_ref
+    assert SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["SECRET_KEY"],
+    ).get_secret(saved_ref) == "mail-secret-value"
+
+    rejected = client.post(
+        "/admin/data-sources",
+        data={
+            "id": "legal-mailbox",
+            "name": "Invalid edit",
+            "plugin": "email_imap",
+            "enabled": "on",
+            "host": "",
+            "port": "993",
+            "use_ssl": "on",
+            "username": "legal@example.com",
+            "password": "must-not-replace-the-secret",
+            "folder": "INBOX",
+            "max_messages": "10",
+        },
+    )
+
+    assert rejected.status_code == 302
+    assert SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["SECRET_KEY"],
+    ).get_secret(saved_ref) == "mail-secret-value"
+    assert (
+        SettingsStore(workspace.settings_file)
+        .load()["data_sources"][0]["name"]
+        == "Legal Mailbox Updated"
+    )
+
+    runtime_settings_store = importlib.import_module("utils.settings_store")
+    original_save = runtime_settings_store.SettingsStore._write_unlocked
+
+    def fail_workspace_settings_save(settings_store, data):
+        if str(settings_store.path) == workspace.settings_file:
+            raise OSError("settings write failed")
+        return original_save(settings_store, data)
+
+    monkeypatch.setattr(
+        runtime_settings_store.SettingsStore,
+        "_write_unlocked",
+        fail_workspace_settings_save,
+    )
+    failed_update = client.post(
+        "/admin/data-sources",
+        data={
+            "id": "legal-mailbox",
+            "name": "Uncommitted edit",
+            "plugin": "email_imap",
+            "enabled": "on",
+            "host": "imap.example.com",
+            "port": "993",
+            "use_ssl": "on",
+            "username": "legal@example.com",
+            "password": "must-remain-uncommitted",
+            "folder": "INBOX",
+            "max_messages": "10",
+        },
+    )
+
+    assert failed_update.status_code == 302
+    unchanged = SettingsStore(workspace.settings_file).load()[
+        "data_sources"
+    ][0]
+    assert unchanged["secrets"]["password"]["ref"] == saved_ref
+    assert SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["SECRET_KEY"],
+    ).get_secret(saved_ref) == "mail-secret-value"
+    assert set(
+        json.loads(
+            Path(flask_app.config["SECRETS_FILE"]).read_text(
+                encoding="utf-8"
+            )
+        )
+    ) == {saved_ref}
+    assert state["depth"] == 0
+    assert any(state["scopes"])
 
 
 def test_job_status_is_hidden_across_workspaces(client, flask_app):
@@ -297,6 +451,69 @@ def test_job_status_is_hidden_across_workspaces(client, flask_app):
     assert response.status_code == 404
 
 
+def test_authenticated_non_admin_can_poll_own_upload_job(flask_app):
+    store = UserStore(flask_app.config["USERS_FILE"])
+    user = store.create_user(
+        email="person@example.com",
+        password="person-pass",
+        role="user",
+    )
+    other_user = store.create_user(
+        email="other@example.com",
+        password="other-pass",
+        role="user",
+    )
+    workspace = workspace_for_user(user, app=flask_app)
+    other_workspace = workspace_for_user(other_user, app=flask_app)
+    get_job_store().create_job(
+        {
+            "id": "person-upload",
+            "type": "file_upload",
+            "status": "completed",
+            "message": "done",
+            "processed": 1,
+            "total": 1,
+            "current_file": "",
+            "workspace_id": workspace.workspace_id,
+            "knowledge_base_id": "default",
+            "errors": [],
+            "result": {"filename": "notes.txt"},
+            "started_at": 0,
+            "finished_at": 1,
+        }
+    )
+    get_job_store().create_job(
+        {
+            "id": "other-upload",
+            "type": "file_upload",
+            "status": "completed",
+            "message": "done",
+            "processed": 1,
+            "total": 1,
+            "current_file": "",
+            "workspace_id": other_workspace.workspace_id,
+            "knowledge_base_id": "default",
+            "errors": [],
+            "result": {"filename": "private.txt"},
+            "started_at": 0,
+            "finished_at": 1,
+        }
+    )
+    normal_client = flask_app.test_client()
+    login = normal_client.post(
+        "/admin/login",
+        data={"email": user["email"], "password": "person-pass"},
+    )
+
+    response = normal_client.get("/api/v1/jobs/person-upload")
+    hidden = normal_client.get("/api/v1/jobs/other-upload")
+
+    assert login.status_code == 302
+    assert response.status_code == 200
+    assert response.get_json()["result"]["filename"] == "notes.txt"
+    assert hidden.status_code == 404
+
+
 def test_admin_deletes_user_and_all_scoped_data(client, flask_app, monkeypatch):
     workspace_module = importlib.import_module("utils.workspace")
     conversation_module = importlib.import_module("utils.conversation_memory")
@@ -321,6 +538,18 @@ def test_admin_deletes_user_and_all_scoped_data(client, flask_app, monkeypatch):
         api_key_value="person-api-key",
     )
     workspace = workspace_for_user(target, app=flask_app)
+    from utils.workspace import (
+        collection_for_knowledge_base,
+        knowledge_base_store,
+    )
+
+    secondary = knowledge_base_store(workspace, app=flask_app).create(
+        name="Private secondary"
+    )
+    secondary_collection = collection_for_knowledge_base(
+        workspace.workspace_id,
+        secondary["id"],
+    )
     Path(workspace.settings_file).write_text('{"data_sources": []}', encoding="utf-8")
     upload_file = Path(workspace.upload_folder) / "private.txt"
     upload_file.write_text("private", encoding="utf-8")
@@ -371,7 +600,10 @@ def test_admin_deletes_user_and_all_scoped_data(client, flask_app, monkeypatch):
     assert secret_store.get_secret(secret_ref) == ""
     assert conversation_module.get_conversation_store().render_for_prompt(conversation_id) == ""
     assert get_job_store().get("person-job") is None
-    assert deleted_collections == [workspace.chroma_collection]
+    assert deleted_collections == [
+        workspace.chroma_collection,
+        secondary_collection,
+    ]
 
 
 def test_admin_cannot_delete_self_or_user_with_active_jobs(client, flask_app, monkeypatch):
@@ -423,7 +655,10 @@ def test_admin_cannot_delete_self_or_user_with_active_jobs(client, flask_app, mo
     assert b"Utente non trovato" in missing_response.data
     assert b"Impossibile eliminare l&#39;utente mentre ha job attivi" in busy_response.data
     assert store.get(admin["id"]) is not None
-    assert store.get(target["id"]) is not None
+    preserved_target = store.get(target["id"])
+    assert preserved_target is not None
+    assert preserved_target["enabled"] is True
+    assert not preserved_target.get("deletion_status")
     assert Path(workspace.settings_file).parent.exists()
 
 
@@ -454,8 +689,51 @@ def test_cleanup_failure_keeps_user_account(client, flask_app, monkeypatch):
     )
 
     assert b"Chroma non disponibile" in response.data
-    assert store.get(target["id"]) is not None
+    preserved = store.get(target["id"])
+    assert preserved is not None
+    assert preserved["enabled"] is False
+    assert preserved["deletion_status"] == "delete_failed"
+    assert "Chroma non disponibile" in preserved["deletion_error"]
     assert Path(workspace.settings_file).parent.exists()
+
+    reenabled = client.post(
+        "/admin/users",
+        data={
+            "action": "update",
+            "user_id": target["id"],
+            "display_name": "Unsafe retry",
+            "role": "user",
+            "enabled": "on",
+        },
+        follow_redirects=True,
+    )
+    assert b"cancellazione incompleta non pu" in reenabled.data
+    assert store.get(target["id"])["enabled"] is False
+
+
+def test_user_delete_preflight_failure_restores_original_account(tmp_path):
+    from app.utils.user_store import UserDeletionPreflightError
+
+    store = UserStore(tmp_path / "users.json")
+    target = store.create_user(
+        email="busy-direct@example.com",
+        password="person-pass",
+        enabled=True,
+    )
+
+    def reject_before_cleanup(_user):
+        raise UserDeletionPreflightError("active jobs")
+
+    with pytest.raises(UserDeletionPreflightError, match="active jobs"):
+        store.delete_user(
+            target["id"],
+            before_delete=reject_before_cleanup,
+        )
+
+    preserved = store.get(target["id"])
+    assert preserved["enabled"] is True
+    assert not preserved.get("deletion_status")
+    assert not preserved.get("deletion_error")
 
 
 def test_admin_update_protects_current_account_and_reports_missing_user(client, flask_app):

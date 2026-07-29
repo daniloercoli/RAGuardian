@@ -12,6 +12,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const userInput = document.getElementById("userInput");
     const sendButton = document.getElementById("sendButton");
     const modelSelect = document.getElementById("modelSelect");
+    const kbSelect = document.getElementById("kbSelect");
     const promptSelect = document.getElementById("promptSelect");
     const clearChatButton = document.getElementById("clearChatButton");
     const streamStatus = document.getElementById("streamStatus");
@@ -29,6 +30,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const promptStorageKey = "ragSystemPromptId";
+    const knowledgeBaseStorageKey = "ragKnowledgeBaseId";
+    let knowledgeBaseId = loadKnowledgeBaseId();
     let systemPromptId = loadSystemPromptId();
     let codeInterpreterEnabled = false;
     const uploadedFiles = [];
@@ -53,6 +56,9 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     userInput.addEventListener("input", resizeInput);
     modelSelect.addEventListener("change", () => updateChatStatus());
+    if (kbSelect) {
+        kbSelect.addEventListener("change", handleKnowledgeBaseChange);
+    }
     if (promptSelect) {
         promptSelect.addEventListener("change", () => {
             const selValue = promptSelect.value;
@@ -300,12 +306,16 @@ document.addEventListener("DOMContentLoaded", () => {
                         file_id: f.id,
                         name: f.name,
                         type: f.type
-                    }))
+                    })),
+                    knowledge_base_id: knowledgeBaseId
                 };
                 const response = await postAsk(ciBody, askTimeout);
                 if (!response.ok) {
                     const data = await readErrorPayload(response);
-                    appendMessage(formatError(data, response.statusText), "bot-message");
+                    const messageDiv = appendBotMessage(
+                        formatError(data, response.statusText)
+                    );
+                    await handleUnavailableKnowledgeBase(data, messageDiv);
                 } else {
                     const messageDiv = appendBotMessage("Preparing analysis...");
                     await renderCodeInterpreterStream(response, messageDiv, askTimeout);
@@ -324,7 +334,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 stream: true,
                 stream_format: "ndjson",
                 system_prompt_id: systemPromptId || undefined,
-                use_code_interpreter: false
+                use_code_interpreter: false,
+                knowledge_base_id: knowledgeBaseId
             };
             if (uploadedFiles.length > 0) {
                 body.attached_files = uploadedFiles.map(f => ({
@@ -339,7 +350,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (!response.ok) {
                 const data = await readErrorPayload(response);
-                appendMessage(formatError(data, response.statusText), "bot-message");
+                const messageDiv = appendBotMessage(
+                    formatError(data, response.statusText)
+                );
+                await handleUnavailableKnowledgeBase(data, messageDiv);
             } else {
                 const messageDiv = appendBotMessage("");
                 await renderStreamingResponse(response, messageDiv, askTimeout);
@@ -393,6 +407,7 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (event.type === "error") {
                 state.hasError = true;
                 renderBotAnswer(messageDiv, formatError(event, "Code interpreter interrupted"));
+                handleUnavailableKnowledgeBase(event, messageDiv).catch(() => {});
             }
         };
 
@@ -461,6 +476,7 @@ document.addEventListener("DOMContentLoaded", () => {
         busy = isBusy;
         sendButton.disabled = isBusy || !modelSelect.value;
         userInput.disabled = isBusy;
+        if (kbSelect) kbSelect.disabled = isBusy;
         sendButton.textContent = isBusy ? "Waiting" : "Send";
         if (streamStatus) {
             streamStatus.hidden = !isBusy;
@@ -568,6 +584,7 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (event.type === "error") {
             state.hasError = true;
             renderBotAnswer(messageDiv, formatError(event, "Streaming interrupted"));
+            handleUnavailableKnowledgeBase(event, messageDiv).catch(() => {});
         }
     }
 
@@ -750,7 +767,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const previousConversationId = conversationId;
         conversationId = createConversationId();
         persistConversationId(conversationId);
-        clearServerConversation(previousConversationId);
+        clearServerConversation(previousConversationId, knowledgeBaseId);
         chatbox.replaceChildren();
         clearUploadedFiles();
         if (emptyState) {
@@ -796,10 +813,16 @@ document.addEventListener("DOMContentLoaded", () => {
         persistConversationId(value);
     }
 
-    async function clearServerConversation(value) {
+    async function clearServerConversation(value, targetKnowledgeBaseId = knowledgeBaseId) {
         if (!value) return;
         try {
-            await fetch(`/conversation/${encodeURIComponent(value)}`, {method: "DELETE"});
+            const query = new URLSearchParams({
+                knowledge_base_id: targetKnowledgeBaseId || "default"
+            });
+            await fetch(
+                `/conversation/${encodeURIComponent(value)}?${query.toString()}`,
+                {method: "DELETE"}
+            );
         } catch (error) {
             console.warn("Unable to clear conversation memory", error);
         }
@@ -939,6 +962,114 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (e) {/* noop */}
     }
 
+    async function loadKnowledgeBases() {
+        if (!kbSelect) return;
+        try {
+            const response = await fetch("/api/knowledge-bases");
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || response.statusText);
+            const knowledgeBases = (data.knowledge_bases || []).filter(
+                item => item.status === "active"
+            );
+            kbSelect.replaceChildren();
+            knowledgeBases.forEach(item => {
+                const label = item.is_default ? `${item.name} (Default)` : item.name;
+                kbSelect.appendChild(new Option(label, item.id));
+            });
+            const availableIds = new Set(knowledgeBases.map(item => item.id));
+            if (!availableIds.has(knowledgeBaseId)) {
+                knowledgeBaseId = availableIds.has("default")
+                    ? "default"
+                    : (knowledgeBases[0] && knowledgeBases[0].id) || "default";
+                persistKnowledgeBaseId(knowledgeBaseId);
+            }
+            kbSelect.value = knowledgeBaseId;
+            kbSelect.disabled = busy || knowledgeBases.length === 0;
+        } catch (error) {
+            kbSelect.replaceChildren(new Option("Knowledge bases unavailable", ""));
+            kbSelect.disabled = true;
+            console.warn("Knowledge bases not available:", error);
+        }
+    }
+
+    function handleKnowledgeBaseChange() {
+        const nextKnowledgeBaseId = kbSelect.value || "default";
+        if (nextKnowledgeBaseId === knowledgeBaseId) return;
+        const hasTranscript = Boolean(chatbox.querySelector(".message"));
+        if (
+            hasTranscript
+            && !window.confirm(
+                "Changing knowledge base starts a new conversation. Continue?"
+            )
+        ) {
+            kbSelect.value = knowledgeBaseId;
+            return;
+        }
+        const previousKnowledgeBaseId = knowledgeBaseId;
+        const previousConversationId = conversationId;
+
+        // Commit the local switch as one synchronous transition. A new request
+        // can never use the new KB while the old transcript is still visible.
+        resetKnowledgeBaseConversation(nextKnowledgeBaseId);
+        if (hasTranscript) {
+            clearServerConversation(
+                previousConversationId,
+                previousKnowledgeBaseId
+            );
+        }
+        userInput.focus();
+    }
+
+    function loadKnowledgeBaseId() {
+        try {
+            return window.sessionStorage
+                ? (sessionStorage.getItem(knowledgeBaseStorageKey) || "default")
+                : "default";
+        } catch (error) {
+            return "default";
+        }
+    }
+
+    function persistKnowledgeBaseId(value) {
+        try {
+            if (window.sessionStorage) {
+                sessionStorage.setItem(knowledgeBaseStorageKey, value || "default");
+            }
+        } catch (error) {/* best effort */}
+    }
+
+    async function handleUnavailableKnowledgeBase(data, preservedMessage = null) {
+        if (
+            !data
+            || !["knowledge_base_not_found", "knowledge_base_deleting", "knowledge_base_delete_failed"].includes(data.status)
+        ) {
+            return false;
+        }
+
+        // Drop the failed transcript but keep the actionable stream error in
+        // view while the selector refreshes to an available fallback.
+        resetKnowledgeBaseConversation("default", preservedMessage);
+        await loadKnowledgeBases();
+        return true;
+    }
+
+    function resetKnowledgeBaseConversation(nextKnowledgeBaseId, preservedMessage = null) {
+        knowledgeBaseId = nextKnowledgeBaseId || "default";
+        persistKnowledgeBaseId(knowledgeBaseId);
+        conversationId = createConversationId();
+        persistConversationId(conversationId);
+        chatbox.replaceChildren();
+        clearUploadedFiles();
+
+        if (preservedMessage) {
+            hideEmptyState();
+            chatbox.appendChild(preservedMessage);
+        } else if (emptyState) {
+            emptyState.hidden = false;
+            chatbox.appendChild(emptyState);
+        }
+    }
+
     async function handleFileUpload(event) {
         const input = event.target;
         const files = input.files;
@@ -1001,6 +1132,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    loadKnowledgeBases();
     loadModels();
     loadPrompts();
     resizeInput();

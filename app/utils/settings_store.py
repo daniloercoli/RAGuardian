@@ -5,7 +5,7 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from utils.file_lock import ProcessSafeFileLock
 
@@ -190,7 +190,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "updated_at": "",
 }
 
-API_SCOPES = {"query", "ingest", "speech"}
+API_SCOPES = {"query", "ingest", "speech", "kb_manage"}
 VOICE_FORMATS = {"mp3", "wav", "opus", "aac", "flac"}
 OCR_MODES = {"vision_chat", "ocr_endpoint", "local_engine"}
 OCR_INPUT_TYPES = {"image", "pdf"}
@@ -231,6 +231,10 @@ class SettingsStore:
         with self._lock:
             return self._load_unlocked()
 
+    def transaction(self) -> ProcessSafeFileLock:
+        """Return the re-entrant lock for a multi-step settings transaction."""
+        return self._lock
+
     def save(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             normalized = self._normalize(_deep_merge(DEFAULT_SETTINGS, settings))
@@ -242,6 +246,26 @@ class SettingsStore:
         with self._lock:
             current = self._load_unlocked()
             normalized = self._normalize(_deep_merge(DEFAULT_SETTINGS, _deep_merge(current, patch)))
+            normalized["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._write_unlocked(normalized)
+            return normalized
+
+    def mutate(
+        self,
+        mutator: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Atomically read, mutate, normalize, and persist the settings document."""
+        with self._lock:
+            current = self._load_unlocked()
+            working = deepcopy(current)
+            mutated = mutator(working)
+            if mutated is None:
+                mutated = working
+            if not isinstance(mutated, dict):
+                raise TypeError("Settings mutator must return a dictionary or None")
+            if mutated == current:
+                return current
+            normalized = self._normalize(_deep_merge(DEFAULT_SETTINGS, mutated))
             normalized["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._write_unlocked(normalized)
             return normalized
@@ -489,6 +513,9 @@ def normalize_data_source(source: Dict[str, Any]) -> Dict[str, Any]:
     sync_interval_seconds = _data_source_sync_interval_seconds(source)
     return {
         "id": source_id,
+        "knowledge_base_id": str(
+            source.get("knowledge_base_id") or "default"
+        ).strip(),
         "name": str(source.get("name") or source_id).strip(),
         "plugin": plugin,
         "enabled": _as_bool(source.get("enabled"), True),

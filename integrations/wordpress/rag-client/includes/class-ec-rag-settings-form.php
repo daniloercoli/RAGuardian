@@ -23,6 +23,20 @@ class EC_Rag_Settings_Form {
         $options     = EC_Rag_Options::get();
         $import_state = EC_Rag_Ingestion::get_import_state();
         $connection_test = null;
+        $knowledge_bases = [];
+        $knowledge_base_catalog_available = false;
+        if (!empty($options['base_url']) && !empty($options['api_key'])) {
+            $api = new EC_Rag_Api_Client(fn() => $options);
+            $knowledge_base_response = $api->get_knowledge_base_catalog();
+            if (
+                !is_wp_error($knowledge_base_response)
+                && array_key_exists('knowledge_bases', $knowledge_base_response)
+                && is_array($knowledge_base_response['knowledge_bases'])
+            ) {
+                $knowledge_bases = $knowledge_base_response['knowledge_bases'];
+                $knowledge_base_catalog_available = true;
+            }
+        }
 
         if (isset($_GET['ec_rag_test']) && current_user_can('manage_options')) {
             check_admin_referer('ec_rag_test_connection');
@@ -62,7 +76,11 @@ class EC_Rag_Settings_Form {
             <form method="post" action="options.php">
                 <?php settings_fields('ec_rag_client'); ?>
 
-                <?php self::render_connection_section($options); ?>
+                <?php self::render_connection_section(
+                    $options,
+                    $knowledge_bases,
+                    $knowledge_base_catalog_available
+                ); ?>
                 <?php self::render_appearance_section($options); ?>
                 <?php self::render_behavior_section($options); ?>
                 <?php self::render_ingestion_section($options); ?>
@@ -108,7 +126,22 @@ class EC_Rag_Settings_Form {
      * @param array $options
      * @return void
      */
-    protected static function render_connection_section(array $options): void {
+    protected static function render_connection_section(
+        array $options,
+        array $knowledge_bases = [],
+        bool $knowledge_base_catalog_available = false
+    ): void {
+        $knowledge_base_choices = self::knowledge_base_choices($knowledge_bases);
+        $selected_knowledge_base = sanitize_text_field(
+            $options['knowledge_base_id'] ?? ''
+        );
+        $authorized_values = array_column($knowledge_base_choices, 'value');
+        $selection_available = in_array(
+            $selected_knowledge_base,
+            $authorized_values,
+            true
+        );
+        $has_knowledge_base_choices = count($knowledge_base_choices) > 0;
         ?>
         <h2><?php esc_html_e('Connection', 'ec-rag'); ?></h2>
         <table class="form-table" role="presentation">
@@ -121,6 +154,74 @@ class EC_Rag_Settings_Form {
                         name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[base_url]"
                         value="<?php echo esc_attr($options['base_url'] ?? ''); ?>"
                         placeholder="https://rag.example.com">
+                </td>
+            </tr>
+            <tr>
+                <th scope="row">
+                    <label for="<?php echo esc_attr('ec-rag-knowledge-base'); ?>">
+                        <?php esc_html_e('Knowledge base', 'ec-rag'); ?>
+                    </label>
+                </th>
+                <td>
+                    <select
+                        id="<?php echo esc_attr('ec-rag-knowledge-base'); ?>"
+                        name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[knowledge_base_id]"
+                        <?php if (!$has_knowledge_base_choices) : ?>disabled<?php endif; ?>
+                    >
+                        <?php if (!$has_knowledge_base_choices) : ?>
+                            <option value="__unavailable__" selected disabled>
+                                <?php esc_html_e('No authorized knowledge bases available', 'ec-rag'); ?>
+                            </option>
+                        <?php endif; ?>
+                        <?php if ($has_knowledge_base_choices && !$selection_available) : ?>
+                            <option
+                                value="<?php echo esc_attr($selected_knowledge_base); ?>"
+                                selected
+                            >
+                                <?php
+                                printf(
+                                    esc_html__('Unavailable (%s)', 'ec-rag'),
+                                    esc_html(
+                                        $selected_knowledge_base === ''
+                                            ? __('Default', 'ec-rag')
+                                            : $selected_knowledge_base
+                                    )
+                                );
+                                ?>
+                            </option>
+                        <?php endif; ?>
+                        <?php foreach ($knowledge_base_choices as $knowledge_base_choice) : ?>
+                            <option
+                                value="<?php echo esc_attr($knowledge_base_choice['value']); ?>"
+                                <?php selected($selected_knowledge_base, $knowledge_base_choice['value']); ?>
+                            >
+                                <?php echo esc_html($knowledge_base_choice['label']); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <?php if (!$has_knowledge_base_choices) : ?>
+                        <input
+                            type="hidden"
+                            name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[knowledge_base_id]"
+                            value="<?php echo esc_attr($selected_knowledge_base); ?>"
+                        >
+                    <?php endif; ?>
+                    <p class="description">
+                        <?php esc_html_e('This target is fixed server-side for all visitors. Changing it does not move existing documents; run a new import or sync after saving.', 'ec-rag'); ?>
+                    </p>
+                    <?php if (!$knowledge_base_catalog_available) : ?>
+                        <p class="description" style="color:#b32d2e;">
+                            <?php esc_html_e('The authorized knowledge-base catalog is temporarily unavailable. The saved target will be preserved; refresh this page to try again.', 'ec-rag'); ?>
+                        </p>
+                    <?php elseif (!$has_knowledge_base_choices) : ?>
+                        <p class="description" style="color:#b32d2e;">
+                            <?php esc_html_e('This API key does not authorize any active knowledge bases.', 'ec-rag'); ?>
+                        </p>
+                    <?php elseif (!$selection_available) : ?>
+                        <p class="description" style="color:#b32d2e;">
+                            <?php esc_html_e('The saved knowledge base is no longer available to this API key. Choose an authorized target before continuing.', 'ec-rag'); ?>
+                        </p>
+                    <?php endif; ?>
                 </td>
             </tr>
             <tr>
@@ -164,6 +265,56 @@ class EC_Rag_Settings_Form {
             </tr>
         </table>
         <?php
+    }
+
+    /**
+     * Convert an API-key-scoped catalog into safe dropdown choices.
+     *
+     * The default option is represented by an empty stored value for backward
+     * compatibility, but it is emitted only when the API response includes the
+     * `default` record.
+     *
+     * @param array $knowledge_bases Raw catalog records.
+     * @return array<int,array{id:string,value:string,label:string}>
+     */
+    public static function knowledge_base_choices(array $knowledge_bases): array {
+        $choices = [];
+        $seen = [];
+
+        foreach ($knowledge_bases as $knowledge_base) {
+            if (
+                !is_array($knowledge_base)
+                || ($knowledge_base['status'] ?? 'active') !== 'active'
+            ) {
+                continue;
+            }
+
+            $knowledge_base_id = sanitize_text_field($knowledge_base['id'] ?? '');
+            if (
+                $knowledge_base_id !== 'default'
+                && !preg_match('/^kb_[0-9a-f]{32}$/', $knowledge_base_id)
+            ) {
+                continue;
+            }
+            if (isset($seen[$knowledge_base_id])) {
+                continue;
+            }
+            $seen[$knowledge_base_id] = true;
+
+            $label = sanitize_text_field($knowledge_base['name'] ?? '');
+            if ($label === '') {
+                $label = $knowledge_base_id === 'default'
+                    ? __('Default', 'ec-rag')
+                    : $knowledge_base_id;
+            }
+            $choices[] = [
+                'id'    => $knowledge_base_id,
+                'value' => $knowledge_base_id === 'default' ? '' : $knowledge_base_id,
+                'label' => $label,
+            ];
+        }
+
+        return $choices;
     }
 
     /**

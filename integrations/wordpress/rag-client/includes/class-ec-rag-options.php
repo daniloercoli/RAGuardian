@@ -72,6 +72,7 @@ class EC_Rag_Options {
         return [
             'base_url'                => '',
             'api_key'                => '',
+            'knowledge_base_id'      => '',
             'response_language'       => 'auto',
             'request_timeout'        => '45',
             'show_sources'           => '1',
@@ -144,10 +145,18 @@ class EC_Rag_Options {
 
         $audio_limit = absint($input['audio_rate_limit_requests'] ?? 2);
         $audio_limit = ($audio_limit >= 1 && $audio_limit <= 20) ? $audio_limit : 2;
+        $knowledge_base_id = sanitize_text_field($input['knowledge_base_id'] ?? '');
+        if ($knowledge_base_id === 'default') {
+            $knowledge_base_id = '';
+        }
+        if ($knowledge_base_id !== '' && !preg_match('/^kb_[0-9a-f]{32}$/', $knowledge_base_id)) {
+            $knowledge_base_id = '';
+        }
 
         return [
             'base_url'                => esc_url_raw(rtrim($input['base_url'] ?? '', '/')),
             'api_key'                => sanitize_text_field($input['api_key'] ?? ''),
+            'knowledge_base_id'      => $knowledge_base_id,
             'response_language'       => EC_Rag_Utils::sanitize_response_language($input['response_language'] ?? 'auto'),
             'request_timeout'        => (string) $timeout,
             'show_sources'           => !empty($input['show_sources']) ? '1' : '0',

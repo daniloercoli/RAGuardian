@@ -13,7 +13,18 @@ from .openai_compatible_embedding_provider import OpenAICompatibleEmbeddingProvi
 from .exceptions import ProviderError
 from ..logging_config import EMBEDDING_LOGGER as log
 from config import Config
+from utils.index_lock import register_lifecycle_invalidator
 from utils.settings_store import get_settings
+
+
+sys.modules.setdefault(
+    "utils.providers.embedding_factory",
+    sys.modules[__name__],
+)
+sys.modules.setdefault(
+    "app.utils.providers.embedding_factory",
+    sys.modules[__name__],
+)
 
 
 # "local" is always available as offline fallback (no API key needed)
@@ -359,3 +370,9 @@ class EmbeddingFactory:
 
         log.warning(f"Unknown embedding model '{model_name}', defaulting to local")
         return "local"
+
+
+register_lifecycle_invalidator(
+    "embedding-provider-runtime",
+    EmbeddingFactory.reset_cache,
+)

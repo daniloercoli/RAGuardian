@@ -1,4 +1,5 @@
 import concurrent.futures
+import time
 from pathlib import Path
 
 from app.utils.settings_store import (
@@ -29,6 +30,24 @@ def test_settings_store_creates_defaults(tmp_path):
     assert settings["ocr"]["provider"] == "regolo"
     assert settings["ocr"]["default_model"] == "deepseek-ocr-2"
     assert settings["ocr_providers"] == []
+
+
+def test_settings_store_mutate_serializes_read_modify_write(tmp_path):
+    store = SettingsStore(str(tmp_path / "settings.json"))
+    store.update({"concurrency": {"counter": 0}})
+
+    def increment(_index):
+        def mutate(settings):
+            counter = settings.setdefault("concurrency", {}).get("counter", 0)
+            time.sleep(0.001)
+            settings["concurrency"]["counter"] = counter + 1
+
+        store.mutate(mutate)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(increment, range(24)))
+
+    assert store.load()["concurrency"]["counter"] == 24
 
 
 def test_settings_store_persists_runtime_values(tmp_path):

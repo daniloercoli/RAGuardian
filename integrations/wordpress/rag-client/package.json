@@ -13,11 +13,12 @@
     "wp:logs": "wp-env logs",
     "wp:cli": "wp-env run cli wp",
     "wp:setup": "wp-env run cli wp plugin activate rag-client",
-    "test": "npm run test:lint && npm run test:php",
+    "test": "npm run test:lint && npm run test:php && npm run test:js",
     "test:e2e": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test",
     "test:e2e:headed": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test --headed",
     "test:e2e:debug": "npm run doctor && wp-env start && wp-env run cli wp plugin activate rag-client && playwright test --debug",
     "test:php": "vendor/bin/phpunit",
+    "test:js": "node --test tests/js/*.test.mjs",
     "test:lint": "find . -name '*.php' -not -path './vendor/*' -exec php -l {} \\;"
   },
   "devDependencies": {

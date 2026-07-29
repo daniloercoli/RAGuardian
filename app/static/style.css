@@ -260,6 +260,55 @@ textarea:focus-visible {
     text-transform: uppercase;
 }
 
+.knowledge-base-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr));
+    margin-top: 18px;
+}
+
+.knowledge-base-card {
+    margin: 0;
+}
+
+.knowledge-base-card h3 {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 5px;
+}
+
+.kb-stats {
+    display: grid;
+    gap: 10px;
+    grid-template-columns: repeat(4, 1fr);
+    margin: 16px 0;
+}
+
+.kb-stats div {
+    background: var(--surface, #f6f7f9);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.kb-stats dt {
+    color: var(--muted, #667085);
+    font-size: 0.75rem;
+}
+
+.kb-stats dd {
+    font-size: 1.1rem;
+    font-weight: 750;
+    margin: 3px 0 0;
+}
+
+.kb-editor {
+    border-top: 1px solid var(--border, #dfe3e8);
+    margin-top: 16px;
+    padding-top: 16px;
+}
+
 .source-configurations {
     display: grid;
     gap: 12px;

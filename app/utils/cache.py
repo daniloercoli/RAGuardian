@@ -95,6 +95,13 @@ class SimpleLRUCache:
         with self._lock:
             self.cache.clear()
         log.info("Cache cleared")
+
+    def clear_prefix(self, prefix: str) -> int:
+        with self._lock:
+            keys = [key for key in self.cache if key.startswith(prefix)]
+            for key in keys:
+                self.cache.pop(key, None)
+        return len(keys)
     
     def __len__(self):
         with self._lock:
@@ -147,7 +154,10 @@ class RAGCache:
             "model": model
         }
         key_json = json.dumps(key_data, sort_keys=True)
-        return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+        collection = str(query or "").split("\n", 1)[0]
+        collection_hash = hashlib.sha256(collection.encode()).hexdigest()[:12]
+        query_hash = hashlib.sha256(key_json.encode()).hexdigest()[:20]
+        return f"{collection_hash}:{query_hash}"
 
     def _redis_key(self, cache_key: str) -> str:
         return f"{state_key_prefix()}:cache:{cache_key}"
@@ -224,6 +234,27 @@ class RAGCache:
                 log.warning("Redis cache clear failed, clearing memory fallback: %s", exc)
         if self._cache:
             self._cache.clear()
+
+    def clear_collection(self, collection_name: str) -> int:
+        collection_hash = hashlib.sha256(
+            str(collection_name or "documents").encode()
+        ).hexdigest()[:12]
+        prefix = f"{collection_hash}:"
+        deleted = 0
+        if self._backend == "redis" and self._redis is not None:
+            try:
+                deleted = redis_scan_delete(
+                    self._redis,
+                    f"{state_key_prefix()}:cache:{prefix}*",
+                )
+            except Exception as exc:
+                log.warning(
+                    "Redis collection cache clear failed, clearing memory fallback: %s",
+                    exc,
+                )
+        if self._cache:
+            deleted += self._cache.clear_prefix(prefix)
+        return deleted
     
     @property
     def size(self) -> int:

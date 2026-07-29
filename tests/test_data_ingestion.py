@@ -1,4 +1,6 @@
 import importlib
+import concurrent.futures
+import json
 from email.message import EmailMessage
 from pathlib import Path
 from datetime import datetime, timezone
@@ -214,6 +216,318 @@ def test_ingestion_storage_materializes_binary_drive_file(tmp_path):
     assert stored["extension"] == "pdf"
 
 
+def test_ingestion_storage_stages_items_and_attachments_without_overwrite(
+    tmp_path,
+):
+    from utils.data_ingestion.base import IngestionAttachment, IngestionItem
+    from utils.data_ingestion.storage import IngestionStorage
+
+    storage = IngestionStorage(str(tmp_path / "uploads"))
+    original_item = IngestionItem(
+        content="old item",
+        filename="Contract.md",
+        extension="md",
+        remote_id="item-1",
+    )
+    replacement_item = IngestionItem(
+        content="new item",
+        filename="Contract.md",
+        extension="md",
+        remote_id="item-1",
+    )
+    stored_item = storage.materialize_item("source", original_item)
+    staged_item = storage.materialize_item(
+        "source",
+        replacement_item,
+        staged=True,
+    )
+
+    assert Path(stored_item["file_path"]).read_text(encoding="utf-8") == "old item"
+    assert Path(staged_item["staged_file_path"]).read_text(
+        encoding="utf-8"
+    ) == "new item"
+
+    parent = IngestionItem(
+        content="parent",
+        filename="Parent.md",
+        extension="md",
+        remote_id="parent-1",
+    )
+    original_attachment = IngestionAttachment(
+        filename="Appendix.txt",
+        extension="txt",
+        content=b"old attachment",
+        remote_id="attachment-1",
+    )
+    replacement_attachment = IngestionAttachment(
+        filename="Appendix.txt",
+        extension="txt",
+        content=b"new attachment",
+        remote_id="attachment-1",
+    )
+    stored_attachment = storage.materialize_attachment(
+        "source",
+        parent,
+        original_attachment,
+    )
+    staged_attachment = storage.materialize_attachment(
+        "source",
+        parent,
+        replacement_attachment,
+        staged=True,
+    )
+
+    assert Path(stored_attachment["file_path"]).read_bytes() == b"old attachment"
+    assert Path(staged_attachment["staged_file_path"]).read_bytes() == (
+        b"new attachment"
+    )
+
+
+def test_staged_document_indexing_restores_file_vectors_and_file_index(
+    tmp_path,
+    monkeypatch,
+):
+    import utils.chroma_manager as chroma_manager
+    import utils.document_indexer as document_indexer
+    import utils.rag_engine as rag_engine
+
+    upload_folder = tmp_path / "uploads"
+    upload_folder.mkdir()
+    final_path = upload_folder / "external.txt"
+    staged_path = upload_folder / ".external.txt.staged"
+    final_path.write_text("old content", encoding="utf-8")
+    staged_path.write_text("new content", encoding="utf-8")
+    file_index = FileIndex(str(tmp_path / "files.json"))
+    file_index.record(
+        "external.txt",
+        str(final_path),
+        2,
+        status="indexed",
+        metadata={"remote_id": "remote-1"},
+    )
+    previous_entry = file_index.get("external.txt")
+    vector_snapshot = {
+        "ids": ["old-1", "old-2"],
+        "documents": ["old one", "old two"],
+        "metadatas": [
+            {"source": str(final_path)},
+            {"source": str(final_path)},
+        ],
+        "embeddings": [[1.0], [2.0]],
+    }
+    restored = []
+
+    monkeypatch.setattr(
+        chroma_manager,
+        "snapshot_documents_by_source",
+        lambda source, collection_name=None: vector_snapshot,
+    )
+    monkeypatch.setattr(
+        chroma_manager,
+        "restore_documents_by_source",
+        lambda source, snapshot, collection_name=None: restored.append(
+            (source, snapshot, collection_name)
+        ),
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "clear_cache_for_collection",
+        lambda _collection: None,
+    )
+
+    def fail_index(config, filename, file_path, extension, **_kwargs):
+        assert Path(file_path).read_text(encoding="utf-8") == "new content"
+        FileIndex(config["FILE_INDEX"]).record(
+            filename,
+            file_path,
+            1,
+            status="indexed",
+            metadata={"remote_id": "remote-1", "version": "new"},
+        )
+        raise RuntimeError("embedding unavailable")
+
+    monkeypatch.setattr(
+        document_indexer,
+        "index_saved_document",
+        fail_index,
+    )
+    config = {
+        "UPLOAD_FOLDER": str(upload_folder),
+        "FILE_INDEX": str(tmp_path / "files.json"),
+        "CHROMA_COLLECTION": "documents-test",
+    }
+
+    with pytest.raises(RuntimeError, match="embedding unavailable"):
+        document_indexer.index_staged_document(
+            config,
+            "external.txt",
+            str(final_path),
+            str(staged_path),
+            "txt",
+        )
+
+    assert final_path.read_text(encoding="utf-8") == "old content"
+    assert not staged_path.exists()
+    assert file_index.get("external.txt") == previous_entry
+    assert restored == [
+        (str(final_path), vector_snapshot, "documents-test")
+    ]
+    assert not list(upload_folder.glob("*.rollback-ingestion"))
+
+
+def test_staged_document_indexing_does_not_rollback_after_lease_loss(
+    tmp_path,
+    monkeypatch,
+):
+    import utils.chroma_manager as chroma_manager
+    import utils.document_indexer as document_indexer
+    import utils.index_lock as locks
+
+    upload_folder = tmp_path / "uploads"
+    upload_folder.mkdir()
+    final_path = upload_folder / "external.txt"
+    staged_path = upload_folder / ".external.txt.staged"
+    final_path.write_text("old content", encoding="utf-8")
+    staged_path.write_text("new content", encoding="utf-8")
+    file_index = FileIndex(str(tmp_path / "files.json"))
+    file_index.record(
+        "external.txt",
+        str(final_path),
+        2,
+        status="indexed",
+        metadata={"version": "old"},
+    )
+    restored = []
+
+    monkeypatch.setattr(
+        chroma_manager,
+        "snapshot_documents_by_source",
+        lambda source, collection_name=None: {"ids": ["old"]},
+    )
+    monkeypatch.setattr(
+        chroma_manager,
+        "restore_documents_by_source",
+        lambda *args, **kwargs: restored.append((args, kwargs)),
+    )
+
+    def lose_lease_after_concurrent_write(
+        config,
+        filename,
+        file_path,
+        extension,
+        **_kwargs,
+    ):
+        Path(file_path).write_text("concurrent winner", encoding="utf-8")
+        FileIndex(config["FILE_INDEX"]).record(
+            filename,
+            file_path,
+            1,
+            status="indexed",
+            metadata={"version": "concurrent"},
+        )
+        raise locks.DistributedLockLeaseLostError("simulated lease loss")
+
+    monkeypatch.setattr(
+        document_indexer,
+        "index_saved_document",
+        lose_lease_after_concurrent_write,
+    )
+    config = {
+        "UPLOAD_FOLDER": str(upload_folder),
+        "FILE_INDEX": str(tmp_path / "files.json"),
+        "CHROMA_COLLECTION": "documents-test",
+    }
+
+    with pytest.raises(
+        locks.DistributedLockLeaseLostError,
+        match="simulated lease loss",
+    ):
+        document_indexer.index_staged_document(
+            config,
+            "external.txt",
+            str(final_path),
+            str(staged_path),
+            "txt",
+        )
+
+    assert final_path.read_text(encoding="utf-8") == "concurrent winner"
+    assert file_index.get("external.txt")["version"] == "concurrent"
+    assert restored == []
+    backups = list(upload_folder.glob(".*.rollback-ingestion"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "old content"
+    assert not staged_path.exists()
+
+
+def test_staged_document_indexing_commits_and_removes_temporary_files(
+    tmp_path,
+    monkeypatch,
+):
+    import utils.chroma_manager as chroma_manager
+    import utils.document_indexer as document_indexer
+
+    upload_folder = tmp_path / "uploads"
+    upload_folder.mkdir()
+    final_path = upload_folder / "external.txt"
+    staged_path = upload_folder / ".external.txt.staged"
+    final_path.write_text("old content", encoding="utf-8")
+    staged_path.write_text("new content", encoding="utf-8")
+    file_index = FileIndex(str(tmp_path / "files.json"))
+    file_index.record(
+        "external.txt",
+        str(final_path),
+        2,
+        status="indexed",
+    )
+    restored = []
+    monkeypatch.setattr(
+        chroma_manager,
+        "snapshot_documents_by_source",
+        lambda source, collection_name=None: {"ids": ["old"]},
+    )
+    monkeypatch.setattr(
+        chroma_manager,
+        "restore_documents_by_source",
+        lambda *args, **kwargs: restored.append((args, kwargs)),
+    )
+
+    def complete_index(config, filename, file_path, extension, **_kwargs):
+        FileIndex(config["FILE_INDEX"]).record(
+            filename,
+            file_path,
+            1,
+            status="indexed",
+            metadata={"version": "new"},
+        )
+        return {"status": "indexed", "chunks": 1}
+
+    monkeypatch.setattr(
+        document_indexer,
+        "index_saved_document",
+        complete_index,
+    )
+    config = {
+        "UPLOAD_FOLDER": str(upload_folder),
+        "FILE_INDEX": str(tmp_path / "files.json"),
+        "CHROMA_COLLECTION": "documents-test",
+    }
+
+    result = document_indexer.index_staged_document(
+        config,
+        "external.txt",
+        str(final_path),
+        str(staged_path),
+        "txt",
+    )
+
+    assert result == {"status": "indexed", "chunks": 1}
+    assert final_path.read_text(encoding="utf-8") == "new content"
+    assert file_index.get("external.txt")["version"] == "new"
+    assert restored == []
+    assert not staged_path.exists()
+    assert not list(upload_folder.glob("*.rollback-ingestion"))
+
+
 def test_email_parser_extracts_html_body_and_supported_attachments():
     from utils.data_ingestion.email_ingester import parse_email_message
 
@@ -357,7 +671,15 @@ def test_sync_data_source_materializes_and_indexes_with_metadata(tmp_path, monke
 
     indexed = []
 
-    def fake_index(config, filename, file_path, extension, **kwargs):
+    def fake_index(
+        config,
+        filename,
+        file_path,
+        staged_file_path,
+        extension,
+        **kwargs,
+    ):
+        Path(staged_file_path).replace(file_path)
         indexed.append(
             {
                 "filename": filename,
@@ -375,7 +697,7 @@ def test_sync_data_source_materializes_and_indexes_with_metadata(tmp_path, monke
         return {"status": "indexed", "chunks": 1}
 
     monkeypatch.setattr(service, "get_ingester", lambda plugin_id: FakeIngester())
-    monkeypatch.setattr(service, "index_saved_document", fake_index)
+    monkeypatch.setattr(service, "index_staged_document", fake_index)
 
     result = service.sync_data_source(
         {
@@ -398,6 +720,62 @@ def test_sync_data_source_materializes_and_indexes_with_metadata(tmp_path, monke
     updated = SettingsStore(str(settings_file)).load()["data_sources"][0]
     assert updated["cursor"] == {"last_uid": 99}
     assert updated["last_error"] == ""
+
+
+def test_concurrent_data_source_state_updates_preserve_other_knowledge_bases(
+    tmp_path,
+):
+    import utils.data_ingestion.service as service
+
+    store = SettingsStore(str(tmp_path / "settings.json"))
+    secondary_id = "kb_11111111111111111111111111111111"
+    store.update(
+        {
+            "data_sources": [
+                {
+                    "id": "default-mail",
+                    "name": "Default Mail",
+                    "plugin": "email_imap",
+                    "knowledge_base_id": "default",
+                },
+                {
+                    "id": "legal-mail",
+                    "name": "Legal Mail",
+                    "plugin": "email_imap",
+                    "knowledge_base_id": secondary_id,
+                },
+            ]
+        }
+    )
+
+    def update_source(arguments):
+        source_id, knowledge_base_id, cursor = arguments
+        for _ in range(12):
+            service._update_data_source_state(
+                store,
+                source_id,
+                knowledge_base_id=knowledge_base_id,
+                cursor=cursor,
+                last_sync_status="completed",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        list(
+            executor.map(
+                update_source,
+                [
+                    ("default-mail", "default", {"uid": 10}),
+                    ("legal-mail", secondary_id, {"uid": 20}),
+                ],
+            )
+        )
+
+    sources = {
+        source["id"]: source
+        for source in store.load()["data_sources"]
+    }
+    assert sources["default-mail"]["cursor"] == {"uid": 10}
+    assert sources["legal-mail"]["cursor"] == {"uid": 20}
 
 
 def test_data_source_sync_job_updates_job_store(monkeypatch, tmp_path):
@@ -450,6 +828,67 @@ def test_data_source_sync_job_updates_job_store(monkeypatch, tmp_path):
     assert job["result"]["indexed"] == 1
 
 
+def test_late_data_source_worker_stops_before_writing_an_inactive_kb(
+    flask_app,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    service = importlib.import_module("utils.data_ingestion.service")
+    from utils.job_store import get_job_store
+    from utils.user_store import UserStore
+    from utils.workspace import (
+        knowledge_base_context,
+        knowledge_base_store,
+        workspace_for_user,
+    )
+
+    user = UserStore(flask_app.config["USERS_FILE"]).create_user(
+        email="sync@example.local",
+        password="admin",
+        display_name="Sync",
+    )
+    workspace = workspace_for_user(user, app=flask_app)
+    secondary = knowledge_base_store(workspace, app=flask_app).create(
+        name="Late sync",
+    )
+    config = knowledge_base_context(workspace, secondary["id"]).as_config()
+    job_store = get_job_store()
+    job_store.create_job(
+        {
+            "id": "late-sync",
+            "type": "data_source_sync",
+            "status": "queued",
+            "workspace_id": workspace.workspace_id,
+            "knowledge_base_id": secondary["id"],
+            "errors": [],
+        }
+    )
+    knowledge_base_store(workspace, app=flask_app).set_status(
+        secondary["id"],
+        "deleting",
+    )
+    writes = []
+    monkeypatch.setattr(
+        service,
+        "mark_data_source_sync_running",
+        lambda *_args, **_kwargs: writes.append("mark"),
+    )
+    monkeypatch.setattr(
+        service,
+        "sync_data_source",
+        lambda *_args, **_kwargs: writes.append("sync"),
+    )
+
+    app_module._run_data_source_sync_job(
+        "late-sync",
+        config,
+        "mail",
+    )
+
+    assert writes == []
+    assert job_store.get("late-sync")["status"] == "failed"
+
+
 def test_admin_can_save_email_data_source(client, flask_app):
     client.post("/admin/login", data={"password": "admin"})
 
@@ -479,6 +918,147 @@ def test_admin_can_save_email_data_source(client, flask_app):
     assert source["plugin"] == "email_imap"
     assert source["config"]["host"] == "imap.example.com"
     assert source["secrets_env"] == {"password_env": "RAG_SOURCE_LEGAL_PASSWORD"}
+
+
+def test_plugin_change_deletes_all_previous_secret_refs(
+    client,
+    flask_app,
+):
+    from utils.secret_store import SecretStore
+    from utils.user_store import UserStore
+    from utils.workspace import workspace_for_user
+
+    client.post("/admin/login", data={"password": "admin"})
+    client.post(
+        "/admin/data-sources",
+        data={
+            "id": "switch-source",
+            "name": "Switch Source",
+            "plugin": "email_imap",
+            "enabled": "on",
+            "host": "imap.example.com",
+            "port": "993",
+            "use_ssl": "on",
+            "username": "legal@example.com",
+            "password": "old-password",
+            "folder": "INBOX",
+            "include_body": "on",
+            "include_attachments": "on",
+            "max_messages": "10",
+        },
+    )
+    settings_store = _workspace_settings(flask_app)
+    previous = settings_store.load()["data_sources"][0]
+    old_ref = previous["secrets"]["password"]["ref"]
+    secret_store = SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["SECRET_KEY"],
+    )
+    assert secret_store.get_secret(old_ref) == "old-password"
+
+    response = client.post(
+        "/admin/data-sources",
+        data={
+            "id": "switch-source",
+            "name": "Switch Source",
+            "plugin": "microsoft_drive",
+            "enabled": "on",
+            "token": "new-token",
+            "drive_id": "drive-1",
+            "folder_path": "Contracts",
+            "recursive": "on",
+            "include_extensions": "pdf,txt,md",
+            "max_files": "20",
+            "max_file_size_mb": "15",
+        },
+    )
+
+    source = settings_store.load()["data_sources"][0]
+    new_ref = source["secrets"]["token"]["ref"]
+    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    workspace = workspace_for_user(user, app=flask_app)
+
+    assert response.status_code == 302
+    assert source["plugin"] == "microsoft_drive"
+    assert new_ref.startswith(f"{workspace.workspace_id}:")
+    assert secret_store.get_secret(new_ref) == "new-token"
+    assert secret_store.get_secret(old_ref) == ""
+
+
+def test_plugin_change_settings_failure_preserves_old_secret_only(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    from utils.secret_store import SecretStore
+
+    client.post("/admin/login", data={"password": "admin"})
+    client.post(
+        "/admin/data-sources",
+        data={
+            "id": "switch-source",
+            "name": "Switch Source",
+            "plugin": "email_imap",
+            "enabled": "on",
+            "host": "imap.example.com",
+            "port": "993",
+            "use_ssl": "on",
+            "username": "legal@example.com",
+            "password": "old-password",
+            "folder": "INBOX",
+            "include_body": "on",
+            "include_attachments": "on",
+            "max_messages": "10",
+        },
+    )
+    settings_store = _workspace_settings(flask_app)
+    previous = settings_store.load()["data_sources"][0]
+    old_ref = previous["secrets"]["password"]["ref"]
+    secret_store = SecretStore(
+        flask_app.config["SECRETS_FILE"],
+        key=flask_app.config["SECRET_KEY"],
+    )
+    runtime_settings = importlib.import_module("utils.settings_store")
+    original_write = runtime_settings.SettingsStore._write_unlocked
+
+    def fail_workspace_write(store, settings):
+        if Path(store.path) == Path(settings_store.path):
+            raise OSError("simulated settings failure")
+        return original_write(store, settings)
+
+    monkeypatch.setattr(
+        runtime_settings.SettingsStore,
+        "_write_unlocked",
+        fail_workspace_write,
+    )
+
+    response = client.post(
+        "/admin/data-sources",
+        data={
+            "id": "switch-source",
+            "name": "Switch Source",
+            "plugin": "microsoft_drive",
+            "enabled": "on",
+            "token": "new-token",
+            "drive_id": "drive-1",
+            "folder_path": "Contracts",
+            "recursive": "on",
+            "include_extensions": "pdf,txt,md",
+            "max_files": "20",
+            "max_file_size_mb": "15",
+        },
+    )
+
+    stored_source = settings_store.load()["data_sources"][0]
+    persisted_secrets = json.loads(
+        Path(flask_app.config["SECRETS_FILE"]).read_text(encoding="utf-8")
+    )
+
+    assert response.status_code == 302
+    assert stored_source["plugin"] == "email_imap"
+    assert stored_source["secrets"]["password"]["ref"] == old_ref
+    assert secret_store.get_secret(old_ref) == "old-password"
+    assert set(persisted_secrets) == {old_ref}
 
 
 def test_admin_can_save_microsoft_drive_data_source(client, flask_app):

@@ -39,6 +39,18 @@ def delete_documents_by_source(source: str, collection_name: str | None = None) 
     return _vector_store(collection_name).delete_by_source(source)
 
 
+def snapshot_documents_by_source(source: str, collection_name: str | None = None) -> dict:
+    return _vector_store(collection_name).snapshot_by_source(source)
+
+
+def restore_documents_by_source(
+    source: str,
+    snapshot: dict,
+    collection_name: str | None = None,
+) -> int:
+    return _vector_store(collection_name).restore_source_snapshot(source, snapshot)
+
+
 def find_document_by_id(document_id: str, exclude_source=None, collection_name: str | None = None):
     return _vector_store(collection_name).find_document_by_id(document_id, exclude_source=exclude_source)
 

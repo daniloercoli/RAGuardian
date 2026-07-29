@@ -72,6 +72,27 @@ def test_bootstrap_admin_if_empty_creates_only_one_admin_concurrently(tmp_path):
     assert sum(result is not None for result in results) == 1
 
 
+def test_user_store_never_overwrites_corrupt_json(tmp_path):
+    store_path = tmp_path / "users.json"
+    corrupt_payload = "{not-valid-json"
+    store_path.write_text(corrupt_payload, encoding="utf-8")
+    store = UserStore(store_path)
+
+    with pytest.raises(ValueError, match="Invalid user store"):
+        store.remove_knowledge_base_from_api_keys(
+            user_id="user-1",
+            knowledge_base_id="default",
+        )
+    assert store_path.read_text(encoding="utf-8") == corrupt_payload
+
+    with pytest.raises(ValueError, match="Invalid user store"):
+        store.create_user(
+            email="new@example.com",
+            password="secret",
+        )
+    assert store_path.read_text(encoding="utf-8") == corrupt_payload
+
+
 def test_raw_api_key_is_hashed_and_cannot_be_retrieved():
     with tempfile.TemporaryDirectory() as tmp:
         store_path = Path(tmp) / "users.json"
@@ -109,6 +130,41 @@ def test_legacy_raw_api_keys_are_migrated_to_hashes(tmp_path):
     raw = store_path.read_text(encoding="utf-8")
     assert "legacy-secret" not in raw
     assert store.migrate_legacy_api_keys() == 0
+
+
+def test_legacy_api_key_kb_grants_are_migrated_atomically(tmp_path):
+    store_path = tmp_path / "users.json"
+    _make_user(store_path, "user-1")
+    _make_user(store_path, "user-2")
+    data = json.loads(store_path.read_text(encoding="utf-8"))
+    data[0]["api_keys"] = [
+        {"name": "legacy", "key": "legacy-secret", "enabled": True},
+        {
+            "name": "explicit",
+            "key": "explicit-secret",
+            "enabled": True,
+            "knowledge_base_ids": [],
+        },
+    ]
+    data[1]["api_keys"] = [
+        {"name": "excluded", "key": "excluded-secret", "enabled": True},
+    ]
+    store_path.write_text(json.dumps(data), encoding="utf-8")
+    store = UserStore(store_path)
+
+    assert store.ensure_api_key_knowledge_base_ids(user_ids={"user-1"}) == 1
+    assert store.get_api_key(
+        "user-1",
+        "legacy",
+    )["knowledge_base_ids"] == ["default"]
+    assert store.get_api_key(
+        "user-1",
+        "explicit",
+    )["knowledge_base_ids"] == []
+    raw_users = json.loads(store_path.read_text(encoding="utf-8"))["users"]
+    assert "knowledge_base_ids" not in raw_users[1]["api_keys"][0]
+    assert store.ensure_api_key_knowledge_base_ids() == 1
+    assert store.ensure_api_key_knowledge_base_ids() == 0
 
 
 def test_duplicate_key_name_fails():

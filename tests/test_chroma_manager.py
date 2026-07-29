@@ -105,6 +105,79 @@ def test_delete_documents_by_source_deletes_matching_chroma_ids(monkeypatch):
     assert collection.deleted_ids == ["src123:abc123:chunk:0", "src123:abc123:chunk:1"]
 
 
+def test_source_snapshot_restores_old_chunks_and_removes_replacement_chunks():
+    class StatefulCollection:
+        def __init__(self):
+            self.rows = {
+                "old-0": {
+                    "document": "old text",
+                    "metadata": {"source": "app/uploads/demo.txt", "chunk_id": 0},
+                    "embedding": [0.1, 0.2],
+                }
+            }
+
+        def get(self, where=None, include=None):
+            rows = [
+                (chunk_id, row)
+                for chunk_id, row in self.rows.items()
+                if not where or row["metadata"].get("source") == where.get("source")
+            ]
+            payload = {"ids": [chunk_id for chunk_id, _row in rows]}
+            if include:
+                payload.update(
+                    {
+                        "documents": [row["document"] for _chunk_id, row in rows],
+                        "metadatas": [dict(row["metadata"]) for _chunk_id, row in rows],
+                        "embeddings": [list(row["embedding"]) for _chunk_id, row in rows],
+                    }
+                )
+            return payload
+
+        def upsert(self, ids, documents, metadatas, embeddings):
+            for chunk_id, document, metadata, embedding in zip(
+                ids,
+                documents,
+                metadatas,
+                embeddings,
+            ):
+                self.rows[chunk_id] = {
+                    "document": document,
+                    "metadata": dict(metadata),
+                    "embedding": list(embedding),
+                }
+
+        def delete(self, ids):
+            for chunk_id in ids:
+                self.rows.pop(chunk_id, None)
+
+    collection = StatefulCollection()
+    store = ChromaPersistentVectorStore(
+        client_factory=lambda: FakeClient(collection),
+    )
+    snapshot = store.snapshot_by_source("app/uploads/demo.txt")
+    collection.rows = {
+        "new-0": {
+            "document": "replacement text",
+            "metadata": {"source": "app/uploads/demo.txt", "chunk_id": 0},
+            "embedding": [0.9, 0.8],
+        }
+    }
+
+    restored = store.restore_source_snapshot(
+        "app/uploads/demo.txt",
+        snapshot,
+    )
+
+    assert restored == 1
+    assert collection.rows == {
+        "old-0": {
+            "document": "old text",
+            "metadata": {"source": "app/uploads/demo.txt", "chunk_id": 0},
+            "embedding": [0.1, 0.2],
+        }
+    }
+
+
 def test_reset_chroma_collection_deletes_and_recreates_documents_collection(monkeypatch):
     collection = FakeCollection()
     client = FakeClient(collection)

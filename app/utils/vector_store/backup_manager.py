@@ -43,6 +43,14 @@ BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "app/backups"))
 CHROMA_DIR = Path(Config.paths.chroma_persist_dir)
 DATA_DIR = Path(Config.paths.data_dir)
 UPLOAD_DIR = Path(Config.paths.upload_folder)
+WORKSPACE_DATA_DIR = Path(
+    os.getenv("RAG_WORKSPACE_DATA_DIR", str(DATA_DIR / "workspaces"))
+)
+WORKSPACE_UPLOAD_DIR = Path(
+    os.getenv("RAG_WORKSPACE_UPLOAD_DIR", str(UPLOAD_DIR / "workspaces"))
+)
+_INITIAL_WORKSPACE_DATA_DIR = WORKSPACE_DATA_DIR
+_INITIAL_WORKSPACE_UPLOAD_DIR = WORKSPACE_UPLOAD_DIR
 
 
 class BackupError(RuntimeError):
@@ -89,15 +97,28 @@ def _checkpoint_chroma(path: Path) -> None:
 # ======================================================================
 # CREATE BACKUP
 # ======================================================================
-def create_backup() -> dict[str, Any]:
-    from utils.index_lock import index_write_lock
+def create_backup(
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    from utils.index_lock import index_write_lock, lifecycle_read_lock
 
-    with index_write_lock():
-        return _create_backup_locked()
+    with lifecycle_read_lock():
+        with index_write_lock():
+            return _create_backup_locked(
+                workspace_data_dir=workspace_data_dir,
+                workspace_upload_dir=workspace_upload_dir,
+            )
 
 
-def _create_backup_locked() -> dict[str, Any]:
+def _create_backup_locked(
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     """Create a backup snapshot of ChromaDB + data JSON files."""
+    from utils.index_lock import assert_distributed_locks_healthy
     from utils.metrics import get_metrics
     metrics = get_metrics()
     start_time = time.time()
@@ -111,6 +132,11 @@ def _create_backup_locked() -> dict[str, Any]:
     staging.mkdir(parents=True)
 
     try:
+        workspace_data_dir, workspace_upload_dir = _configured_workspace_dirs(
+            workspace_data_dir=workspace_data_dir,
+            workspace_upload_dir=workspace_upload_dir,
+        )
+
         # ── 1. live document count (before any copy) ──────────────
         live_doc_count = _count_chroma_live(CHROMA_DIR)
         log.info("Live document count: %d", live_doc_count)
@@ -144,12 +170,49 @@ def _create_backup_locked() -> dict[str, Any]:
         else:
             uploads_staging.mkdir()
 
+        # Workspace roots can be configured outside the global data/upload
+        # trees. Store them as separate archive components only when the
+        # global component does not already contain them.
+        workspace_data_staging, workspace_data_separate = (
+            _stage_workspace_directory(
+                workspace_data_dir,
+                primary_source=DATA_DIR,
+                primary_staging=data_staging,
+                separate_staging=staging / "workspace_data",
+                ignore=shutil.ignore_patterns("*.lock"),
+            )
+        )
+        workspace_upload_staging, workspace_upload_separate = (
+            _stage_workspace_directory(
+                workspace_upload_dir,
+                primary_source=UPLOAD_DIR,
+                primary_staging=uploads_staging,
+                separate_staging=staging / "workspace_uploads",
+            )
+        )
+        assert_distributed_locks_healthy()
+
         # ── 5. build manifest ──────────────────────────────────────
         manifest_path = staging / "manifest.json"
         chroma_size = _dir_size(chroma_staging) if chroma_staging.exists() else 0
         data_size = _dir_size(data_staging) if data_staging.exists() else 0
         uploads_size = _dir_size(uploads_staging) if uploads_staging.exists() else 0
-        total_size = chroma_size + data_size + uploads_size
+        workspace_data_size = _dir_size(workspace_data_staging)
+        workspace_uploads_size = _dir_size(workspace_upload_staging)
+        total_size = (
+            chroma_size
+            + data_size
+            + uploads_size
+            + (workspace_data_size if workspace_data_separate else 0)
+            + (workspace_uploads_size if workspace_upload_separate else 0)
+        )
+        knowledge_base_summary = _knowledge_base_manifest_summary(
+            data_staging,
+            chroma_root=chroma_staging,
+            uploads_root=uploads_staging,
+            workspace_data_root=workspace_data_staging,
+            workspace_uploads_root=workspace_upload_staging,
+        )
 
         manifest = {
             "backup_id": backup_id,
@@ -159,13 +222,41 @@ def _create_backup_locked() -> dict[str, Any]:
             "chroma_size_bytes": chroma_size,
             "data_size_bytes": data_size,
             "uploads_size_bytes": uploads_size,
+            "workspace_data_size_bytes": workspace_data_size,
+            "workspace_uploads_size_bytes": workspace_uploads_size,
             "total_size_bytes": total_size,
             "chroma_sha256": _dir_checksum(chroma_staging) if chroma_staging.exists() else "",
             "data_sha256": _dir_checksum(data_staging) if data_staging.exists() else "",
             "uploads_sha256": _dir_checksum(uploads_staging) if uploads_staging.exists() else "",
+            "workspace_data_sha256": _dir_checksum(workspace_data_staging),
+            "workspace_uploads_sha256": _dir_checksum(workspace_upload_staging),
             "source_chroma_dir": str(CHROMA_DIR),
             "source_data_dir": str(DATA_DIR),
             "source_upload_dir": str(UPLOAD_DIR),
+            "source_workspace_data_dir": str(workspace_data_dir),
+            "source_workspace_upload_dir": str(workspace_upload_dir),
+            "workspace_data_backup_path": workspace_data_staging.relative_to(
+                staging
+            ).as_posix(),
+            "workspace_uploads_backup_path": workspace_upload_staging.relative_to(
+                staging
+            ).as_posix(),
+            "workspace_data_separate": workspace_data_separate,
+            "workspace_uploads_separate": workspace_upload_separate,
+            "knowledge_base_catalog_schema_version": 1,
+            "knowledge_base_workspace_count": knowledge_base_summary[
+                "workspace_count"
+            ],
+            "knowledge_base_count": knowledge_base_summary[
+                "knowledge_base_count"
+            ],
+            "knowledge_base_collection_count": knowledge_base_summary[
+                "collection_count"
+            ],
+            "knowledge_base_collection_scan_available": knowledge_base_summary[
+                "collection_scan_available"
+            ],
+            "knowledge_bases": knowledge_base_summary["knowledge_bases"],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -179,6 +270,7 @@ def _create_backup_locked() -> dict[str, Any]:
         compressed_size = compressed.stat().st_size
         manifest["compressed_size_bytes"] = compressed_size
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        assert_distributed_locks_healthy()
 
         # ── 7. move to final location ─────────────────────────────
         final_dir = BACKUP_DIR / backup_id
@@ -186,6 +278,7 @@ def _create_backup_locked() -> dict[str, Any]:
         shutil.move(str(compressed), str(final_dir / f"{backup_id}.tar.gz"))
         # Copy decompressed files for restore convenience
         for child in sorted(staging.iterdir()):
+            assert_distributed_locks_healthy()
             dest = final_dir / child.name
             if not dest.exists() or dest.is_dir():
                 if child.is_dir():
@@ -200,7 +293,13 @@ def _create_backup_locked() -> dict[str, Any]:
         final_archive = final_dir / f"{backup_id}.tar.gz"
         if encryption_key:
             final_archive = _encrypt_backup(final_dir, encryption_key)
-            for component_name in ("chroma_db", "data", "uploads"):
+            for component_name in (
+                "chroma_db",
+                "data",
+                "uploads",
+                "workspace_data",
+                "workspace_uploads",
+            ):
                 shutil.rmtree(final_dir / component_name, ignore_errors=True)
         manifest["archive_filename"] = final_archive.name
         manifest["archive_sha256"] = _sha256(final_archive)
@@ -241,14 +340,30 @@ def _create_backup_locked() -> dict[str, Any]:
 # ======================================================================
 # RESTORE BACKUP
 # ======================================================================
-def restore_backup(backup_id: str) -> dict[str, Any]:
-    from utils.index_lock import index_write_lock
+def restore_backup(
+    backup_id: str,
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    from utils.index_lock import index_write_lock, lifecycle_write_lock
 
-    with index_write_lock():
-        return _restore_backup_locked(_safe_backup_id(backup_id))
+    backup_id = _safe_backup_id(backup_id)
+    with lifecycle_write_lock(publish=False):
+        with index_write_lock():
+            return _restore_backup_locked(
+                backup_id,
+                workspace_data_dir=workspace_data_dir,
+                workspace_upload_dir=workspace_upload_dir,
+            )
 
 
-def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
+def _restore_backup_locked(
+    backup_id: str,
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     """Restore ChromaDB + data JSON from a previous backup.
 
     This performs an atomic swap:
@@ -257,6 +372,10 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
       3. Atomic rename restore → current
       4. Verify document count matches manifest
     """
+    from utils.index_lock import (
+        DistributedLockLeaseLostError,
+        assert_distributed_locks_healthy,
+    )
     from utils.metrics import get_metrics
     metrics = get_metrics()
     restore_start = time.time()
@@ -264,6 +383,7 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
     extract_root: Optional[Path] = None
     restore_dirs: list[Path] = []
     swapped: list[tuple[Path, Optional[Path]]] = []
+    chroma_clients_reset = False
 
     try:
         backup_path = BACKUP_DIR / backup_id
@@ -281,9 +401,10 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
         if verification.get("status") != "ok":
             raise BackupError(f"Backup {backup_id} failed integrity verification: {verification}")
 
-        source_chroma = backup_path / "chroma_db"
-        source_data = backup_path / "data"
-        source_uploads = backup_path / "uploads"
+        source_root = backup_path
+        source_chroma = source_root / "chroma_db"
+        source_data = source_root / "data"
+        source_uploads = source_root / "uploads"
 
         if not source_chroma.exists():
             tar_path = backup_path / f"{backup_id}.tar.gz"
@@ -295,9 +416,7 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
                 extract_root.mkdir(parents=True)
                 with tarfile.open(str(tar_path), "r:gz") as tar:
                     _safe_extract(tar, extract_root)
-                source_chroma = extract_root / "chroma_db"
-                source_data = extract_root / "data"
-                source_uploads = extract_root / "uploads"
+                source_root = extract_root
             elif encrypted_tar.exists():
                 encryption_key = os.getenv("BACKUP_ENCRYPTION_KEY")
                 if not encryption_key:
@@ -311,71 +430,119 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
                 with tarfile.open(str(decrypted_tar), "r:gz") as tar:
                     _safe_extract(tar, extract_root)
                 decrypted_tar.unlink(missing_ok=True)
-                source_chroma = extract_root / "chroma_db"
-                source_data = extract_root / "data"
-                source_uploads = extract_root / "uploads"
+                source_root = extract_root
+
+        source_chroma = source_root / "chroma_db"
+        source_data = source_root / "data"
+        source_uploads = source_root / "uploads"
+        source_workspace_data = _manifest_component_path(
+            source_root,
+            manifest.get("workspace_data_backup_path"),
+            fallback=source_data / "workspaces",
+        )
+        source_workspace_uploads = _manifest_component_path(
+            source_root,
+            manifest.get("workspace_uploads_backup_path"),
+            fallback=source_uploads / "workspaces",
+        )
+        workspace_data_dir, workspace_upload_dir = _configured_workspace_dirs(
+            workspace_data_dir=workspace_data_dir,
+            workspace_upload_dir=workspace_upload_dir,
+        )
 
         bak_suffix = f".bak.{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
-        components = (
-            (CHROMA_DIR, source_chroma),
-            (DATA_DIR, source_data),
-            (UPLOAD_DIR, source_uploads),
+        components = _restore_components(
+            source_chroma=source_chroma,
+            source_data=source_data,
+            source_uploads=source_uploads,
+            source_workspace_data=source_workspace_data,
+            source_workspace_uploads=source_workspace_uploads,
+            workspace_data_dir=workspace_data_dir,
+            workspace_upload_dir=workspace_upload_dir,
         )
-        for target, source in components:
+        for target, source, overlays in components:
             target.parent.mkdir(parents=True, exist_ok=True)
             restore_dir = target.parent / f"{target.name}.restore.{backup_id}"
             if restore_dir.exists():
                 shutil.rmtree(restore_dir)
-            if source.exists():
-                shutil.copytree(str(source), str(restore_dir))
-            else:
-                restore_dir.mkdir()
+            _copy_directory(source, restore_dir)
+            for relative_path, overlay_source in overlays:
+                overlay_target = restore_dir / relative_path
+                if overlay_target.exists():
+                    shutil.rmtree(overlay_target)
+                overlay_target.parent.mkdir(parents=True, exist_ok=True)
+                _copy_directory(overlay_source, overlay_target)
             restore_dirs.append(restore_dir)
 
+        # Chroma caches one System per persistence path. Stop and evict the
+        # live System before swapping directories, otherwise a client created
+        # after the restore can keep serving the SQLite database moved to
+        # ``.bak`` under the same path identifier.
+        assert_distributed_locks_healthy()
+        chroma_clients_reset = True
+        _reset_chroma_system_cache()
         try:
-            for (target, _source), restore_dir in zip(components, restore_dirs):
+            for (target, _source, _overlays), restore_dir in zip(
+                components, restore_dirs
+            ):
+                assert_distributed_locks_healthy()
                 previous = target.parent / f"{target.name}{bak_suffix}"
                 if previous.exists():
+                    assert_distributed_locks_healthy()
                     shutil.rmtree(previous)
+                assert_distributed_locks_healthy()
                 previous_path: Optional[Path] = None
                 if target.exists():
-                    shutil.move(str(target), str(previous))
+                    try:
+                        shutil.move(str(target), str(previous))
+                    except Exception:
+                        if previous.exists() and not target.exists():
+                            swapped.append((target, previous))
+                        raise
                     previous_path = previous
-                try:
-                    shutil.move(str(restore_dir), str(target))
-                except Exception:
-                    if previous_path and previous_path.exists() and not target.exists():
-                        shutil.move(str(previous_path), str(target))
-                    raise
                 swapped.append((target, previous_path))
+                assert_distributed_locks_healthy()
+                shutil.move(str(restore_dir), str(target))
+                assert_distributed_locks_healthy()
+        except DistributedLockLeaseLostError:
+            raise
         except Exception:
-            for target, previous in reversed(swapped):
-                if target.exists():
-                    shutil.rmtree(target)
-                if previous and previous.exists():
-                    shutil.move(str(previous), str(target))
+            _rollback_restore_components(swapped)
             raise
 
+        assert_distributed_locks_healthy()
         actual_docs = _count_chroma_live(CHROMA_DIR)
+        _validate_restored_knowledge_bases(
+            DATA_DIR,
+            chroma_root=CHROMA_DIR,
+            uploads_root=UPLOAD_DIR,
+            manifest=manifest,
+            workspace_data_root=workspace_data_dir,
+            workspace_uploads_root=workspace_upload_dir,
+        )
         verify_ok = actual_docs == expected_docs
 
         if not verify_ok:
-            for target, previous in reversed(swapped):
-                if target.exists():
-                    shutil.rmtree(target)
-                if previous and previous.exists():
-                    shutil.move(str(previous), str(target))
-            swapped.clear()
             raise BackupError(
                 f"Restored document count mismatch: expected {expected_docs}, found {actual_docs}"
             )
 
+        # Import registers RAG/provider invalidators; the Chroma invalidator is
+        # registered by the vector-store module used during the reset above.
+        import utils.rag_engine  # noqa: F401
+        from utils.index_lock import (
+            bump_lifecycle_generation,
+            invalidate_lifecycle_caches,
+        )
+
+        assert_distributed_locks_healthy()
+        invalidate_lifecycle_caches()
         chroma_log.info(
             "Restore complete: expected %d docs, actual %d, verify=%s",
             expected_docs, actual_docs, verify_ok,
         )
 
-        return {
+        result = {
             "status": "success",
             "backup_id": backup_id,
             "document_count": actual_docs,
@@ -386,8 +553,72 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
                 for target, previous in swapped
             },
         }
+        # Publish while the filesystem swap is still inside the rollback
+        # transaction and both lifecycle/index locks are held. A publication
+        # failure therefore restores the previous snapshot instead of leaving
+        # other workers attached to stale Chroma systems.
+        assert_distributed_locks_healthy()
+        bump_lifecycle_generation()
+        return result
+    except DistributedLockLeaseLostError as e:
+        restore_status = "error"
+        preserved = {
+            str(target): str(previous) if previous else ""
+            for target, previous in swapped
+        }
+        if chroma_clients_reset:
+            try:
+                _reset_chroma_system_cache()
+            except Exception as reset_error:
+                log.error(
+                    "Failed to reset Chroma clients after lost restore lease: %s",
+                    reset_error,
+                )
+        log.critical(
+            "Restore %s lost its distributed lease; live paths were not "
+            "rolled back. Re-run the restore after lock recovery. "
+            "Preserved snapshots: %s",
+            backup_id,
+            preserved,
+        )
+        raise
     except Exception as e:
         restore_status = "error"
+        # Catalog validation happens after the atomic swap. Roll every
+        # component back on any post-swap failure, not only on a Chroma count
+        # mismatch, so an invalid KB catalog can never remain active.
+        try:
+            _rollback_restore_components(swapped)
+        except DistributedLockLeaseLostError as lease_error:
+            preserved = {
+                str(target): str(previous) if previous else ""
+                for target, previous in swapped
+            }
+            if chroma_clients_reset:
+                try:
+                    _reset_chroma_system_cache()
+                except Exception as reset_error:
+                    log.error(
+                        "Failed to reset Chroma clients after skipped "
+                        "restore rollback: %s",
+                        reset_error,
+                    )
+            log.critical(
+                "Restore %s failed and then lost its distributed lease; "
+                "rollback was skipped. Re-run the restore after lock "
+                "recovery. Preserved snapshots: %s",
+                backup_id,
+                preserved,
+            )
+            raise lease_error from e
+        if chroma_clients_reset:
+            try:
+                _reset_chroma_system_cache()
+            except Exception as reset_error:
+                log.error(
+                    "Failed to reset Chroma clients after restore rollback: %s",
+                    reset_error,
+                )
         log.error("Restore failed for backup %s: %s", backup_id, e)
         raise
     finally:
@@ -397,6 +628,28 @@ def _restore_backup_locked(backup_id: str) -> dict[str, Any]:
         if extract_root and extract_root.exists():
             shutil.rmtree(extract_root, ignore_errors=True)
         metrics.observe_backup("restore", time.time() - restore_start, restore_status)
+
+
+def _rollback_restore_components(
+    swapped: list[tuple[Path, Optional[Path]]],
+) -> None:
+    """Restore live components only while distributed ownership is valid."""
+
+    if not swapped:
+        return
+    from utils.index_lock import assert_distributed_locks_healthy
+
+    assert_distributed_locks_healthy()
+    for target, previous in reversed(swapped):
+        assert_distributed_locks_healthy()
+        if target.exists():
+            shutil.rmtree(target)
+            assert_distributed_locks_healthy()
+        if previous and previous.exists():
+            assert_distributed_locks_healthy()
+            shutil.move(str(previous), str(target))
+            assert_distributed_locks_healthy()
+    swapped.clear()
 
 
 # ======================================================================
@@ -465,6 +718,23 @@ def verify_backup(backup_id: str) -> dict[str, Any]:
     else:
         uploads_ok = not expected_uploads
 
+    if encrypted_only:
+        workspace_data_ok = True
+        workspace_uploads_ok = True
+    else:
+        workspace_data_ok = _verify_manifest_directory(
+            backup_path,
+            manifest,
+            path_key="workspace_data_backup_path",
+            checksum_key="workspace_data_sha256",
+        )
+        workspace_uploads_ok = _verify_manifest_directory(
+            backup_path,
+            manifest,
+            path_key="workspace_uploads_backup_path",
+            checksum_key="workspace_uploads_sha256",
+        )
+
     # Verify the compressed or encrypted archive and its checksum.
     tar_ok = (
         (backup_path / f"{backup_id}.tar.gz").exists()
@@ -480,11 +750,23 @@ def verify_backup(backup_id: str) -> dict[str, Any]:
     )
 
     return {
-        "status": "ok" if (chroma_ok and data_ok and uploads_ok and tar_ok and archive_checksum_ok) else "mismatch",
+        "status": "ok"
+        if (
+            chroma_ok
+            and data_ok
+            and uploads_ok
+            and workspace_data_ok
+            and workspace_uploads_ok
+            and tar_ok
+            and archive_checksum_ok
+        )
+        else "mismatch",
         "backup_id": backup_id,
         "chroma_checksum_ok": chroma_ok,
         "data_checksum_ok": data_ok,
         "uploads_checksum_ok": uploads_ok,
+        "workspace_data_checksum_ok": workspace_data_ok,
+        "workspace_uploads_checksum_ok": workspace_uploads_ok,
         "tar_archive_ok": tar_ok,
         "archive_checksum_ok": archive_checksum_ok,
         "document_count": manifest.get("document_count", 0),
@@ -535,10 +817,17 @@ def apply_retention() -> list[str]:
 # ======================================================================
 # SCHEDULED BACKUP
 # ======================================================================
-def schedule_backup() -> dict[str, Any]:
+def schedule_backup(
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
     """Trigger for APScheduler or cron. Runs create_backup wrapped in retry."""
     try:
-        result = create_backup()
+        result = create_backup(
+            workspace_data_dir=workspace_data_dir,
+            workspace_upload_dir=workspace_upload_dir,
+        )
         # Auto-retention after successful backup
         try:
             apply_retention()
@@ -655,9 +944,17 @@ class BackupScheduler:
         scheduler.stop()   # graceful
     """
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        *,
+        workspace_data_dir: str | os.PathLike[str] | None = None,
+        workspace_upload_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._enabled = enabled
+        self._workspace_data_dir = workspace_data_dir
+        self._workspace_upload_dir = workspace_upload_dir
         self._threads: list[threading.Thread] = []
         self._stop_events: list[threading.Event] = []
         self._running = False
@@ -671,6 +968,18 @@ class BackupScheduler:
     def is_running(self) -> bool:
         with self._lock:
             return self._running
+
+    def configure_workspace_dirs(
+        self,
+        *,
+        workspace_data_dir: str | os.PathLike[str] | None = None,
+        workspace_upload_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
+        """Update the workspace roots used by future scheduled runs."""
+
+        with self._lock:
+            self._workspace_data_dir = workspace_data_dir
+            self._workspace_upload_dir = workspace_upload_dir
 
     def start(self) -> None:
         """Start scheduled backup threads (non-blocking)."""
@@ -741,14 +1050,24 @@ class BackupScheduler:
         """Perform a single scheduled backup + retention."""
         log.info("BackupScheduler: running scheduled backup (hour %d)", hour)
         try:
-            result = schedule_backup()
+            with self._lock:
+                workspace_data_dir = self._workspace_data_dir
+                workspace_upload_dir = self._workspace_upload_dir
+            result = schedule_backup(
+                workspace_data_dir=workspace_data_dir,
+                workspace_upload_dir=workspace_upload_dir,
+            )
             status = result.get("status", "unknown")
             log.info("BackupScheduler: hour %d – backup %s", hour, status)
         except Exception as e:
             log.error("BackupScheduler: hour %d – backup failed: %s", hour, e)
 
 
-def start_scheduler() -> "BackupScheduler":
+def start_scheduler(
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> "BackupScheduler":
     """Return (starting if needed) the global scheduler instance."""
     global _scheduler
 
@@ -757,7 +1076,16 @@ def start_scheduler() -> "BackupScheduler":
             enabled = os.getenv("BACKUP_ENABLED", "0").lower() in {
                 "1", "true", "yes", "on",
             }
-            _scheduler = BackupScheduler(enabled=enabled)
+            _scheduler = BackupScheduler(
+                enabled=enabled,
+                workspace_data_dir=workspace_data_dir,
+                workspace_upload_dir=workspace_upload_dir,
+            )
+        else:
+            _scheduler.configure_workspace_dirs(
+                workspace_data_dir=workspace_data_dir,
+                workspace_upload_dir=workspace_upload_dir,
+            )
 
     if not _scheduler.is_running:
         _scheduler.start()
@@ -776,6 +1104,21 @@ def stop_scheduler() -> None:
 # ======================================================================
 # LIVE CHROMA COUNT
 # ======================================================================
+def _reset_chroma_system_cache() -> None:
+    """Stop cached Chroma systems so a path swap opens the replacement DB."""
+
+    if _chromadb_module is None:
+        return
+    try:
+        from utils.vector_store.chroma_persistent import (
+            reset_chroma_system_cache,
+        )
+
+        reset_chroma_system_cache()
+    except Exception as exc:
+        raise BackupError(f"Unable to clear Chroma client cache: {exc}") from exc
+
+
 def _count_chroma_live(path: Path) -> int:
     """Ask the ChromaDB client for its live document count.
 
@@ -807,6 +1150,400 @@ def _count_chroma_live(path: Path) -> int:
 # ======================================================================
 # HELPERS
 # ======================================================================
+def _configured_workspace_dirs(
+    *,
+    workspace_data_dir: str | os.PathLike[str] | None = None,
+    workspace_upload_dir: str | os.PathLike[str] | None = None,
+) -> tuple[Path, Path]:
+    """Return the workspace roots used by the application.
+
+    Environment values are resolved when each operation starts so a worker
+    does not silently keep stale values after configuration is injected.
+    The module globals remain patchable for tests and embedding callers.
+    """
+
+    workspace_data_env = os.getenv("RAG_WORKSPACE_DATA_DIR")
+    workspace_upload_env = os.getenv("RAG_WORKSPACE_UPLOAD_DIR")
+    if workspace_data_dir is not None:
+        resolved_workspace_data_dir = Path(workspace_data_dir)
+    elif workspace_data_env is not None:
+        resolved_workspace_data_dir = Path(workspace_data_env)
+    elif WORKSPACE_DATA_DIR != _INITIAL_WORKSPACE_DATA_DIR:
+        resolved_workspace_data_dir = WORKSPACE_DATA_DIR
+    else:
+        resolved_workspace_data_dir = DATA_DIR / "workspaces"
+    if workspace_upload_dir is not None:
+        resolved_workspace_upload_dir = Path(workspace_upload_dir)
+    elif workspace_upload_env is not None:
+        resolved_workspace_upload_dir = Path(workspace_upload_env)
+    elif WORKSPACE_UPLOAD_DIR != _INITIAL_WORKSPACE_UPLOAD_DIR:
+        resolved_workspace_upload_dir = WORKSPACE_UPLOAD_DIR
+    else:
+        resolved_workspace_upload_dir = UPLOAD_DIR / "workspaces"
+    return resolved_workspace_data_dir, resolved_workspace_upload_dir
+
+
+def _relative_directory(path: Path, root: Path) -> Path | None:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+
+
+def _copy_directory(
+    source: Path,
+    destination: Path,
+    *,
+    ignore: Any = None,
+) -> None:
+    if source.exists():
+        shutil.copytree(str(source), str(destination), ignore=ignore)
+    else:
+        destination.mkdir(parents=True)
+
+
+def _stage_workspace_directory(
+    source: Path,
+    *,
+    primary_source: Path,
+    primary_staging: Path,
+    separate_staging: Path,
+    ignore: Any = None,
+) -> tuple[Path, bool]:
+    relative_path = _relative_directory(source, primary_source)
+    if relative_path is not None:
+        staged = primary_staging / relative_path
+        if not staged.exists():
+            staged.mkdir(parents=True)
+        return staged, False
+    _copy_directory(source, separate_staging, ignore=ignore)
+    return separate_staging, True
+
+
+def _manifest_component_path(
+    backup_root: Path,
+    value: Any,
+    *,
+    fallback: Path,
+) -> Path:
+    """Resolve a manifest path without allowing it outside the backup."""
+
+    if value is None:
+        return fallback
+    if not isinstance(value, str) or not value:
+        raise BackupError("Invalid workspace component path in backup manifest")
+    root = backup_root.resolve()
+    candidate = (backup_root / value).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise BackupError("Unsafe workspace component path in backup manifest") from exc
+    return candidate
+
+
+def _verify_manifest_directory(
+    backup_root: Path,
+    manifest: dict,
+    *,
+    path_key: str,
+    checksum_key: str,
+) -> bool:
+    """Verify an optional logical directory recorded by newer manifests."""
+
+    if checksum_key not in manifest:
+        return True
+    try:
+        component = _manifest_component_path(
+            backup_root,
+            manifest.get(path_key),
+            fallback=backup_root / "__missing_workspace_component__",
+        )
+    except BackupError:
+        return False
+    expected = manifest.get(checksum_key)
+    return (
+        isinstance(expected, str)
+        and component.is_dir()
+        and _dir_checksum(component) == expected
+    )
+
+
+def _restore_components(
+    *,
+    source_chroma: Path,
+    source_data: Path,
+    source_uploads: Path,
+    source_workspace_data: Path,
+    source_workspace_uploads: Path,
+    workspace_data_dir: Path,
+    workspace_upload_dir: Path,
+) -> list[tuple[Path, Path, list[tuple[Path, Path]]]]:
+    """Build non-overlapping restore swaps and workspace overlays."""
+
+    components: list[tuple[Path, Path, list[tuple[Path, Path]]]] = [
+        (CHROMA_DIR, source_chroma, []),
+        (DATA_DIR, source_data, []),
+        (UPLOAD_DIR, source_uploads, []),
+    ]
+
+    def add_workspace_component(
+        target: Path,
+        source: Path,
+        *,
+        primary_index: int,
+    ) -> None:
+        primary_target, primary_source, overlays = components[primary_index]
+        relative_path = _relative_directory(target, primary_target)
+        if relative_path is not None:
+            if relative_path == Path("."):
+                components[primary_index] = (primary_target, source, overlays)
+            else:
+                overlays.append((relative_path, source))
+            return
+        if _relative_directory(primary_target, target) is not None:
+            raise BackupError(
+                f"Workspace restore target {target} cannot contain {primary_target}"
+            )
+        components.append((target, source, []))
+
+    add_workspace_component(
+        workspace_data_dir,
+        source_workspace_data,
+        primary_index=1,
+    )
+    add_workspace_component(
+        workspace_upload_dir,
+        source_workspace_uploads,
+        primary_index=2,
+    )
+
+    # Overlapping top-level swaps can move a prepared restore tree out from
+    # underneath a later swap. Reject such configurations before live state
+    # is touched.
+    for index, (target, _source, _overlays) in enumerate(components):
+        for other_target, _other_source, _other_overlays in components[index + 1 :]:
+            if (
+                _relative_directory(target, other_target) is not None
+                or _relative_directory(other_target, target) is not None
+            ):
+                raise BackupError(
+                    f"Backup restore targets overlap: {target} and {other_target}"
+                )
+    return components
+
+
+def _knowledge_base_manifest_summary(
+    data_root: Path,
+    *,
+    chroma_root: Path | None = None,
+    uploads_root: Path | None = None,
+    workspace_data_root: Path | None = None,
+    workspace_uploads_root: Path | None = None,
+) -> dict:
+    from utils.knowledge_base_store import KnowledgeBaseStore
+    from utils.workspace import collection_for_knowledge_base
+
+    workspaces_root = workspace_data_root or data_root / "workspaces"
+    workspace_uploads_root = (
+        workspace_uploads_root
+        if workspace_uploads_root is not None
+        else uploads_root / "workspaces"
+        if uploads_root is not None
+        else None
+    )
+    entries = []
+    workspace_count = 0
+    if not workspaces_root.exists():
+        return {
+            "workspace_count": 0,
+            "knowledge_base_count": 0,
+            "collection_count": 0,
+            "collection_scan_available": True,
+            "knowledge_bases": [],
+        }
+    for workspace_dir in sorted(path for path in workspaces_root.iterdir() if path.is_dir()):
+        workspace_count += 1
+        catalog_path = workspace_dir / "knowledge_bases.json"
+        if catalog_path.exists():
+            records = KnowledgeBaseStore(catalog_path).list()
+        else:
+            records = [{"id": "default", "name": "Default", "status": "active"}]
+        for record in records:
+            knowledge_base_id = record["id"]
+            if knowledge_base_id == "default":
+                file_index = workspace_dir / "files.json"
+                data_directory = workspace_dir
+                upload_directory = (
+                    workspace_uploads_root / workspace_dir.name
+                    if workspace_uploads_root is not None
+                    else None
+                )
+            else:
+                data_directory = (
+                    workspace_dir
+                    / "knowledge_bases"
+                    / knowledge_base_id
+                )
+                file_index = data_directory / "files.json"
+                upload_directory = (
+                    workspace_uploads_root
+                    / workspace_dir.name
+                    / "__knowledge_bases__"
+                    / knowledge_base_id
+                    if workspace_uploads_root is not None
+                    else None
+                )
+            files = []
+            if file_index.exists():
+                try:
+                    loaded = json.loads(file_index.read_text(encoding="utf-8"))
+                    files = loaded if isinstance(loaded, list) else []
+                except (json.JSONDecodeError, OSError):
+                    files = []
+            entries.append(
+                {
+                    "workspace_id": workspace_dir.name,
+                    "knowledge_base_id": knowledge_base_id,
+                    "status": record.get("status", "active"),
+                    "collection": collection_for_knowledge_base(
+                        workspace_dir.name,
+                        knowledge_base_id,
+                    ),
+                    "tracked_files": len(files),
+                    "indexed_files": sum(
+                        item.get("status") == "indexed"
+                        for item in files
+                        if isinstance(item, dict)
+                    ),
+                    "chunks": sum(
+                        max(0, int(item.get("chunks") or 0))
+                        for item in files
+                        if isinstance(item, dict)
+                    ),
+                    "data_directory_present": data_directory.exists(),
+                    "upload_directory_present": (
+                        upload_directory.exists()
+                        if upload_directory is not None
+                        else False
+                    ),
+                }
+            )
+    collection_counts, collection_scan_available = _chroma_collection_counts(
+        chroma_root
+    )
+    for entry in entries:
+        collection_name = entry["collection"]
+        entry["collection_present"] = collection_name in collection_counts
+        entry["documents"] = collection_counts.get(collection_name, 0)
+    return {
+        "workspace_count": workspace_count,
+        "knowledge_base_count": len(entries),
+        "collection_count": sum(
+            entry["collection_present"] for entry in entries
+        ),
+        "collection_scan_available": collection_scan_available,
+        "knowledge_bases": entries,
+    }
+
+
+def _validate_restored_knowledge_bases(
+    data_root: Path,
+    *,
+    chroma_root: Path,
+    uploads_root: Path,
+    manifest: dict,
+    workspace_data_root: Path | None = None,
+    workspace_uploads_root: Path | None = None,
+) -> None:
+    from utils.knowledge_base_store import KnowledgeBaseCatalogError, KnowledgeBaseStore
+
+    workspaces_root = workspace_data_root or data_root / "workspaces"
+    if not workspaces_root.exists():
+        return
+    for workspace_dir in (path for path in workspaces_root.iterdir() if path.is_dir()):
+        catalog_path = workspace_dir / "knowledge_bases.json"
+        if not catalog_path.exists():
+            continue
+        try:
+            KnowledgeBaseStore(catalog_path).list()
+        except KnowledgeBaseCatalogError as exc:
+            raise BackupError(
+                f"Invalid restored knowledge base catalog for {workspace_dir.name}"
+            ) from exc
+
+    expected_entries = manifest.get("knowledge_bases")
+    if not isinstance(expected_entries, list):
+        return
+    actual = _knowledge_base_manifest_summary(
+        data_root,
+        chroma_root=chroma_root,
+        uploads_root=uploads_root,
+        workspace_data_root=workspaces_root,
+        workspace_uploads_root=workspace_uploads_root,
+    )
+    expected_by_key = {
+        (item.get("workspace_id"), item.get("knowledge_base_id")): item
+        for item in expected_entries
+        if isinstance(item, dict)
+    }
+    actual_by_key = {
+        (item.get("workspace_id"), item.get("knowledge_base_id")): item
+        for item in actual["knowledge_bases"]
+    }
+    if set(expected_by_key) != set(actual_by_key):
+        raise BackupError("Restored knowledge base catalog does not match the manifest")
+    for key, expected in expected_by_key.items():
+        restored = actual_by_key[key]
+        for field in ("data_directory_present", "upload_directory_present"):
+            if field in expected and bool(expected[field]) != bool(restored[field]):
+                raise BackupError(
+                    f"Restored knowledge base storage does not match the manifest: {key}"
+                )
+    if (
+        manifest.get("knowledge_base_collection_scan_available")
+        and actual["collection_scan_available"]
+    ):
+        for key, expected in expected_by_key.items():
+            restored = actual_by_key[key]
+            if (
+                bool(expected.get("collection_present"))
+                != bool(restored["collection_present"])
+                or int(expected.get("documents") or 0)
+                != int(restored["documents"])
+            ):
+                raise BackupError(
+                    f"Restored knowledge base collection does not match the manifest: {key}"
+                )
+
+
+def _chroma_collection_counts(path: Path | None) -> tuple[dict[str, int], bool]:
+    if path is None or not path.exists():
+        return {}, True
+    if _chromadb_module is None:
+        return {}, False
+    try:
+        client = _chromadb_module.PersistentClient(path=str(path))
+        counts: dict[str, int] = {}
+        for item in client.list_collections():
+            if isinstance(item, str):
+                name = item
+                collection = client.get_collection(name)
+            elif isinstance(item, dict):
+                name = str(item.get("name") or "")
+                collection = item.get("collection")
+                if collection is None and name:
+                    collection = client.get_collection(name)
+            else:
+                name = str(getattr(item, "name", "") or "")
+                collection = item
+            if name and collection is not None:
+                counts[name] = max(0, int(collection.count()))
+        return counts, True
+    except Exception as exc:
+        chroma_log.warning("Knowledge base collection count failed: %s", exc)
+        return {}, False
+
+
 def _dir_size(path: Path) -> int:
     total = 0
     for f in path.rglob("*"):

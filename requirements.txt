@@ -6,7 +6,7 @@ Flask>=3.1,<4
 gunicorn>=23,<26; platform_system != "Windows"
 python-dotenv>=1.0,<2
 redis>=5.0,<7
-rq>=2.0,<3
+rq>=2.8,<3
 langchain-community>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-core>=0.3,<0.4

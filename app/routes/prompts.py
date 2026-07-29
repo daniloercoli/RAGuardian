@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from flask import current_app, jsonify, render_template, request
+from contextlib import contextmanager
+
+from flask import abort, current_app, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
 from utils.auth import current_user, require_admin, require_login
+from utils.index_lock import lifecycle_read_lock
 from utils.prompt_store import PromptStore
+from utils.user_store import UserStore
 
 
 def _store() -> PromptStore:
@@ -13,6 +18,21 @@ def _store() -> PromptStore:
 def _user_id() -> str:
     user = current_user()
     return user["id"] if user else ""
+
+
+@contextmanager
+def _personal_prompt_owner():
+    """Keep user deletion outside the complete personal-prompt operation."""
+    with lifecycle_read_lock():
+        user = current_user()
+        if not user:
+            abort(401)
+        current = UserStore(
+            current_app.config.get("USERS_FILE")
+        ).get(user["id"])
+        if not current or not current.get("enabled", True):
+            abort(401)
+        yield current["id"]
 
 
 def register_prompt_routes(app) -> None:
@@ -29,7 +49,10 @@ def register_prompt_routes(app) -> None:
     @app.route("/api/prompts", methods=["GET"])
     @require_login
     def api_list_prompts():
-        return jsonify({"personal": _store().list_user_prompts(_user_id())})
+        with _personal_prompt_owner() as user_id:
+            return jsonify({
+                "personal": _store().list_user_prompts(user_id)
+            })
 
     @app.route("/api/prompts", methods=["POST"])
     @require_login
@@ -42,7 +65,16 @@ def register_prompt_routes(app) -> None:
         if not name or not content:
             return jsonify(error="name and content required"), 400
         try:
-            return jsonify(_store().create_user_prompt(_user_id(), name, content)), 201
+            with _personal_prompt_owner() as user_id:
+                return jsonify(
+                    _store().create_user_prompt(
+                        user_id,
+                        name,
+                        content,
+                    )
+                ), 201
+        except HTTPException:
+            raise
         except Exception as exc:
             return jsonify(error=str(exc)), 400
 
@@ -50,19 +82,21 @@ def register_prompt_routes(app) -> None:
     @require_login
     def api_update_prompt(prompt_id):
         data = request.get_json(silent=True) or {}
-        updated = _store().update_user_prompt(
-            _user_id(),
-            prompt_id,
-            name=data.get("name"),
-            content=data.get("content"),
-        )
+        with _personal_prompt_owner() as user_id:
+            updated = _store().update_user_prompt(
+                user_id,
+                prompt_id,
+                name=data.get("name"),
+                content=data.get("content"),
+            )
         return jsonify(updated) if updated else (jsonify(error="prompt not found"), 404)
 
     @app.route("/api/prompts/<prompt_id>", methods=["DELETE"])
     @require_login
     def api_delete_prompt(prompt_id):
-        if _store().delete_user_prompt(_user_id(), prompt_id):
-            return jsonify(ok=True)
+        with _personal_prompt_owner() as user_id:
+            if _store().delete_user_prompt(user_id, prompt_id):
+                return jsonify(ok=True)
         return jsonify(error="prompt not found"), 404
 
     @app.route("/api/prompts/shared", methods=["GET"])

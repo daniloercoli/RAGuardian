@@ -13,7 +13,10 @@ def register_backup_routes(app) -> None:
         from utils.vector_store.backup_manager import create_backup
 
         try:
-            result = create_backup()
+            result = create_backup(
+                workspace_data_dir=app.config["WORKSPACE_DATA_DIR"],
+                workspace_upload_dir=app.config["WORKSPACE_UPLOAD_DIR"],
+            )
             flash(
                 f"Backup creato: {result.get('id', '?')} "
                 f"({result.get('document_count', 0)} documenti)",
@@ -42,7 +45,11 @@ def register_backup_routes(app) -> None:
         from utils.vector_store.backup_manager import restore_backup
 
         try:
-            result = restore_backup(backup_id)
+            result = restore_backup(
+                backup_id,
+                workspace_data_dir=app.config["WORKSPACE_DATA_DIR"],
+                workspace_upload_dir=app.config["WORKSPACE_UPLOAD_DIR"],
+            )
             flash(
                 f"Restore completato: {backup_id} "
                 f"({result.get('document_count', 'unknown')} documenti)",

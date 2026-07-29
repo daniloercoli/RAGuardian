@@ -21,7 +21,7 @@ wp plugin install dist/rag-client.zip --activate
 ```
 
 3. Open **Settings -> Raguardian**.
-4. Configure the RAGuardian base URL and paste an API key created from **RAGuardian -> API Keys** for the workspace user that should power the website.
+4. Configure the RAGuardian base URL, paste an API key, and select one of the knowledge bases authorized to that key.
 5. Enable the floating widget globally or place the inline shortcode where needed:
 
 ```text
@@ -37,6 +37,13 @@ Recommended setup:
 5. Use **Test RAGuardian health** to verify that WordPress can reach `/api/v1/health`.
 
 Do not create separate keys for chat, ingestion, and speech unless you intentionally want separate rotation or audit boundaries. The normal plugin setup uses one key with the required scopes.
+
+The selected KB is stored in WordPress options and injected by PHP into query,
+health, upload, audio, and delete calls. Visitors cannot override it. An empty
+setting means the default KB. Changing it does not move existing documents;
+run a new import or sync for the new target. WXR queues and post-sync cron jobs
+store the target when they are created, so later settings changes cannot
+redirect in-progress work.
 
 ## Architecture
 

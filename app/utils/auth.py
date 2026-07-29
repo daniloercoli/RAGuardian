@@ -10,7 +10,7 @@ from werkzeug.security import check_password_hash
 
 from utils.settings_store import API_SCOPES
 from utils.user_store import UserStore, api_key_matches, normalize_email
-from utils.workspace import workspace_for_user
+from utils.workspace import safe_workspace_id
 
 
 def hash_password(password: str) -> str:
@@ -91,40 +91,39 @@ def find_api_key(value: Optional[str]) -> Optional[dict]:
             "name": "env",
             "key": value,
             "enabled": True,
-            "scopes": sorted(API_SCOPES),
+            "scopes": ["query", "ingest", "speech"],
             "can_upload": True,
+            "knowledge_base_ids": ["default"],
             "user_id": admin["id"],
-            "workspace_id": admin["id"],
+            "workspace_id": safe_workspace_id(admin["id"]),
         }
 
     store = _user_store()
-    if not _first_admin_user() and not _user_store().has_users():
-        _user_store().bootstrap_admin_if_empty(
-            email="admin@example.local",
-            password=os.urandom(16).hex(),
-        )
-
     with store._lock:
         users = store._list_unlocked()
     for user in users:
+        if not user.get("enabled", True):
+            continue
         for key_item in (user.get("api_keys") or []):
             if not key_item.get("enabled", True) or not api_key_matches(key_item, value):
                 continue
             if _api_key_is_expired(key_item.get("expires_at")):
                 continue
-            try:
-                workspace = workspace_for_user(user, app=current_app)
-            except Exception:
-                workspace = workspace_for_user({"id": user["id"]}, app=current_app)
             scopes = key_item.get("scopes", ["query"])
+            knowledge_base_ids = (
+                key_item.get("knowledge_base_ids")
+                if "knowledge_base_ids" in key_item
+                else ["default"]
+            )
             return {
                 "name": key_item.get("name", "custom"),
                 "key": value,
                 "enabled": True,
                 "scopes": scopes,
+                "knowledge_base_ids": list(knowledge_base_ids or []),
                 "can_upload": "ingest" in scopes,
                 "user_id": user["id"],
-                "workspace_id": workspace.workspace_id,
+                "workspace_id": safe_workspace_id(user["id"]),
                 "api_key_id": key_item.get("id") or key_item.get("name"),
                 "_user_key_name": key_item.get("name"),
                 "_user_id_for_logging": user["id"],
@@ -171,6 +170,26 @@ def require_api_scope(scope: str):
     return decorator
 
 
+def require_api_any_scope(*required_scopes: str):
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            key = find_api_key(request.headers.get("X-API-Key"))
+            if not key:
+                return jsonify(error="API key mancante o non valida", status="unauthorized"), 401
+            if not any(api_key_has_scope(key, scope) for scope in required_scopes):
+                return jsonify(
+                    error="API key senza uno scope richiesto",
+                    status="forbidden",
+                ), 403
+            request.api_key = key
+            return view(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def require_login_or_api_scope(scope: str):
     def decorator(view):
         @functools.wraps(view)
@@ -188,6 +207,28 @@ def require_login_or_api_scope(scope: str):
     return decorator
 
 
+def require_login_or_api_any_scope(*required_scopes: str):
+    """Allow any authenticated user or an API key with one required scope."""
+
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            if is_logged_in():
+                return view(*args, **kwargs)
+            key = find_api_key(request.headers.get("X-API-Key"))
+            if key and any(api_key_has_scope(key, scope) for scope in required_scopes):
+                request.api_key = key
+                return view(*args, **kwargs)
+            return jsonify(
+                error="Credenziali mancanti o scope richiesto assente",
+                status="unauthorized",
+            ), 401
+
+        return wrapper
+
+    return decorator
+
+
 def require_admin_or_api_scope(scope: str):
     def decorator(view):
         @functools.wraps(view)
@@ -199,6 +240,26 @@ def require_admin_or_api_scope(scope: str):
                 request.api_key = key
                 return view(*args, **kwargs)
             return jsonify(error=f"Credenziali mancanti o scope richiesto assente: {scope}", status="unauthorized"), 401
+
+        return wrapper
+
+    return decorator
+
+
+def require_admin_or_api_any_scope(*required_scopes: str):
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            if is_admin_logged_in():
+                return view(*args, **kwargs)
+            key = find_api_key(request.headers.get("X-API-Key"))
+            if key and any(api_key_has_scope(key, scope) for scope in required_scopes):
+                request.api_key = key
+                return view(*args, **kwargs)
+            return jsonify(
+                error="Credenziali mancanti o scope richiesto assente",
+                status="unauthorized",
+            ), 401
 
         return wrapper
 

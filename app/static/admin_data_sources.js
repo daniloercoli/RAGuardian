@@ -1,4 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
+    const knowledgeBaseId = new URLSearchParams(window.location.search).get(
+        "knowledge_base_id"
+    ) || "default";
     const statusBox = document.getElementById("dataSourceJobStatus");
     const syncButtons = Array.from(document.querySelectorAll("[data-sync-source]"));
     const toggleButtons = Array.from(document.querySelectorAll("[data-toggle-source]"));
@@ -32,7 +35,8 @@ document.addEventListener("DOMContentLoaded", () => {
     async function pollJob(jobId) {
         let done = false;
         while (!done) {
-            const response = await fetch(`/admin/data-sources/jobs/${encodeURIComponent(jobId)}`, {
+            const query = new URLSearchParams({knowledge_base_id: knowledgeBaseId});
+            const response = await fetch(`/admin/data-sources/jobs/${encodeURIComponent(jobId)}?${query.toString()}`, {
                 method: "GET",
                 headers: {"Accept": "application/json"},
                 credentials: "same-origin"

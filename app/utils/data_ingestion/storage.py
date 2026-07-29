@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import uuid
 from pathlib import Path
 
 from utils.data_ingestion.base import IngestionAttachment, IngestionItem
@@ -15,21 +16,37 @@ class IngestionStorage:
     def __init__(self, upload_folder: str):
         self.upload_root = Path(upload_folder).resolve()
 
-    def materialize_item(self, data_source_id: str, item: IngestionItem) -> dict:
+    def materialize_item(
+        self,
+        data_source_id: str,
+        item: IngestionItem,
+        *,
+        staged: bool = False,
+    ) -> dict:
         extension = _safe_extension(item.extension)
         filename = stable_filename(data_source_id, item.remote_id, item.filename, extension)
         path = self._source_dir(data_source_id) / filename
+        write_path = _staged_path(path) if staged else path
         if item.content_bytes is not None:
-            path.write_bytes(item.content_bytes)
+            write_path.write_bytes(item.content_bytes)
         else:
-            path.write_text(item.content or "", encoding="utf-8")
-        return {"filename": filename, "file_path": str(path), "extension": extension}
+            write_path.write_text(item.content or "", encoding="utf-8")
+        result = {
+            "filename": filename,
+            "file_path": str(path),
+            "extension": extension,
+        }
+        if staged:
+            result["staged_file_path"] = str(write_path)
+        return result
 
     def materialize_attachment(
         self,
         data_source_id: str,
         parent: IngestionItem,
         attachment: IngestionAttachment,
+        *,
+        staged: bool = False,
     ) -> dict | None:
         extension = _safe_extension(attachment.extension)
         if extension not in DOCUMENT_INDEX_EXTENSIONS:
@@ -37,8 +54,16 @@ class IngestionStorage:
         remote_id = attachment.remote_id or f"{parent.remote_id}:{attachment.filename}"
         filename = stable_filename(data_source_id, remote_id, attachment.filename, extension)
         path = self._source_dir(data_source_id) / filename
-        path.write_bytes(attachment.content or b"")
-        return {"filename": filename, "file_path": str(path), "extension": extension}
+        write_path = _staged_path(path) if staged else path
+        write_path.write_bytes(attachment.content or b"")
+        result = {
+            "filename": filename,
+            "file_path": str(path),
+            "extension": extension,
+        }
+        if staged:
+            result["staged_file_path"] = str(write_path)
+        return result
 
     def _source_dir(self, data_source_id: str) -> Path:
         source_dir = (self.upload_root / "external" / _slug(data_source_id)).resolve()
@@ -54,6 +79,12 @@ def stable_filename(source_id: str, remote_id: str, original_name: str, extensio
     source_slug = _slug(source_id) or "source"
     name = _slug(Path(original_name or "document").stem) or "document"
     return f"{source_slug}__{remote_hash}__{name}.{extension}"
+
+
+def _staged_path(path: Path) -> Path:
+    return path.with_name(
+        f".{path.name}.{uuid.uuid4().hex}.staged-ingestion"
+    )
 
 
 def _safe_extension(extension: str) -> str:

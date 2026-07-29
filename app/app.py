@@ -28,12 +28,16 @@ from werkzeug.utils import secure_filename
 
 from config import Config
 from utils.auth import (
+    api_key_has_scope,
     current_user,
     require_admin,
+    require_admin_or_api_any_scope,
     require_admin_or_api_scope,
     require_admin_or_upload_api_key,
     require_api_scope,
     require_login,
+    require_login_or_api_any_scope,
+    require_login_or_api_scope,
 )
 from utils.file_index import FileIndex
 from utils.http_security import (
@@ -67,6 +71,7 @@ from utils.rate_limiter import RateLimiter
 from utils.settings_store import (
     SettingsStore,
     normalize_custom_provider,
+    normalize_data_source,
     normalize_embedding_provider,
     normalize_ocr_provider,
     normalize_ocr_settings,
@@ -79,8 +84,14 @@ from utils.state_backend import (
     redis_connection,
     runtime_state_status,
 )
-from utils.job_store import get_job_store, queue_name
-from utils.workspace import workspace_from_request
+from utils.job_store import (
+    ensure_job_target_active,
+    ensure_knowledge_base_target_active,
+    get_job_store,
+    queue_name,
+)
+from utils.knowledge_base_store import KnowledgeBaseValidationError
+from utils.workspace import knowledge_base_from_request, workspace_from_request
 from utils.validators import (
     ValidationError,
     validate_boolean,
@@ -118,6 +129,7 @@ CHAT_DISPLAY_UPLOAD_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "txt", "md
 CHAT_UPLOAD_EXTENSIONS = CHAT_DATA_UPLOAD_EXTENSIONS | CHAT_DISPLAY_UPLOAD_EXTENSIONS
 CHAT_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CODE_IMAGE_PATTERN = re.compile(r"^[0-9a-f]{12}_[A-Za-z0-9._-]+\.png$")
+_KNOWLEDGE_BASE_UNSET = object()
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -136,6 +148,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["API_KEY_USAGE_FILE"] = os.getenv("RAG_API_KEY_USAGE_FILE", "app/data/api_keys_usage.json")
     app.config["WORKSPACE_DATA_DIR"] = os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
     app.config["WORKSPACE_UPLOAD_DIR"] = os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces")
+    app.config["MAX_KNOWLEDGE_BASES"] = int(os.getenv("RAG_MAX_KNOWLEDGE_BASES", "20"))
     app.config["SECRET_KEY"] = Config.api_keys.flask_secret_key or os.getenv("FLASK_SECRET_KEY") or "dev-secret"
     app.config["RAG_SECRET_KEY"] = os.getenv("RAG_SECRET_KEY") or app.config["SECRET_KEY"]
     app.config["MAX_UPLOAD_SIZE_MB"] = Config.paths.max_upload_size_mb
@@ -146,7 +159,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["CORS_ALLOWED_ORIGINS"] = _env_csv("RAG_CORS_ALLOWED_ORIGINS")
     app.config["CORS_ALLOWED_METHODS"] = _env_csv(
         "RAG_CORS_ALLOWED_METHODS",
-        default="GET,POST,DELETE,OPTIONS",
+        default="GET,POST,PATCH,DELETE,OPTIONS",
     )
     app.config["CORS_ALLOWED_HEADERS"] = _env_csv(
         "RAG_CORS_ALLOWED_HEADERS",
@@ -197,9 +210,29 @@ def create_app(test_config: dict | None = None) -> Flask:
     def _request_timeout_error(_error):
         return jsonify(error="Richiesta scaduta", status="timeout"), 503
 
+    from utils.knowledge_base_store import KnowledgeBaseCatalogError
+
+    @app.errorhandler(KnowledgeBaseValidationError)
+    def _knowledge_base_validation_error(error):
+        return jsonify(
+            error=error.message,
+            status=error.code,
+        ), error.status_code
+
+    @app.errorhandler(KnowledgeBaseCatalogError)
+    def _knowledge_base_catalog_error(error):
+        log.error("Knowledge base catalog error: %s", error)
+        return jsonify(
+            error="Catalogo knowledge base non valido",
+            status="knowledge_base_catalog_error",
+        ), 500
+
     # ── Start backup scheduler (background thread) ──
     from utils.vector_store.backup_manager import start_scheduler
-    start_scheduler()
+    start_scheduler(
+        workspace_data_dir=app.config["WORKSPACE_DATA_DIR"],
+        workspace_upload_dir=app.config["WORKSPACE_UPLOAD_DIR"],
+    )
 
     # --- Request metrics + API key usage middleware ---
     @app.before_request
@@ -218,12 +251,6 @@ def create_app(test_config: dict | None = None) -> Flask:
         csrf_error = _validate_csrf_request(app)
         if csrf_error is not None:
             return csrf_error
-        # Track API key info for usage logging
-        api_key_header = request.headers.get("X-API-Key")
-        if api_key_header:
-            from utils.auth import find_api_key
-            request._api_key_info = find_api_key(api_key_header)
-
     @app.after_request
     def _after_request_metrics(response):
         start = getattr(request, "_rag_metrics_start", time.time())
@@ -243,7 +270,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
 
         # Log per-user API key usage
-        api_key_info = getattr(request, "_api_key_info", None)
+        api_key_info = getattr(request, "api_key", None)
         if api_key_info is not None:
             user_id = api_key_info.get("user_id", "")
             key_name = api_key_info.get("_user_key_name") or api_key_info.get("name", "")
@@ -275,6 +302,11 @@ def create_app(test_config: dict | None = None) -> Flask:
                     request_id=getattr(request, "_rag_request_id", ""),
                     ip_address=ip_address,
                     workspace_id=api_key_info.get("workspace_id", ""),
+                    knowledge_base_id=getattr(
+                        request,
+                        "_rag_knowledge_base_id",
+                        "default",
+                    ),
                     api_key_id=api_key_info.get("api_key_id") or key_name,
                 )
             except Exception:
@@ -302,11 +334,13 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     from routes.auth import register_auth_routes
     from routes.backups import register_backup_routes
     from routes.prompts import register_prompt_routes
+    from routes.knowledge_bases import register_knowledge_base_routes
 
     register_admin_account_routes(app)
     register_auth_routes(app)
     register_backup_routes(app)
     register_prompt_routes(app)
+    register_knowledge_base_routes(app)
 
     @app.route("/")
     @require_login
@@ -376,9 +410,20 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     def conversation_clear(conversation_id):
         conversation_id = validate_conversation_id(conversation_id, required=True)
         from utils.conversation_memory import get_conversation_store
+        from utils.index_lock import lifecycle_read_lock
 
-        cleared = get_conversation_store().clear(_scoped_conversation_id(conversation_id))
-        return jsonify(conversation_id=conversation_id, cleared=cleared)
+        config = _workspace_config(app)
+        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+            _raise_if_knowledge_base_became_unavailable(config)
+            cleared = get_conversation_store().clear(
+                _scoped_conversation_id(conversation_id, config)
+            )
+        payload = {
+            "conversation_id": conversation_id,
+            "cleared": cleared,
+            "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+        }
+        return jsonify(payload)
 
     @app.route("/transcribe", methods=["POST"])
     @require_login
@@ -388,7 +433,10 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return limited
 
         try:
-            result = _transcribe_audio(app)
+            result = _transcribe_audio(
+                app,
+                config=_workspace_shared_config(app),
+            )
             return jsonify(result)
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
@@ -404,7 +452,13 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return limited
 
         try:
-            return jsonify(_ocr_extract_upload(app, persist=False))
+            return jsonify(
+                _ocr_extract_upload(
+                    app,
+                    persist=False,
+                    config=_workspace_shared_config(app),
+                )
+            )
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except Exception as e:
@@ -434,16 +488,23 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
                         run_rag_query_events(payload),
                         mimetype="application/x-ndjson",
                     )
-                return Response(
-                    run_rag_query(payload, stream=True),
+                stream = _prime_stream(
+                    run_rag_query(payload, stream=True)
+                )
+                response = Response(
+                    stream,
                     mimetype="text/plain",
                 )
+                response.headers["X-Knowledge-Base-Id"] = payload["knowledge_base_id"]
+                return response
 
             result = run_rag_query(payload, stream=False)
             return jsonify(result)
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except RequestTimeoutExceeded:
+            raise
+        except KnowledgeBaseValidationError:
             raise
         except Exception as e:
             log.error(f"Errore ask: {e}")
@@ -460,8 +521,13 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         store = SettingsStore(app.config["SETTINGS_FILE"])
         if request.method == "POST":
             try:
-                _handle_config_post(store)
-                _sync_admin_settings_to_workspaces(app, store.load())
+                _handle_config_post(
+                    store,
+                    after_save=lambda settings: _sync_admin_settings_to_workspaces(
+                        app,
+                        settings,
+                    ),
+                )
                 ProviderFactory.reset_cache()
                 from utils.providers.embedding_factory import EmbeddingFactory
 
@@ -525,7 +591,12 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             except Exception as e:
                 log.error(f"Errore upload admin: {e}")
                 flash(str(e), "error")
-            return redirect(url_for("admin_files"))
+            return redirect(
+                url_for(
+                    "admin_files",
+                    knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+                )
+            )
 
         file_index = FileIndex(config["FILE_INDEX"])
         files = file_index.list()
@@ -542,6 +613,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             files_pagination=files_pagination,
             health=_health_status(app, deep=False, config=config),
             index_status=_index_rebuild_status(app, config=config),
+            knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+            knowledge_bases=_active_knowledge_bases(app),
         )
 
     @app.route("/admin/data-sources", methods=["GET", "POST"])
@@ -553,39 +626,93 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         config = _workspace_config(app)
         store = SettingsStore(config["SETTINGS_FILE"])
         if request.method == "POST":
+            secret_changes: list[dict[str, str]] = []
             try:
-                source = _data_source_from_form(request.form)
-                settings = store.load()
-                existing = {
-                    item.get("id"): item
-                    for item in settings.get("data_sources", [])
-                    if item.get("id")
-                }
-                previous = existing.get(source["id"], {})
-                source = {
-                    **source,
-                    "cursor": previous.get("cursor", {}),
-                    "last_sync": previous.get("last_sync", ""),
-                    "last_sync_status": previous.get("last_sync_status", ""),
-                    "next_sync_at": previous.get("next_sync_at", ""),
-                    "last_error": previous.get("last_error", ""),
-                }
-                existing[source["id"]] = source
-                store.save({**settings, "data_sources": list(existing.values())})
+                from utils.index_lock import lifecycle_read_lock
+
+                def mutate_data_sources(settings):
+                    existing = {
+                        item.get("id"): item
+                        for item in settings.get("data_sources", [])
+                        if item.get("id")
+                    }
+                    prospective_id = normalize_data_source(
+                        {
+                            "id": request.form.get("id")
+                            or request.form.get("name"),
+                        }
+                    )["id"]
+                    previous = existing.get(prospective_id, {})
+                    if (
+                        previous
+                        and (previous.get("knowledge_base_id") or "default")
+                        != config["KNOWLEDGE_BASE_ID"]
+                    ):
+                        raise ValidationError(
+                            "Una data source non può essere spostata fra knowledge base",
+                            "id",
+                        )
+                    source = _data_source_from_form(
+                        request.form,
+                        previous=previous,
+                        config=config,
+                        secret_changes=secret_changes,
+                    )
+                    source = {
+                        **source,
+                        "cursor": previous.get("cursor", {}),
+                        "last_sync": previous.get("last_sync", ""),
+                        "last_sync_status": previous.get(
+                            "last_sync_status",
+                            "",
+                        ),
+                        "next_sync_at": previous.get("next_sync_at", ""),
+                        "last_error": previous.get("last_error", ""),
+                    }
+                    existing[source["id"]] = source
+                    settings["data_sources"] = list(existing.values())
+
+                with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+                    _raise_if_knowledge_base_became_unavailable(config)
+                    try:
+                        store.mutate(mutate_data_sources)
+                    except Exception:
+                        _cleanup_data_source_secret_changes(
+                            config,
+                            secret_changes,
+                            committed=False,
+                        )
+                        raise
+                    _cleanup_data_source_secret_changes(
+                        config,
+                        secret_changes,
+                        committed=True,
+                    )
                 flash("Data source salvata", "success")
             except ValidationError as e:
                 flash(e.message, "error")
             except Exception as e:
                 log.error("Errore salvataggio data source: %s", e)
                 flash(str(e), "error")
-            return redirect(url_for("admin_data_sources"))
+            return redirect(
+                url_for(
+                    "admin_data_sources",
+                    knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+                )
+            )
 
         settings = store.public_view()
         return render_template(
             "admin_data_sources.html",
-            data_sources=data_source_summaries(settings, config["FILE_INDEX"]),
+            data_sources=data_source_summaries(
+                settings,
+                config["FILE_INDEX"],
+                config["KNOWLEDGE_BASE_ID"],
+            ),
             plugins=available_plugins(),
             health=_health_status(app, deep=False, config=config),
+            knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+            knowledge_bases=_active_knowledge_bases(app),
         )
 
     @app.route("/admin/data-sources/<data_source_id>/sync", methods=["POST"])
@@ -609,10 +736,21 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
                 raise ValidationError("Body JSON non valido", "enabled")
             enabled = validate_boolean(payload.get("enabled"), "enabled")
             config = _workspace_config(app)
+            from utils.index_lock import lifecycle_read_lock
             from utils.settings_store import SettingsStore
             from utils.data_ingestion.service import toggle_data_source_enabled
-            toggle_data_source_enabled(SettingsStore(config["SETTINGS_FILE"]), data_source_id, enabled)
-            return jsonify(status="ok")
+            with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+                _raise_if_knowledge_base_became_unavailable(config)
+                toggle_data_source_enabled(
+                    SettingsStore(config["SETTINGS_FILE"]),
+                    data_source_id,
+                    enabled,
+                    config["KNOWLEDGE_BASE_ID"],
+                )
+            return jsonify(
+                status="ok",
+                knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+            )
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except Exception as e:
@@ -623,8 +761,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @require_login
     def admin_data_source_sync_status(job_id):
         job = _get_job(job_id)
-        config = _workspace_config(app)
-        if job and job.get("workspace_id") != config["WORKSPACE_ID"]:
+        workspace = workspace_from_request(app)
+        if job and job.get("workspace_id") != workspace.workspace_id:
             job = None
         if not job:
             return jsonify(error="Job non trovato", status="not_found"), 404
@@ -633,15 +771,25 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @app.route("/admin/files/delete", methods=["POST"])
     @require_login
     def admin_delete_file():
+        config = _workspace_config(app)
         try:
-            result = _delete_indexed_file(app, request.form.get("filename"), config=_workspace_config(app))
+            result = _delete_indexed_file(
+                app,
+                request.form.get("filename"),
+                config=config,
+            )
             flash(result["message"], "success")
         except ValidationError as e:
             flash(e.message, "error")
         except Exception as e:
             log.error(f"Errore eliminazione file admin: {e}")
             flash(str(e), "error")
-        return redirect(url_for("admin_files"))
+        return redirect(
+            url_for(
+                "admin_files",
+                knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+            )
+        )
 
     @app.route("/admin/files/rebuild", methods=["POST"])
     @require_login
@@ -657,8 +805,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @require_login
     def admin_rebuild_index_status(job_id):
         job = _get_rebuild_job(job_id)
-        config = _workspace_config(app)
-        if job and job.get("workspace_id") != config["WORKSPACE_ID"]:
+        workspace = workspace_from_request(app)
+        if job and job.get("workspace_id") != workspace.workspace_id:
             job = None
         if not job:
             return jsonify(error="Job non trovato", status="not_found"), 404
@@ -667,15 +815,26 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @app.route("/admin/files/download/<path:filename>", methods=["GET"])
     @require_login
     def admin_download_file(filename):
+        config = _workspace_config(app)
         try:
-            return _download_indexed_file(app, filename, config=_workspace_config(app))
+            return _download_indexed_file(app, filename, config=config)
         except ValidationError as e:
             flash(e.message, "error")
-            return redirect(url_for("admin_files"))
+            return redirect(
+                url_for(
+                    "admin_files",
+                    knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+                )
+            )
         except Exception as e:
             log.error(f"Errore download file: {e}")
             flash(str(e), "error")
-            return redirect(url_for("admin_files"))
+            return redirect(
+                url_for(
+                    "admin_files",
+                    knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+                )
+            )
 
     # ---------------------------------------------------------------
     # Code Interpreter Routes
@@ -692,32 +851,50 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             if not file:
                 return jsonify(error="Nessun file"), 400
             from utils.validators import validate_file
-            config = _workspace_config(app)
-            _cleanup_code_interpreter_files(config)
-            max_mb = int(os.getenv("CODE_INTERPRETER_MAX_FILE_MB", "50"))
-            validated = validate_file(
-                file=file, field_name="file",
-                allowed_extensions=sorted(CHAT_UPLOAD_EXTENSIONS),
-                max_size_mb=max_mb,
-            )
-            filename = secure_filename(validated.filename)
-            if not filename:
-                raise ValidationError("Nome file non valido", "file")
-            extension = filename.rsplit(".", 1)[1].lower()
-            if extension not in CHAT_UPLOAD_EXTENSIONS:
-                return jsonify(error="Formato file non supportato"), 400
-            file_id = uuid.uuid4().hex
-            scratch = _chat_upload_dir(config)
-            os.makedirs(scratch, exist_ok=True)
-            file_path = os.path.join(scratch, f"{file_id}_{filename}")
-            validated.save(file_path)
-            return jsonify({
-                "filename": filename,
-                "id": file_id,
-                "file_id": file_id,
-                "size": os.path.getsize(file_path),
-                "type": validated.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
-            })
+            config = _workspace_shared_config(app)
+            from utils.index_lock import lifecycle_read_lock
+
+            with lifecycle_read_lock(
+                scope=config["CHROMA_COLLECTION"],
+            ):
+                _raise_if_knowledge_base_became_unavailable(config)
+                _cleanup_code_interpreter_files(config)
+                max_mb = int(
+                    os.getenv("CODE_INTERPRETER_MAX_FILE_MB", "50")
+                )
+                validated = validate_file(
+                    file=file,
+                    field_name="file",
+                    allowed_extensions=sorted(CHAT_UPLOAD_EXTENSIONS),
+                    max_size_mb=max_mb,
+                )
+                filename = secure_filename(validated.filename)
+                if not filename:
+                    raise ValidationError("Nome file non valido", "file")
+                extension = filename.rsplit(".", 1)[1].lower()
+                if extension not in CHAT_UPLOAD_EXTENSIONS:
+                    return jsonify(
+                        error="Formato file non supportato"
+                    ), 400
+                file_id = uuid.uuid4().hex
+                scratch = _chat_upload_dir(config)
+                os.makedirs(scratch, exist_ok=True)
+                file_path = os.path.join(
+                    scratch,
+                    f"{file_id}_{filename}",
+                )
+                validated.save(file_path)
+                return jsonify({
+                    "filename": filename,
+                    "id": file_id,
+                    "file_id": file_id,
+                    "size": os.path.getsize(file_path),
+                    "type": (
+                        validated.content_type
+                        or mimetypes.guess_type(filename)[0]
+                        or "application/octet-stream"
+                    ),
+                })
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except Exception as e:
@@ -728,7 +905,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @require_login
     def serve_code_pic(filename):
         """Serve generated code result images."""
-        config = _workspace_config(app)
+        config = _workspace_shared_config(app)
         if not CODE_IMAGE_PATTERN.match(filename):
             return jsonify(error="Image not found"), 404
         pic_path = _safe_join(_chat_pics_dir(config), filename)
@@ -765,35 +942,79 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
                         run_rag_query_events(payload, public=True),
                         mimetype="application/x-ndjson",
                     )
-                return Response(
-                    run_rag_query(payload, stream=True, public=True),
+                stream = _prime_stream(
+                    run_rag_query(payload, stream=True, public=True)
+                )
+                response = Response(
+                    stream,
                     mimetype="text/plain",
                 )
+                response.headers["X-Knowledge-Base-Id"] = payload["knowledge_base_id"]
+                return response
             return jsonify(run_rag_query(payload, stream=False, public=True))
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except RequestTimeoutExceeded:
+            raise
+        except KnowledgeBaseValidationError:
             raise
         except Exception as e:
             log.error(f"Errore api query: {e}")
             return jsonify(error=str(e), status="server_error"), 500
 
     @app.route("/api/v1/files", methods=["POST"])
-    @require_admin_or_api_scope("ingest")
+    @require_login_or_api_scope("ingest")
     def api_files():
         return _upload_json_response(app)
 
     @app.route("/api/v1/audio", methods=["POST"])
-    @require_admin_or_api_scope("ingest")
+    @require_login_or_api_scope("ingest")
     def api_audio():
         return _audio_json_response(app)
 
     @app.route("/api/v1/jobs/<job_id>", methods=["GET"])
-    @require_admin_or_api_scope("ingest")
+    @require_login_or_api_any_scope("ingest", "kb_manage")
     def api_job_status(job_id):
         job = _get_job(job_id)
-        if job and getattr(request, "api_key", None) and job.get("workspace_id") != request.api_key.get("workspace_id"):
+        api_key = getattr(request, "api_key", None)
+        if (
+            job
+            and not api_key
+            and job.get("workspace_id")
+            != _workspace_shared_config(app).get("WORKSPACE_ID")
+        ):
             job = None
+        if job and api_key:
+            job_knowledge_base_id = job.get("knowledge_base_id") or "default"
+            delete_job = job.get("type") == "delete_knowledge_base"
+            wrong_workspace = (
+                job.get("workspace_id") != api_key.get("workspace_id")
+            )
+            missing_scope = not api_key_has_scope(
+                api_key,
+                "kb_manage" if delete_job else "ingest",
+            )
+            wrong_delete_requester = (
+                delete_job
+                and str(job.get("requester_api_key_id") or "")
+                != str(api_key.get("api_key_id") or "")
+            )
+            target_not_allowed = (
+                not delete_job
+                and job_knowledge_base_id
+                not in set(
+                    api_key.get("knowledge_base_ids")
+                    if "knowledge_base_ids" in api_key
+                    else ["default"]
+                )
+            )
+            if (
+                wrong_workspace
+                or missing_scope
+                or wrong_delete_requester
+                or target_not_allowed
+            ):
+                job = None
         if not job:
             return jsonify(error="Job non trovato", status="not_found"), 404
         return jsonify(job)
@@ -802,7 +1023,13 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @require_api_scope("query")
     def api_ocr():
         try:
-            return jsonify(_ocr_extract_upload(app, persist=False, config=_workspace_config(app)))
+            return jsonify(
+                _ocr_extract_upload(
+                    app,
+                    persist=False,
+                    config=_workspace_shared_config(app),
+                )
+            )
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except Exception as e:
@@ -813,7 +1040,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     @require_api_scope("speech")
     def api_tts():
         try:
-            return _tts_response(app)
+            return _tts_response(app, config=_workspace_shared_config(app))
         except ValidationError as e:
             return jsonify(e.to_dict()), 400
         except Exception as e:
@@ -825,24 +1052,37 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     def api_conversation_clear(conversation_id):
         conversation_id = validate_conversation_id(conversation_id, required=True)
         from utils.conversation_memory import get_conversation_store
+        from utils.index_lock import lifecycle_read_lock
 
-        cleared = get_conversation_store().clear(_scoped_conversation_id(conversation_id))
-        return jsonify(conversation_id=conversation_id, cleared=cleared)
+        config = _workspace_config(app)
+        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+            _raise_if_knowledge_base_became_unavailable(config)
+            cleared = get_conversation_store().clear(
+                _scoped_conversation_id(conversation_id, config)
+            )
+        return jsonify(
+            conversation_id=conversation_id,
+            cleared=cleared,
+            knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+        )
 
     @app.route("/api/v1/files/<path:filename>", methods=["DELETE"])
-    @require_admin_or_api_scope("ingest")
+    @require_login_or_api_scope("ingest")
     def api_delete_file(filename):
         try:
             return jsonify(_delete_indexed_file(app, filename, config=_workspace_config(app)))
         except ValidationError as e:
             status_code = 404 if e.code == "not_found" else 400
             return jsonify(e.to_dict()), status_code
+        except KnowledgeBaseValidationError:
+            raise
         except Exception as e:
             log.error(f"Errore eliminazione file API: {e}")
             return jsonify(error=str(e), status="server_error"), 500
 
 
 def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
+    from utils.index_lock import lifecycle_read_lock
     from utils.rag_engine import query_rag
     from utils.metrics import get_metrics
 
@@ -850,41 +1090,59 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
     metrics.begin_query()
     start = time.time()
     status = "success"
+    config = None
 
     try:
         _ensure_request_not_timed_out()
-        config = _workspace_config(current_app)
-        raw_conversation_id = payload.get("conversation_id")
-        conversation_id = _scoped_conversation_id(raw_conversation_id)
-        custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
-        extra_context_docs = _temporary_attachment_context_docs(payload, config)
-        _ensure_request_not_timed_out()
-        result = query_rag(
-            payload["query"],
-            model=payload.get("model"),
-            provider=payload.get("provider"),
-            stream=stream,
-            temperature=payload.get("temperature"),
-            k=payload.get("k"),
-            settings_path=config["SETTINGS_FILE"],
-            file_index_path=config["FILE_INDEX"],
-            collection_name=config["CHROMA_COLLECTION"],
-            conversation_id=conversation_id,
-            client_context=payload.get("client_context"),
-            response_language=payload.get("response_language"),
-            public=public,
-            custom_system_prompt=custom_system,
-            extra_context_docs=extra_context_docs,
+        config = _workspace_config(
+            current_app,
+            payload.get("knowledge_base_id"),
         )
-        _ensure_request_not_timed_out()
-        if isinstance(result, dict) and raw_conversation_id:
-            result["conversation_id"] = raw_conversation_id
-        return result
+        raw_conversation_id = payload.get("conversation_id")
+        conversation_id = _scoped_conversation_id(raw_conversation_id, config)
+        custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+            _raise_if_knowledge_base_became_unavailable(config)
+            _ensure_request_not_timed_out()
+            extra_context_docs = _temporary_attachment_context_docs(
+                payload,
+                config,
+            )
+            result = query_rag(
+                payload["query"],
+                model=payload.get("model"),
+                provider=payload.get("provider"),
+                stream=stream,
+                temperature=payload.get("temperature"),
+                k=payload.get("k"),
+                settings_path=config["SETTINGS_FILE"],
+                file_index_path=config["FILE_INDEX"],
+                collection_name=config["CHROMA_COLLECTION"],
+                conversation_id=conversation_id,
+                client_context=payload.get("client_context"),
+                response_language=payload.get("response_language"),
+                public=public,
+                custom_system_prompt=custom_system,
+                extra_context_docs=extra_context_docs,
+            )
+            _ensure_request_not_timed_out()
+            if isinstance(result, dict) and raw_conversation_id:
+                result["conversation_id"] = raw_conversation_id
+            if isinstance(result, dict):
+                result["knowledge_base_id"] = config["KNOWLEDGE_BASE_ID"]
+                _add_knowledge_base_to_download_urls(
+                    result.get("context"),
+                    config["KNOWLEDGE_BASE_ID"],
+                )
+            elif stream:
+                result = _guard_stream_for_knowledge_base(result, config)
+            return result
     except RequestTimeoutExceeded:
         status = "timeout"
         raise
     except Exception:
         status = "error"
+        _raise_if_knowledge_base_became_unavailable(config)
         raise
     finally:
         metrics.end_query()
@@ -893,6 +1151,7 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
 
 
 def run_rag_query_events(payload: dict, public: bool = False):
+    from utils.index_lock import lifecycle_read_lock
     from utils.rag_engine import query_rag_stream_events
     from utils.metrics import get_metrics
 
@@ -901,38 +1160,72 @@ def run_rag_query_events(payload: dict, public: bool = False):
     start = time.time()
     status = "success"
 
-    config = _workspace_config(current_app)
+    config = _workspace_config(
+        current_app,
+        payload.get("knowledge_base_id"),
+    )
     _ensure_request_not_timed_out()
     raw_conversation_id = payload.get("conversation_id")
-    conversation_id = _scoped_conversation_id(raw_conversation_id)
+    conversation_id = _scoped_conversation_id(raw_conversation_id, config)
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
-    extra_context_docs = _temporary_attachment_context_docs(payload, config)
-    _ensure_request_not_timed_out()
-    events = query_rag_stream_events(
-        payload["query"],
-        model=payload.get("model"),
-        provider=payload.get("provider"),
-        temperature=payload.get("temperature"),
-        k=payload.get("k"),
-        settings_path=config["SETTINGS_FILE"],
-        file_index_path=config["FILE_INDEX"],
-        collection_name=config["CHROMA_COLLECTION"],
-        conversation_id=conversation_id,
-        client_context=payload.get("client_context"),
-        response_language=payload.get("response_language"),
-        public=public,
-        custom_system_prompt=custom_system,
-        extra_context_docs=extra_context_docs,
-    )
 
     def encode_events():
         nonlocal status
         try:
-            for event in events:
+            with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+                _raise_if_knowledge_base_became_unavailable(config)
+                extra_context_docs = _temporary_attachment_context_docs(
+                    payload,
+                    config,
+                )
                 _ensure_request_not_timed_out()
-                if raw_conversation_id and isinstance(event, dict) and event.get("conversation_id"):
-                    event = {**event, "conversation_id": raw_conversation_id}
-                yield json.dumps(event, ensure_ascii=False) + "\n"
+                events = query_rag_stream_events(
+                    payload["query"],
+                    model=payload.get("model"),
+                    provider=payload.get("provider"),
+                    temperature=payload.get("temperature"),
+                    k=payload.get("k"),
+                    settings_path=config["SETTINGS_FILE"],
+                    file_index_path=config["FILE_INDEX"],
+                    collection_name=config["CHROMA_COLLECTION"],
+                    conversation_id=conversation_id,
+                    client_context=payload.get("client_context"),
+                    response_language=payload.get("response_language"),
+                    public=public,
+                    custom_system_prompt=custom_system,
+                    extra_context_docs=extra_context_docs,
+                )
+                for event in events:
+                    _ensure_request_not_timed_out()
+                    if isinstance(event, dict) and event.get("type") == "error":
+                        try:
+                            _raise_if_knowledge_base_became_unavailable(config)
+                        except KnowledgeBaseValidationError as exc:
+                            event = {
+                                "type": "error",
+                                "error": exc.message,
+                                "status": exc.code,
+                                "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                            }
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") in {"meta", "done"}
+                    ):
+                        event = {
+                            **event,
+                            "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                        }
+                        _add_knowledge_base_to_download_urls(
+                            event.get("context"),
+                            config["KNOWLEDGE_BASE_ID"],
+                        )
+                    if (
+                        raw_conversation_id
+                        and isinstance(event, dict)
+                        and event.get("conversation_id")
+                    ):
+                        event = {**event, "conversation_id": raw_conversation_id}
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
         except RequestTimeoutExceeded:
             status = "timeout"
             yield json.dumps(
@@ -941,6 +1234,19 @@ def run_rag_query_events(payload: dict, public: bool = False):
             ) + "\n"
         except Exception:
             status = "error"
+            try:
+                _raise_if_knowledge_base_became_unavailable(config)
+            except KnowledgeBaseValidationError as exc:
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "error": exc.message,
+                        "status": exc.code,
+                        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                return
             raise
         finally:
             metrics.end_query()
@@ -948,6 +1254,81 @@ def run_rag_query_events(payload: dict, public: bool = False):
             metrics.observe_query(duration=duration, status=status)
 
     return encode_events()
+
+
+def _guard_stream_for_knowledge_base(stream, config: dict):
+    def guarded():
+        from utils.index_lock import lifecycle_read_lock
+
+        try:
+            with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+                _raise_if_knowledge_base_became_unavailable(config)
+                yield from stream
+        except Exception:
+            _raise_if_knowledge_base_became_unavailable(config)
+            raise
+
+    return guarded()
+
+
+def _prime_stream(stream):
+    """Run retrieval before sending streaming response headers."""
+    iterator = iter(stream)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return iter(())
+
+    def combined():
+        yield first
+        yield from iterator
+
+    return combined()
+
+
+def _raise_if_knowledge_base_became_unavailable(config: dict | None) -> None:
+    if not config:
+        return
+    from utils.job_store import (
+        JobTargetUnavailableError,
+        ensure_knowledge_base_target_active,
+    )
+
+    try:
+        ensure_knowledge_base_target_active(config)
+    except JobTargetUnavailableError as exc:
+        raise KnowledgeBaseValidationError(
+            "Workspace non disponibile",
+            code="workspace_unavailable",
+            status_code=409,
+        ) from exc
+    except KnowledgeBaseValidationError:
+        if config.get("KNOWLEDGE_BASE_ID", "default") == "default":
+            raise
+        # Preserve the more specific deleting/delete_failed response below.
+        pass
+    if config.get("KNOWLEDGE_BASE_ID", "default") == "default":
+        return
+    from utils.knowledge_base_store import KnowledgeBaseStore
+
+    catalog_path = os.path.join(
+        os.path.dirname(config["SETTINGS_FILE"]),
+        "knowledge_bases.json",
+    )
+    record = KnowledgeBaseStore(catalog_path).get(config["KNOWLEDGE_BASE_ID"])
+    if record is not None and record.get("status") == "active":
+        return
+    if record is not None and record.get("status") == "delete_failed":
+        raise KnowledgeBaseValidationError(
+            "Knowledge base non disponibile",
+            code="knowledge_base_delete_failed",
+            status_code=409,
+        )
+    raise KnowledgeBaseValidationError(
+        "Knowledge base in eliminazione",
+        code="knowledge_base_deleting",
+        status_code=409,
+    )
 
 
 def _temporary_attachment_context_docs(payload: dict, config: dict) -> list:
@@ -968,8 +1349,25 @@ def _temporary_attachment_context_docs(payload: dict, config: dict) -> list:
     )
 
 
+def _add_knowledge_base_to_download_urls(
+    context_items,
+    knowledge_base_id: str,
+) -> None:
+    if not isinstance(context_items, list):
+        return
+    for item in context_items:
+        if not isinstance(item, dict) or not item.get("download_url"):
+            continue
+        separator = "&" if "?" in item["download_url"] else "?"
+        item["download_url"] = (
+            f"{item['download_url']}{separator}"
+            f"knowledge_base_id={knowledge_base_id}"
+        )
+
+
 def run_code_interpreter_query(payload: dict) -> dict:
     """Generate Python from query + RAG context, then execute it on attached files."""
+    from utils.index_lock import lifecycle_read_lock
     from utils.metrics import get_metrics
 
     metrics = get_metrics()
@@ -977,15 +1375,21 @@ def run_code_interpreter_query(payload: dict) -> dict:
     start = time.time()
     status = "success"
     try:
-        _ensure_request_not_timed_out()
-        prepared = _prepare_code_interpreter_run(payload)
-        _ensure_request_not_timed_out()
-        code = _generate_code_for_interpreter(prepared)
-        _ensure_request_not_timed_out()
-        result = _execute_interpreter_code(prepared, code)
-        _ensure_request_not_timed_out()
-        _append_code_interpreter_conversation_turn(payload, prepared, result)
-        return _code_interpreter_response(prepared, code, result)
+        config = _workspace_config(
+            current_app,
+            payload.get("knowledge_base_id"),
+        )
+        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+            _raise_if_knowledge_base_became_unavailable(config)
+            _ensure_request_not_timed_out()
+            prepared = _prepare_code_interpreter_run(payload, config=config)
+            _ensure_request_not_timed_out()
+            code = _generate_code_for_interpreter(prepared)
+            _ensure_request_not_timed_out()
+            result = _execute_interpreter_code(prepared, code)
+            _ensure_request_not_timed_out()
+            _append_code_interpreter_conversation_turn(payload, prepared, result)
+            return _code_interpreter_response(prepared, code, result)
     except RequestTimeoutExceeded:
         status = "timeout"
         raise
@@ -999,6 +1403,7 @@ def run_code_interpreter_query(payload: dict) -> dict:
 
 def run_code_interpreter_query_events(payload: dict):
     """NDJSON event stream for code interpreter mode."""
+    from utils.index_lock import lifecycle_read_lock
     from utils.metrics import get_metrics
 
     metrics = get_metrics()
@@ -1010,21 +1415,42 @@ def run_code_interpreter_query_events(payload: dict):
         return json.dumps(event, ensure_ascii=False) + "\n"
 
     try:
-        _ensure_request_not_timed_out()
-        prepared = _prepare_code_interpreter_run(payload)
-        yield encode(_code_interpreter_meta_event(prepared))
-        _ensure_request_not_timed_out()
-        code = _generate_code_for_interpreter(prepared)
-        yield encode({"type": "code", "code": code})
-        _ensure_request_not_timed_out()
-        result = _execute_interpreter_code(prepared, code)
-        yield encode({"type": "execution", "result": result})
-        _ensure_request_not_timed_out()
-        _append_code_interpreter_conversation_turn(payload, prepared, result)
-        yield encode({"type": "done", **_code_interpreter_response(prepared, code, result)})
+        config = _workspace_config(
+            current_app,
+            payload.get("knowledge_base_id"),
+        )
+        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+            _raise_if_knowledge_base_became_unavailable(config)
+            _ensure_request_not_timed_out()
+            prepared = _prepare_code_interpreter_run(payload, config=config)
+            yield encode(_code_interpreter_meta_event(prepared))
+            _ensure_request_not_timed_out()
+            code = _generate_code_for_interpreter(prepared)
+            yield encode({"type": "code", "code": code})
+            _ensure_request_not_timed_out()
+            result = _execute_interpreter_code(prepared, code)
+            yield encode({"type": "execution", "result": result})
+            _ensure_request_not_timed_out()
+            _append_code_interpreter_conversation_turn(payload, prepared, result)
+            yield encode(
+                {
+                    "type": "done",
+                    **_code_interpreter_response(prepared, code, result),
+                }
+            )
     except RequestTimeoutExceeded:
         status = "timeout"
         yield encode({"type": "error", "error": "Richiesta scaduta", "status": "timeout"})
+    except KnowledgeBaseValidationError as exc:
+        status = "error"
+        yield encode(
+            {
+                "type": "error",
+                "error": exc.message,
+                "status": exc.code,
+                "knowledge_base_id": payload.get("knowledge_base_id") or "default",
+            }
+        )
     except Exception as exc:
         status = "error"
         log.error("Errore code interpreter: %s", exc)
@@ -1040,7 +1466,10 @@ def _code_interpreter_enabled() -> bool:
 
 
 def _chat_base_dir(config: dict) -> str:
-    return os.path.join(config["UPLOAD_FOLDER"], "chat_files")
+    return os.path.join(
+        config.get("WORKSPACE_UPLOAD_FOLDER") or config["UPLOAD_FOLDER"],
+        "chat_files",
+    )
 
 
 def _chat_upload_dir(config: dict) -> str:
@@ -1146,11 +1575,18 @@ def _chat_file_preview(path: str, extension: str, max_chars: int = 4000) -> str:
         return ""
 
 
-def _prepare_code_interpreter_run(payload: dict) -> dict:
+def _prepare_code_interpreter_run(
+    payload: dict,
+    *,
+    config: dict | None = None,
+) -> dict:
     if not _code_interpreter_enabled():
         raise ValidationError("Code interpreter disabilitato", "use_code_interpreter", "disabled")
 
-    config = _workspace_config(current_app)
+    config = config or _workspace_config(
+        current_app,
+        payload.get("knowledge_base_id"),
+    )
     _cleanup_code_interpreter_files(config)
     attached_files = _resolve_chat_attachments(config, payload.get("attached_files") or [])
     if not attached_files:
@@ -1167,7 +1603,7 @@ def _prepare_code_interpreter_run(payload: dict) -> dict:
     from utils.settings_store import SettingsStore
 
     raw_conversation_id = payload.get("conversation_id")
-    conversation_id = _scoped_conversation_id(raw_conversation_id)
+    conversation_id = _scoped_conversation_id(raw_conversation_id, config)
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
     rag_error = ""
     try:
@@ -1184,6 +1620,7 @@ def _prepare_code_interpreter_run(payload: dict) -> dict:
             use_cache=False,
         )
     except Exception as exc:
+        _raise_if_knowledge_base_became_unavailable(config)
         log.warning("RAG context unavailable for code interpreter: %s", exc)
         rag_error = str(exc)
         settings = SettingsStore(config["SETTINGS_FILE"]).load()
@@ -1207,6 +1644,15 @@ def _prepare_code_interpreter_run(payload: dict) -> dict:
         }
 
     context_docs = rag_payload["context_docs"]
+    serialized_context = _serialize_context(
+        context_docs,
+        file_index_path=config["FILE_INDEX"],
+        include_downloads=True,
+    )
+    _add_knowledge_base_to_download_urls(
+        serialized_context,
+        config["KNOWLEDGE_BASE_ID"],
+    )
     system_prompt = build_code_system_prompt(
         user_query=payload["query"],
         data_files=attached_files,
@@ -1230,13 +1676,10 @@ def _prepare_code_interpreter_run(payload: dict) -> dict:
         "conversation_id": conversation_id,
         "raw_conversation_id": raw_conversation_id,
         "context_docs": context_docs,
-        "context": _serialize_context(
-            context_docs,
-            file_index_path=config["FILE_INDEX"],
-            include_downloads=True,
-        ),
+        "context": serialized_context,
         "sources": _serialize_sources(context_docs),
         "rag_error": rag_error,
+        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
     }
 
 
@@ -1284,7 +1727,14 @@ def _generate_code_for_interpreter(prepared: dict) -> str:
 def _execute_interpreter_code(prepared: dict, code: str) -> dict:
     from utils.code_interpreter import CodeInterpreter
 
-    interpreter = CodeInterpreter({"upload_folder": prepared["config"]["UPLOAD_FOLDER"]})
+    interpreter = CodeInterpreter(
+        {
+            "upload_folder": (
+                prepared["config"].get("WORKSPACE_UPLOAD_FOLDER")
+                or prepared["config"]["UPLOAD_FOLDER"]
+            )
+        }
+    )
     return interpreter.execute(code, prepared["attached_files"])
 
 
@@ -1335,6 +1785,7 @@ def _code_interpreter_meta_event(prepared: dict) -> dict:
         ],
         "context": prepared["context"],
         "sources": prepared["sources"],
+        "knowledge_base_id": prepared["knowledge_base_id"],
     }
     if prepared.get("raw_conversation_id"):
         event["conversation_id"] = prepared["raw_conversation_id"]
@@ -1362,6 +1813,7 @@ def _code_interpreter_response(prepared: dict, code: str, result: dict) -> dict:
         "context": prepared["context"],
         "sources": prepared["sources"],
         "usage": None,
+        "knowledge_base_id": prepared["knowledge_base_id"],
     }
     if prepared.get("raw_conversation_id"):
         response["conversation_id"] = prepared["raw_conversation_id"]
@@ -1382,8 +1834,62 @@ def _has_users(app: Flask) -> bool:
     return UserStore(app.config["USERS_FILE"]).has_users()
 
 
-def _workspace_config(app: Flask) -> dict:
-    return workspace_from_request(app).as_config()
+def _workspace_config(
+    app: Flask,
+    knowledge_base_id=_KNOWLEDGE_BASE_UNSET,
+    *,
+    allow_inactive: bool = False,
+) -> dict:
+    from utils.index_lock import lifecycle_read_lock
+
+    if knowledge_base_id is _KNOWLEDGE_BASE_UNSET:
+        knowledge_base_id = _knowledge_base_id_from_request()
+    with lifecycle_read_lock():
+        context = knowledge_base_from_request(
+            knowledge_base_id,
+            app=app,
+            allow_inactive=allow_inactive,
+            create_dirs=True,
+        )
+    request._rag_knowledge_base_id = context.knowledge_base_id
+    config = context.as_config()
+    config["USERS_FILE"] = app.config["USERS_FILE"]
+    return config
+
+
+def _workspace_shared_config(app: Flask) -> dict:
+    """Workspace settings and temporary storage without a KB authorization check."""
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock():
+        config = workspace_from_request(app).as_config()
+    config["USERS_FILE"] = app.config["USERS_FILE"]
+    return config
+
+
+def _active_knowledge_bases(app: Flask) -> list[dict]:
+    from utils.index_lock import lifecycle_read_lock
+    from utils.workspace import knowledge_base_store
+
+    with lifecycle_read_lock():
+        workspace = workspace_from_request(app)
+        return [
+            record
+            for record in knowledge_base_store(workspace, app=app).list()
+            if record.get("status") == "active"
+        ]
+
+
+def _knowledge_base_id_from_request() -> str | None:
+    if request.is_json:
+        data = request.get_json(silent=True)
+        if isinstance(data, dict) and "knowledge_base_id" in data:
+            return data.get("knowledge_base_id")
+    if "knowledge_base_id" in request.form:
+        return request.form.get("knowledge_base_id")
+    if "knowledge_base_id" in request.args:
+        return request.args.get("knowledge_base_id")
+    return None
 
 
 def _sync_admin_settings_to_workspaces(app: Flask, settings: dict) -> None:
@@ -1409,11 +1915,19 @@ def _sync_admin_settings_to_workspaces(app: Flask, settings: dict) -> None:
             log.warning("Unable to sync admin settings to workspace %s: %s", workspace_id, exc)
 
 
-def _scoped_conversation_id(conversation_id: str | None) -> str | None:
+def _scoped_conversation_id(
+    conversation_id: str | None,
+    config: dict | None = None,
+) -> str | None:
     if not conversation_id:
         return None
-    config = _workspace_config(current_app)
-    return f"{config['WORKSPACE_ID']}:{conversation_id}"
+    config = config or _workspace_config(current_app)
+    if config.get("KNOWLEDGE_BASE_ID", "default") == "default":
+        return f"{config['WORKSPACE_ID']}:{conversation_id}"
+    return (
+        f"{config['WORKSPACE_ID']}:kb:"
+        f"{config['KNOWLEDGE_BASE_ID']}:{conversation_id}"
+    )
 
 
 def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
@@ -1448,25 +1962,27 @@ def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
 
 
 def _process_upload(app: Flask, config: dict | None = None) -> dict:
-    from utils.index_lock import index_write_lock
+    from utils.index_lock import index_write_lock, lifecycle_read_lock
 
-    with index_write_lock():
-        return _process_upload_locked(app, config=config)
+    config = config or _workspace_config(app)
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        with index_write_lock():
+            return _process_upload_locked(app, config=config)
 
 
 def _process_upload_locked(app: Flask, config: dict | None = None) -> dict:
     config = config or _workspace_config(app)
-    upload = _save_document_upload(app, config=config)
-
-    def ocr_documents(file_path, parsed_documents=None, parse_error=""):
-        return _ocr_documents_for_config(
-            config,
-            file_path,
-            parsed_documents=parsed_documents,
-            parse_error=parse_error,
-        )
-
-    return _index_saved_document_upload(config, **upload, ocr_documents_func=ocr_documents)
+    ensure_knowledge_base_target_active(config)
+    upload = _save_document_upload(app, config=config, staged=True)
+    try:
+        result = _index_staged_upload(config, "file", upload)
+    finally:
+        _discard_staged_upload(app, upload, config=config)
+    return {
+        **result,
+        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+    }
 
 
 def _safe_relative_upload_path(raw_value: str | None, fallback_filename: str) -> str:
@@ -1496,6 +2012,14 @@ def _safe_relative_upload_path(raw_value: str | None, fallback_filename: str) ->
     if fallback_filename and parts[-1] != fallback_filename:
         raise ValidationError("Path relativo e nome file non corrispondono", "relative_path")
     return "/".join(parts)
+
+
+def _validate_relative_path_for_config(relative_path: str, config: dict) -> None:
+    if (
+        config.get("KNOWLEDGE_BASE_ID", "default") == "default"
+        and relative_path.split("/", 1)[0] == "__knowledge_bases__"
+    ):
+        raise ValidationError("Segmento path riservato", "relative_path")
 
 
 def _safe_file_index_key(raw_value: str | None) -> str:
@@ -1528,7 +2052,12 @@ def _upload_storage_path(config: dict, relative_path: str) -> str:
     return file_path
 
 
-def _save_document_upload(app: Flask, config: dict | None = None) -> dict:
+def _save_document_upload(
+    app: Flask,
+    config: dict | None = None,
+    *,
+    staged: bool = False,
+) -> dict:
     config = config or _workspace_config(app)
     file = validate_file(
         file=request.files.get("file"),
@@ -1542,16 +2071,39 @@ def _save_document_upload(app: Flask, config: dict | None = None) -> dict:
         raise ValidationError("Nome file non valido", "file")
     extension = filename.rsplit(".", 1)[1].lower()
     relative_path = _safe_relative_upload_path(request.form.get("relative_path"), filename)
+    _validate_relative_path_for_config(relative_path, config)
 
     os.makedirs(config["UPLOAD_FOLDER"], exist_ok=True)
     file_path = _upload_storage_path(config, relative_path)
-    file.save(file_path)
-    return {
+    staged_file_path = _save_upload_file(file, file_path, staged=staged)
+    upload = {
         "filename": relative_path,
         "file_path": file_path,
         "extension": extension,
         "relative_path": relative_path,
     }
+    if staged_file_path:
+        upload["staged_file_path"] = staged_file_path
+    return upload
+
+
+def _save_upload_file(file, file_path: str, *, staged: bool) -> str:
+    if not staged:
+        file.save(file_path)
+        return ""
+
+    parent = os.path.dirname(file_path)
+    staged_file_path = os.path.join(
+        parent,
+        f".{os.path.basename(file_path)}.{uuid.uuid4().hex}.pending-upload",
+    )
+    try:
+        file.save(staged_file_path)
+    except Exception:
+        if os.path.isfile(staged_file_path):
+            os.remove(staged_file_path)
+        raise
+    return staged_file_path
 
 
 def _index_saved_document_upload(
@@ -1607,8 +2159,25 @@ def _source_type_for_upload_extension(extension: str) -> str:
 
 
 def _ocr_extract_upload(app: Flask, persist: bool = False, config: dict | None = None) -> dict:
-    from utils.ocr_provider import OCR_EXTENSIONS
     config = config or _workspace_config(app)
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _ocr_extract_upload_under_lifecycle(
+            app,
+            persist=persist,
+            config=config,
+        )
+
+
+def _ocr_extract_upload_under_lifecycle(
+    app: Flask,
+    *,
+    persist: bool,
+    config: dict,
+) -> dict:
+    from utils.ocr_provider import OCR_EXTENSIONS
 
     file = validate_file(
         file=request.files.get("file"),
@@ -1769,13 +2338,22 @@ def _download_indexed_file(app: Flask, filename: str, config: dict | None = None
 
 
 def _delete_indexed_file(app: Flask, filename: str | None, config: dict | None = None) -> dict:
-    from utils.index_lock import index_write_lock
+    from utils.index_lock import index_write_lock, lifecycle_read_lock
 
-    with index_write_lock():
-        return _delete_indexed_file_locked(app, filename, config=config)
+    config = config or _workspace_config(app)
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        with index_write_lock():
+            return _delete_indexed_file_locked(
+                app,
+                filename,
+                config=config,
+            )
 
 
 def _delete_indexed_file_locked(app: Flask, filename: str | None, config: dict | None = None) -> dict:
+    from utils.index_lock import assert_distributed_locks_healthy
+
     config = config or _workspace_config(app)
     filename = _safe_file_index_key(filename)
     if not filename:
@@ -1789,14 +2367,16 @@ def _delete_indexed_file_locked(app: Flask, filename: str | None, config: dict |
     source = entry.get("path") or os.path.join(config["UPLOAD_FOLDER"], filename)
 
     from utils.chroma_manager import delete_documents_by_source
-    from utils.rag_engine import clear_cache
+    from utils.rag_engine import clear_cache_for_collection
 
+    assert_distributed_locks_healthy()
     chunks_deleted = delete_documents_by_source(source, collection_name=config.get("CHROMA_COLLECTION"))
+    assert_distributed_locks_healthy()
     file_index.remove(filename)
     uploaded_file_deleted = _delete_uploaded_file_if_safe(app, source, config=config)
     transcript_deleted = _delete_transcript_if_safe(app, entry.get("transcript_path", ""), config=config)
     ocr_text_deleted = _delete_transcript_if_safe(app, entry.get("ocr_text_path", ""), config=config)
-    clear_cache()
+    clear_cache_for_collection(config.get("CHROMA_COLLECTION") or "documents")
     return {
         "message": f"{filename} rimosso dalla knowledge base",
         "filename": filename,
@@ -1805,6 +2385,7 @@ def _delete_indexed_file_locked(app: Flask, filename: str | None, config: dict |
         "file_deleted": uploaded_file_deleted,
         "transcript_deleted": transcript_deleted,
         "ocr_text_deleted": ocr_text_deleted,
+        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
     }
 
 
@@ -1855,25 +2436,43 @@ def _upload_json_response(app: Flask):
         return jsonify(_process_upload(app, config=config))
     except ValidationError as e:
         return jsonify(e.to_dict()), 400
+    except KnowledgeBaseValidationError:
+        raise
     except Exception as e:
         log.error(f"Errore upload: {e}")
         return jsonify(error=str(e), status="server_error"), 500
 
 
 def _process_audio_upload(app: Flask, config: dict | None = None) -> dict:
-    from utils.index_lock import index_write_lock
+    from utils.index_lock import index_write_lock, lifecycle_read_lock
 
-    with index_write_lock():
-        return _process_audio_upload_locked(app, config=config)
+    config = config or _workspace_config(app)
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        with index_write_lock():
+            return _process_audio_upload_locked(app, config=config)
 
 
 def _process_audio_upload_locked(app: Flask, config: dict | None = None) -> dict:
     config = config or _workspace_config(app)
-    upload = _save_audio_upload(app, config=config)
-    return _index_saved_audio_upload(config, **upload)
+    ensure_knowledge_base_target_active(config)
+    upload = _save_audio_upload(app, config=config, staged=True)
+    try:
+        result = _index_staged_upload(config, "audio", upload)
+    finally:
+        _discard_staged_upload(app, upload, config=config)
+    return {
+        **result,
+        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+    }
 
 
-def _save_audio_upload(app: Flask, config: dict | None = None) -> dict:
+def _save_audio_upload(
+    app: Flask,
+    config: dict | None = None,
+    *,
+    staged: bool = False,
+) -> dict:
     from utils.audio_processor import AUDIO_EXTENSIONS
     config = config or _workspace_config(app)
 
@@ -1887,17 +2486,21 @@ def _save_audio_upload(app: Flask, config: dict | None = None) -> dict:
     if not filename:
         raise ValidationError("Nome file non valido", "file")
     relative_path = _safe_relative_upload_path(request.form.get("relative_path"), filename)
+    _validate_relative_path_for_config(relative_path, config)
+    language_override = _audio_language_override()
 
     os.makedirs(config["UPLOAD_FOLDER"], exist_ok=True)
     file_path = _upload_storage_path(config, relative_path)
-    file.save(file_path)
-    language_override = _audio_language_override()
-    return {
+    staged_file_path = _save_upload_file(file, file_path, staged=staged)
+    upload = {
         "filename": relative_path,
         "file_path": file_path,
         "language_override": language_override,
         "relative_path": relative_path,
     }
+    if staged_file_path:
+        upload["staged_file_path"] = staged_file_path
+    return upload
 
 
 def _index_saved_audio_upload(
@@ -1910,12 +2513,14 @@ def _index_saved_audio_upload(
     from utils.audio_processor import process_transcript
     from utils.chroma_manager import add_documents_to_chroma, delete_documents_by_source, find_document_by_id
     from utils.document_indexer import normalize_metadata_values
-    from utils.rag_engine import clear_cache
+    from utils.index_lock import assert_distributed_locks_healthy
+    from utils.rag_engine import clear_cache_for_collection
     from utils.voice_provider import get_voice_provider
 
     settings = SettingsStore(config["SETTINGS_FILE"]).load()
     language_hint = _audio_language_hint(settings, language_override)
     transcript = get_voice_provider(settings).transcribe(file_path, language=language_override)
+    assert_distributed_locks_healthy()
     transcript_path = f"{file_path}.transcript.txt"
     with open(transcript_path, "w", encoding="utf-8") as transcript_file:
         transcript_file.write(transcript)
@@ -1938,8 +2543,10 @@ def _index_saved_audio_upload(
         document.metadata = {**(document.metadata or {}), **document_extra}
 
     collection_name = config.get("CHROMA_COLLECTION")
+    assert_distributed_locks_healthy()
     replaced_chunks = delete_documents_by_source(file_path, collection_name=collection_name)
     if not documents:
+        assert_distributed_locks_healthy()
         FileIndex(config["FILE_INDEX"]).record(
             filename,
             file_path,
@@ -1952,7 +2559,7 @@ def _index_saved_audio_upload(
             ),
         )
         if replaced_chunks:
-            clear_cache()
+            clear_cache_for_collection(collection_name or "documents")
         raise ValidationError("Audio transcript is empty", "file")
 
     document_id = str(documents[0].metadata.get("document_id") or "")
@@ -1960,6 +2567,7 @@ def _index_saved_audio_upload(
     duplicate = find_document_by_id(document_id, exclude_source=file_path, collection_name=collection_name) if document_id else None
     if duplicate:
         duplicate_source = duplicate.get("source") or ""
+        assert_distributed_locks_healthy()
         FileIndex(config["FILE_INDEX"]).record(
             filename,
             file_path,
@@ -1978,7 +2586,7 @@ def _index_saved_audio_upload(
             ),
         )
         if replaced_chunks:
-            clear_cache()
+            clear_cache_for_collection(collection_name or "documents")
         return {
             "message": f"{filename} already present in the knowledge base; not reindexed",
             "filename": filename,
@@ -1992,8 +2600,10 @@ def _index_saved_audio_upload(
             "relative_path": relative_path,
         }
 
+    assert_distributed_locks_healthy()
     add_documents_to_chroma(documents, collection_name=collection_name)
-    clear_cache()
+    clear_cache_for_collection(collection_name or "documents")
+    assert_distributed_locks_healthy()
     FileIndex(config["FILE_INDEX"]).record(
         filename,
         file_path,
@@ -2040,6 +2650,8 @@ def _audio_json_response(app: Flask):
         return jsonify(_process_audio_upload(app, config=config))
     except ValidationError as e:
         return jsonify(e.to_dict()), 400
+    except KnowledgeBaseValidationError:
+        raise
     except Exception as e:
         log.error(f"Errore upload audio: {e}")
         return jsonify(error=str(e), status="server_error"), 500
@@ -2051,11 +2663,27 @@ def _async_upload_requested() -> bool:
 
 def _start_upload_job(app: Flask, upload_type: str, config: dict | None = None) -> tuple[dict, int]:
     config = config or _workspace_config(app)
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _start_upload_job_admitted(
+            app,
+            upload_type,
+            config,
+        )
+
+
+def _start_upload_job_admitted(
+    app: Flask,
+    upload_type: str,
+    config: dict,
+) -> tuple[dict, int]:
     if upload_type == "file":
-        upload = _save_document_upload(app, config=config)
+        upload = _save_document_upload(app, config=config, staged=True)
         message = f"{upload['filename']} upload in elaborazione"
     elif upload_type == "audio":
-        upload = _save_audio_upload(app, config=config)
+        upload = _save_audio_upload(app, config=config, staged=True)
         message = f"{upload['filename']} audio upload in elaborazione"
     else:
         raise ValidationError("Tipo job non valido", "type")
@@ -2073,28 +2701,40 @@ def _start_upload_job(app: Flask, upload_type: str, config: dict | None = None) 
         "filename": upload["filename"],
         "user_id": config.get("USER_ID"),
         "workspace_id": config.get("WORKSPACE_ID"),
+        "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
         "errors": [],
         "result": None,
         "started_at": time.time(),
         "finished_at": None,
     }
-    payload, status_code = get_job_store().create_job(job)
+    try:
+        payload, status_code = get_job_store().create_job(job)
+    except Exception:
+        _discard_staged_upload(app, upload, config=config)
+        raise
     if status_code >= 400:
+        _discard_staged_upload(app, upload, config=config)
         return payload, status_code
 
     if queued:
         try:
             _enqueue_upload_job(job_id, config, upload_type, upload)
         except Exception as exc:
+            _discard_staged_upload(app, upload, config=config)
             _finish_job(job_id, "failed", f"Errore accodamento upload: {exc}")
             raise
     else:
-        thread = threading.Thread(
-            target=_run_upload_job,
-            args=(job_id, config, upload_type, upload),
-            daemon=True,
-        )
-        thread.start()
+        try:
+            thread = threading.Thread(
+                target=_run_upload_job,
+                args=(job_id, config, upload_type, upload),
+                daemon=True,
+            )
+            thread.start()
+        except Exception as exc:
+            _discard_staged_upload(app, upload, config=config)
+            _finish_job(job_id, "failed", f"Errore avvio upload: {exc}")
+            raise
     return {"job_id": job_id, **(get_job_store().get(job_id) or payload)}, 202
 
 
@@ -2119,20 +2759,23 @@ def _enqueue_upload_job(job_id: str, config: dict, upload_type: str, upload: dic
 
 
 def _run_upload_job(job_id: str, config: dict, upload_type: str, upload: dict) -> None:
-    _update_job(
-        job_id,
-        status="running",
-        message=f"Elaborazione upload {upload.get('filename', '')}".strip(),
-        current_file=upload.get("filename", ""),
-    )
     try:
-        if upload_type == "file":
-            result = _index_saved_document_upload(config, **upload)
-        elif upload_type == "audio":
-            result = _index_saved_audio_upload(config, **upload)
-        else:
-            raise ValidationError("Tipo job non valido", "type")
+        from utils.index_lock import index_write_lock
 
+        with index_write_lock():
+            ensure_job_target_active(job_id, config)
+            _update_job(
+                job_id,
+                status="running",
+                message=f"Elaborazione upload {upload.get('filename', '')}".strip(),
+                current_file=upload.get("filename", ""),
+            )
+            result = _index_staged_upload(config, upload_type, upload)
+
+        result = {
+            **result,
+            "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
+        }
         _update_job(job_id, processed=1, result=result)
         _finish_job(job_id, "completed", result.get("message", "Upload completato"))
     except ValidationError as exc:
@@ -2144,6 +2787,239 @@ def _run_upload_job(job_id: str, config: dict, upload_type: str, upload: dict) -
         _append_job_error(job_id, upload.get("filename", ""), str(exc))
         _update_job(job_id, result={"error": str(exc), "status": "server_error"})
         _finish_job(job_id, "failed", str(exc))
+    finally:
+        _discard_staged_upload(None, upload, config=config)
+
+
+def _index_staged_upload(config: dict, upload_type: str, upload: dict) -> dict:
+    from utils.index_lock import assert_distributed_locks_healthy
+
+    assert_distributed_locks_healthy()
+    index_upload, rollback_state = _commit_staged_upload(
+        upload,
+        config=config,
+        include_transcript=upload_type == "audio",
+    )
+    try:
+        assert_distributed_locks_healthy()
+        if upload_type == "file":
+            result = _index_saved_document_upload(config, **index_upload)
+        elif upload_type == "audio":
+            result = _index_saved_audio_upload(config, **index_upload)
+        else:
+            raise ValidationError("Tipo job non valido", "type")
+        assert_distributed_locks_healthy()
+    except Exception as exc:
+        if rollback_state is not None:
+            try:
+                _rollback_committed_upload(rollback_state, config=config)
+            except Exception as rollback_exc:
+                log.exception(
+                    "Rollback upload fallito per %s: %s",
+                    upload.get("filename", ""),
+                    rollback_exc,
+                )
+                raise RuntimeError(
+                    f"{exc}; rollback upload fallito: {rollback_exc}"
+                ) from exc
+        raise
+    else:
+        if rollback_state is not None:
+            _finalize_committed_upload(rollback_state)
+        return result
+
+
+def _commit_staged_upload(
+    upload: dict,
+    *,
+    config: dict,
+    include_transcript: bool = False,
+) -> tuple[dict, dict | None]:
+    from utils.chroma_manager import snapshot_documents_by_source
+
+    index_upload = dict(upload)
+    staged_file_path = str(index_upload.pop("staged_file_path", "") or "")
+    if not staged_file_path:
+        return index_upload, None
+
+    upload_root = os.path.abspath(config["UPLOAD_FOLDER"])
+    final_path = os.path.abspath(str(index_upload["file_path"]))
+    staged_path = os.path.abspath(staged_file_path)
+    if (
+        not final_path.startswith(upload_root + os.sep)
+        or not staged_path.startswith(upload_root + os.sep)
+        or os.path.dirname(final_path) != os.path.dirname(staged_path)
+    ):
+        raise ValidationError("Path staging upload non valido", "file")
+    if not os.path.isfile(staged_path):
+        raise ValidationError("File staging upload non trovato", "file")
+
+    filename = str(index_upload.get("filename") or "")
+    file_index_entry = FileIndex(config["FILE_INDEX"]).get(filename)
+    had_existing_file = os.path.isfile(final_path)
+    transcript_path = f"{final_path}.transcript.txt" if include_transcript else ""
+    had_existing_transcript = bool(
+        transcript_path and os.path.isfile(transcript_path)
+    )
+    has_previous_state = bool(
+        had_existing_file or had_existing_transcript or file_index_entry
+    )
+    vector_snapshot = (
+        snapshot_documents_by_source(
+            final_path,
+            collection_name=config.get("CHROMA_COLLECTION"),
+        )
+        if has_previous_state
+        else None
+    )
+    backup_file_path = (
+        _upload_rollback_path(final_path)
+        if had_existing_file
+        else ""
+    )
+    backup_transcript_path = (
+        _upload_rollback_path(transcript_path)
+        if had_existing_transcript
+        else ""
+    )
+    rollback_state = {
+        "filename": filename,
+        "final_path": final_path,
+        "backup_file_path": backup_file_path,
+        "had_existing_file": had_existing_file,
+        "transcript_path": transcript_path,
+        "backup_transcript_path": backup_transcript_path,
+        "had_existing_transcript": had_existing_transcript,
+        "file_index_entry": deepcopy(file_index_entry),
+        "vector_snapshot": vector_snapshot,
+        "file_backup_created": False,
+        "transcript_backup_created": False,
+        "replacement_committed": False,
+    }
+
+    try:
+        if backup_file_path:
+            os.replace(final_path, backup_file_path)
+            rollback_state["file_backup_created"] = True
+        if backup_transcript_path:
+            os.replace(transcript_path, backup_transcript_path)
+            rollback_state["transcript_backup_created"] = True
+        os.replace(staged_path, final_path)
+        rollback_state["replacement_committed"] = True
+    except Exception:
+        _restore_upload_files(rollback_state)
+        raise
+    return index_upload, rollback_state
+
+
+def _upload_rollback_path(file_path: str) -> str:
+    return os.path.join(
+        os.path.dirname(file_path),
+        f".{os.path.basename(file_path)}.{uuid.uuid4().hex}.rollback-upload",
+    )
+
+
+def _rollback_committed_upload(rollback_state: dict, *, config: dict) -> None:
+    from utils.chroma_manager import (
+        delete_documents_by_source,
+        restore_documents_by_source,
+    )
+    from utils.rag_engine import clear_cache_for_collection
+
+    errors = []
+    try:
+        _restore_upload_files(rollback_state)
+    except Exception as exc:
+        errors.append(f"file: {exc}")
+
+    final_path = rollback_state["final_path"]
+    collection_name = config.get("CHROMA_COLLECTION")
+    try:
+        vector_snapshot = rollback_state.get("vector_snapshot")
+        if vector_snapshot is None:
+            delete_documents_by_source(
+                final_path,
+                collection_name=collection_name,
+            )
+        else:
+            restore_documents_by_source(
+                final_path,
+                vector_snapshot,
+                collection_name=collection_name,
+            )
+        clear_cache_for_collection(collection_name or "documents")
+    except Exception as exc:
+        errors.append(f"vettori: {exc}")
+
+    try:
+        FileIndex(config["FILE_INDEX"]).restore_entry(
+            rollback_state["filename"],
+            rollback_state.get("file_index_entry"),
+        )
+    except Exception as exc:
+        errors.append(f"file index: {exc}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+def _restore_upload_files(rollback_state: dict) -> None:
+    final_path = rollback_state["final_path"]
+    backup_file_path = rollback_state.get("backup_file_path") or ""
+    if rollback_state.get("replacement_committed") and os.path.isfile(final_path):
+        os.remove(final_path)
+    if rollback_state.get("file_backup_created"):
+        if not os.path.isfile(backup_file_path):
+            raise FileNotFoundError(
+                f"Backup rollback upload non trovato: {backup_file_path}"
+            )
+        os.replace(backup_file_path, final_path)
+
+    transcript_path = rollback_state.get("transcript_path") or ""
+    backup_transcript_path = rollback_state.get("backup_transcript_path") or ""
+    if (
+        transcript_path
+        and rollback_state.get("replacement_committed")
+        and os.path.isfile(transcript_path)
+    ):
+        os.remove(transcript_path)
+    if rollback_state.get("transcript_backup_created"):
+        if not os.path.isfile(backup_transcript_path):
+            raise FileNotFoundError(
+                f"Backup rollback trascrizione non trovato: {backup_transcript_path}"
+            )
+        os.replace(backup_transcript_path, transcript_path)
+
+
+def _finalize_committed_upload(rollback_state: dict) -> None:
+    for key in ("backup_file_path", "backup_transcript_path"):
+        backup_path = rollback_state.get(key) or ""
+        if not backup_path or not os.path.isfile(backup_path):
+            continue
+        try:
+            os.remove(backup_path)
+        except OSError as exc:
+            log.warning(
+                "Impossibile rimuovere backup temporaneo upload %s: %s",
+                backup_path,
+                exc,
+            )
+
+
+def _discard_staged_upload(
+    app: Flask | None,
+    upload: dict,
+    *,
+    config: dict,
+) -> bool:
+    staged_file_path = str(upload.get("staged_file_path") or "")
+    if not staged_file_path:
+        return False
+    return _delete_uploaded_file_if_safe(
+        app,
+        staged_file_path,
+        config=config,
+    )
 
 
 def _get_job(job_id: str) -> dict | None:
@@ -2162,13 +3038,19 @@ def _finish_job(job_id: str, status: str, message: str) -> None:
     get_job_store().finish(job_id, status, message)
 
 
-def _data_source_from_form(form) -> dict:
+def _data_source_from_form(
+    form,
+    *,
+    previous: dict | None = None,
+    config: dict | None = None,
+    secret_changes: list[dict[str, str]] | None = None,
+) -> dict:
     from utils.data_ingestion.registry import get_ingester
     from utils.secret_store import SecretStore
     from utils.settings_store import normalize_data_source
 
     plugin = form.get("plugin") or "email_imap"
-    config = _workspace_config(current_app)
+    config = config or _workspace_config(current_app)
     secret_store = SecretStore(config["SECRETS_FILE"], key=config["SECRET_KEY"])
     if plugin == "microsoft_drive":
         raw_source = {
@@ -2236,20 +3118,89 @@ def _data_source_from_form(form) -> dict:
         }
         secret_name = "password"
         secret_value = form.get("password", "")
+    raw_source["knowledge_base_id"] = config["KNOWLEDGE_BASE_ID"]
     source = normalize_data_source(raw_source)
     if not source.get("id"):
         raise ValidationError("id data source obbligatorio", "id")
     validation_config = {**source["config"], **source["secrets_env"]}
+    previous_secret_refs = {
+        name: str(descriptor.get("ref") or "")
+        for name, descriptor in (previous or {}).get("secrets", {}).items()
+        if isinstance(descriptor, dict) and descriptor.get("ref")
+    }
+    plugin_changed = bool(
+        previous and previous.get("plugin") != plugin
+    )
+    if previous and not plugin_changed:
+        source["secrets"] = deepcopy(previous.get("secrets") or {})
+        for previous_name, descriptor in source["secrets"].items():
+            if isinstance(descriptor, dict) and descriptor.get("ref"):
+                validation_config[previous_name] = secret_store.get_secret(
+                    descriptor["ref"]
+                )
     if secret_value:
-        ref = secret_store.set_secret(
-            config["WORKSPACE_ID"],
+        validation_config[secret_name] = secret_value
+    get_ingester(source["plugin"]).validate_config(validation_config)
+    if secret_value:
+        secret_owner = config["WORKSPACE_ID"]
+        if config["KNOWLEDGE_BASE_ID"] != "default":
+            secret_owner = (
+                f"{config['WORKSPACE_ID']}:{config['KNOWLEDGE_BASE_ID']}"
+            )
+        ref = secret_store.create_secret(
+            secret_owner,
             f"{source['id']}:{secret_name}",
             secret_value,
         )
-        source["secrets"] = {secret_name: {"mode": "user_secret", "ref": ref}}
-        validation_config[secret_name] = secret_value
-    get_ingester(source["plugin"]).validate_config(validation_config)
+        if secret_changes is not None:
+            secret_changes.append(
+                {
+                    "new_ref": ref,
+                    "old_ref": (
+                        ""
+                        if plugin_changed
+                        else previous_secret_refs.get(secret_name, "")
+                    ),
+                }
+            )
+        source.setdefault("secrets", {})[secret_name] = {
+            "mode": "user_secret",
+            "ref": ref,
+        }
+    if plugin_changed:
+        for old_ref in previous_secret_refs.values():
+            if secret_changes is not None:
+                secret_changes.append(
+                    {"new_ref": "", "old_ref": old_ref}
+                )
     return source
+
+
+def _cleanup_data_source_secret_changes(
+    config: dict,
+    changes: list[dict[str, str]],
+    *,
+    committed: bool,
+) -> None:
+    from utils.secret_store import SecretStore
+
+    field = "old_ref" if committed else "new_ref"
+    secret_store = SecretStore(
+        config["SECRETS_FILE"],
+        key=config["SECRET_KEY"],
+    )
+    for change in changes:
+        ref = str(change.get(field) or "")
+        if not ref:
+            continue
+        try:
+            secret_store.delete_secret(ref)
+        except Exception as exc:
+            log.warning(
+                "Impossibile ripulire il secret data source %s: %s",
+                ref,
+                exc,
+            )
 
 
 def _data_source_sync_fields_from_form(form) -> dict:
@@ -2299,8 +3250,20 @@ def _parse_tts_payload() -> dict:
 
 
 def _tts_response(app: Flask, config: dict | None = None) -> Response:
-    from utils.voice_provider import content_type_for_format, get_voice_provider
     config = config or _workspace_config(app)
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _tts_response_under_lifecycle(app, config=config)
+
+
+def _tts_response_under_lifecycle(
+    app: Flask,
+    *,
+    config: dict,
+) -> Response:
+    from utils.voice_provider import content_type_for_format, get_voice_provider
 
     payload = _parse_tts_payload()
     settings = SettingsStore(config["SETTINGS_FILE"]).load()
@@ -2311,9 +3274,21 @@ def _tts_response(app: Flask, config: dict | None = None) -> Response:
 
 
 def _transcribe_audio(app: Flask, config: dict | None = None) -> dict:
+    config = config or _workspace_config(app)
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _transcribe_audio_under_lifecycle(app, config=config)
+
+
+def _transcribe_audio_under_lifecycle(
+    app: Flask,
+    *,
+    config: dict,
+) -> dict:
     from utils.audio_processor import AUDIO_EXTENSIONS
     from utils.voice_provider import get_voice_provider
-    config = config or _workspace_config(app)
 
     file = validate_file(
         file=request.files.get("file"),
@@ -2359,6 +3334,20 @@ def _transcribe_audio(app: Flask, config: dict | None = None) -> dict:
 
 def _start_rebuild_index_job(app: Flask, config: dict | None = None) -> tuple[dict, int]:
     config = config or _workspace_config(app)
+    from utils.index_lock import lifecycle_read_lock
+
+    with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _start_rebuild_index_job_admitted(
+            app,
+            config,
+        )
+
+
+def _start_rebuild_index_job_admitted(
+    app: Flask,
+    config: dict,
+) -> tuple[dict, int]:
     job_id = uuid.uuid4().hex
     entries = FileIndex(config["FILE_INDEX"]).list()
     profile = _current_index_profile_for_config(config)
@@ -2375,6 +3364,7 @@ def _start_rebuild_index_job(app: Flask, config: dict | None = None) -> tuple[di
         "profile": profile,
         "user_id": config.get("USER_ID"),
         "workspace_id": config.get("WORKSPACE_ID"),
+        "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
         "started_at": time.time(),
         "finished_at": None,
     }
@@ -2454,8 +3444,23 @@ def _run_rebuild_index_job(
 ) -> None:
     from utils.index_lock import index_write_lock
 
-    with index_write_lock():
-        return _run_rebuild_index_job_locked(job_id, config, profile, entries, ocr_profile)
+    try:
+        with index_write_lock():
+            return _run_rebuild_index_job_locked(
+                job_id,
+                config,
+                profile,
+                entries,
+                ocr_profile,
+            )
+    except Exception as exc:
+        log.error("Impossibile acquisire il lock per il rebuild %s: %s", job_id, exc)
+        _append_rebuild_error(job_id, "", str(exc))
+        _finish_rebuild_job(
+            job_id,
+            "failed",
+            f"Ricostruzione non avviata: {exc}",
+        )
 
 
 def _run_rebuild_index_job_locked(
@@ -2465,25 +3470,33 @@ def _run_rebuild_index_job_locked(
     entries: list[dict],
     ocr_profile: dict | None = None,
 ) -> None:
-    file_index = FileIndex(config["FILE_INDEX"])
-    seen_document_ids: dict[str, str] = {}
-    if ocr_profile is None:
-        settings = SettingsStore(config["SETTINGS_FILE"]).load()
-        ocr_profile = _index_profile_from_settings(settings, include_ocr=True)
+    from utils.index_lock import (
+        DistributedLockLeaseLostError,
+        assert_distributed_locks_healthy,
+    )
 
     try:
+        assert_distributed_locks_healthy()
+        ensure_job_target_active(job_id, config)
         _update_rebuild_job(job_id, status="running", message="Ricostruzione indice avviata")
+        file_index = FileIndex(config["FILE_INDEX"])
+        seen_document_ids: dict[str, str] = {}
+        if ocr_profile is None:
+            settings = SettingsStore(config["SETTINGS_FILE"]).load()
+            ocr_profile = _index_profile_from_settings(settings, include_ocr=True)
         from utils.chroma_manager import add_documents_to_chroma, reset_chroma_collection
         from utils.document_indexer import apply_extra_metadata_to_documents, ingestion_metadata_from_entry
         from utils.providers.embedding_factory import EmbeddingFactory
-        from utils.rag_engine import clear_cache
+        from utils.rag_engine import clear_cache_for_collection
 
         EmbeddingFactory.reset_cache()
         collection_name = config.get("CHROMA_COLLECTION")
+        assert_distributed_locks_healthy()
         reset_chroma_collection(collection_name=collection_name)
-        clear_cache()
+        clear_cache_for_collection(collection_name or "documents")
 
         for index, entry in enumerate(entries):
+            assert_distributed_locks_healthy()
             filename = _entry_filename(entry)
             _update_rebuild_job(
                 job_id,
@@ -2494,6 +3507,7 @@ def _run_rebuild_index_job_locked(
 
             try:
                 file_path, documents, source_type, rebuild_extra = _documents_for_rebuild(config, entry)
+                assert_distributed_locks_healthy()
                 ingestion_extra = ingestion_metadata_from_entry(entry)
                 if ingestion_extra:
                     apply_extra_metadata_to_documents(documents, ingestion_extra)
@@ -2542,6 +3556,7 @@ def _run_rebuild_index_job_locked(
                     )
                     continue
 
+                assert_distributed_locks_healthy()
                 add_documents_to_chroma(documents, collection_name=collection_name)
                 if document_id:
                     seen_document_ids[document_id] = file_path
@@ -2561,6 +3576,8 @@ def _run_rebuild_index_job_locked(
                         },
                     ),
                 )
+            except DistributedLockLeaseLostError:
+                raise
             except Exception as e:
                 message = str(e)
                 source = str(entry.get("path") or os.path.join(config["UPLOAD_FOLDER"], filename))
@@ -2577,7 +3594,8 @@ def _run_rebuild_index_job_locked(
             finally:
                 _update_rebuild_job(job_id, processed=index + 1)
 
-        clear_cache()
+        assert_distributed_locks_healthy()
+        clear_cache_for_collection(collection_name or "documents")
         final_job = _get_rebuild_job(job_id) or {}
         errors = final_job.get("errors", [])
         if errors:
@@ -2819,7 +3837,11 @@ def _parse_query_payload(require_json: bool = True) -> dict:
                 required=True,
             )
             validate_string(f.get("name"), f"attached_files[{i}].name", required=False)
-    _validate_model_selection(model, provider, config=_workspace_config(current_app))
+    config = _workspace_config(
+        current_app,
+        data.get("knowledge_base_id"),
+    )
+    _validate_model_selection(model, provider, config=config)
 
     return {
         "query": query,
@@ -2835,6 +3857,7 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "system_prompt_id": system_prompt_id,
         "use_code_interpreter": use_code_interpreter,
         "attached_files": attached_files,
+        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
     }
 
 
@@ -2947,7 +3970,16 @@ def _validate_model_selection(model: str | None, provider: str | None, config: d
         raise ValidationError("Modello non valido", "model")
 
 
-def _handle_config_post(store: SettingsStore) -> None:
+def _handle_config_post(store: SettingsStore, *, after_save=None) -> dict:
+    with store.transaction():
+        _handle_config_post_locked(store)
+        settings = store.load()
+        if after_save is not None:
+            after_save(settings)
+        return settings
+
+
+def _handle_config_post_locked(store: SettingsStore) -> None:
     settings = store.load()
     action = request.form.get("action")
 
@@ -3548,18 +4580,8 @@ def _model_configuration_error_response(error: str) -> dict:
     }
 
 
-def _health_status(app: Flask, deep: bool = True, config: dict | None = None) -> dict:
-    if config is None:
-        try:
-            config = _workspace_config(app)
-        except Exception:
-            config = {
-                "SETTINGS_FILE": app.config["SETTINGS_FILE"],
-                "FILE_INDEX": app.config["FILE_INDEX"],
-                "UPLOAD_FOLDER": app.config["UPLOAD_FOLDER"],
-                "CHROMA_COLLECTION": None,
-            }
-    status = {
+def _base_health_status(config: dict) -> dict:
+    return {
         "status": "healthy",
         "model_configuration_ready": False,
         "settings_ready": False,
@@ -3582,8 +4604,56 @@ def _health_status(app: Flask, deep: bool = True, config: dict | None = None) ->
         "queue_ready": True,
         "queue_depth": 0,
         "active_jobs_count": 0,
+        "knowledge_base_id": config.get("KNOWLEDGE_BASE_ID", "default"),
     }
-    state_status = runtime_state_status(active_jobs_count=_active_rebuild_jobs_count())
+
+
+def _health_status(app: Flask, deep: bool = True, config: dict | None = None) -> dict:
+    if config is None:
+        try:
+            config = _workspace_config(app)
+        except KnowledgeBaseValidationError:
+            raise
+        except Exception:
+            config = {
+                "SETTINGS_FILE": app.config["SETTINGS_FILE"],
+                "FILE_INDEX": app.config["FILE_INDEX"],
+                "UPLOAD_FOLDER": app.config["UPLOAD_FOLDER"],
+                "CHROMA_COLLECTION": None,
+            }
+    state_status = runtime_state_status(active_jobs_count=0)
+    if not state_status["redis_ready"] or not state_status["queue_ready"]:
+        status = _base_health_status(config)
+        status.update(state_status)
+        status["status"] = "degraded"
+        return status
+    from utils.index_lock import lifecycle_read_lock
+
+    collection_name = config.get("CHROMA_COLLECTION")
+    with lifecycle_read_lock(scope=collection_name):
+        _raise_if_knowledge_base_became_unavailable(config)
+        return _health_status_under_lifecycle(app, deep=deep, config=config)
+
+
+def _health_status_under_lifecycle(
+    app: Flask,
+    *,
+    deep: bool,
+    config: dict,
+) -> dict:
+    status = _base_health_status(config)
+    try:
+        if config.get("WORKSPACE_ID"):
+            active_jobs_count = get_job_store().active_jobs_count(
+                config["WORKSPACE_ID"],
+                config.get("KNOWLEDGE_BASE_ID", "default"),
+            )
+        else:
+            active_jobs_count = _active_rebuild_jobs_count()
+    except Exception as exc:
+        log.warning("Unable to read scoped active jobs count: %s", exc)
+        active_jobs_count = 0
+    state_status = runtime_state_status(active_jobs_count=active_jobs_count)
     status.update(state_status)
     if not state_status["redis_ready"] or not state_status["queue_ready"]:
         status["status"] = "degraded"
@@ -3636,7 +4706,9 @@ def _health_status(app: Flask, deep: bool = True, config: dict | None = None) ->
 
         collection_name = config.get("CHROMA_COLLECTION")
         if collection_name:
-            status.update(get_collection_status(collection_name=collection_name))
+            status.update(
+                get_collection_status(collection_name=collection_name)
+            )
         else:
             status.update(get_collection_status())
         status["database_ready"] = True

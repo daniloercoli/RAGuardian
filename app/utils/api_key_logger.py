@@ -48,6 +48,7 @@ class ApiKeyLogger:
         request_id: str = "",
         ip_address: str = "",
         workspace_id: str = "",
+        knowledge_base_id: str = "",
         api_key_id: str = "",
     ) -> None:
         if not self._enabled:
@@ -72,6 +73,7 @@ class ApiKeyLogger:
             "request_id": request_id,
             "ip_address": ip_address,
             "workspace_id": workspace_id,
+            "knowledge_base_id": knowledge_base_id or "default",
         }
         with self._lock:
             data = self._load_data_unlocked()
