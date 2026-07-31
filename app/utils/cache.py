@@ -102,6 +102,13 @@ class SimpleLRUCache:
             for key in keys:
                 self.cache.pop(key, None)
         return len(keys)
+
+    def clear_matching(self, predicate) -> int:
+        with self._lock:
+            keys = [key for key in self.cache if predicate(key)]
+            for key in keys:
+                self.cache.pop(key, None)
+        return len(keys)
     
     def __len__(self):
         with self._lock:
@@ -155,6 +162,18 @@ class RAGCache:
         }
         key_json = json.dumps(key_data, sort_keys=True)
         collection = str(query or "").split("\n", 1)[0]
+        if collection.startswith("multi-v2:"):
+            collections = sorted(
+                value
+                for value in collection.removeprefix("multi-v2:").split("|")
+                if value
+            )
+            tokens = "".join(
+                f"|{hashlib.sha256(value.encode()).hexdigest()[:12]}|"
+                for value in collections
+            )
+            query_hash = hashlib.sha256(key_json.encode()).hexdigest()[:20]
+            return f"v2:{tokens}:{query_hash}"
         collection_hash = hashlib.sha256(collection.encode()).hexdigest()[:12]
         query_hash = hashlib.sha256(key_json.encode()).hexdigest()[:20]
         return f"{collection_hash}:{query_hash}"
@@ -240,12 +259,17 @@ class RAGCache:
             str(collection_name or "documents").encode()
         ).hexdigest()[:12]
         prefix = f"{collection_hash}:"
+        plural_token = f"|{collection_hash}|"
         deleted = 0
         if self._backend == "redis" and self._redis is not None:
             try:
                 deleted = redis_scan_delete(
                     self._redis,
                     f"{state_key_prefix()}:cache:{prefix}*",
+                )
+                deleted += redis_scan_delete(
+                    self._redis,
+                    f"{state_key_prefix()}:cache:v2:*{plural_token}*",
                 )
             except Exception as exc:
                 log.warning(
@@ -254,6 +278,9 @@ class RAGCache:
                 )
         if self._cache:
             deleted += self._cache.clear_prefix(prefix)
+            deleted += self._cache.clear_matching(
+                lambda key: key.startswith("v2:") and plural_token in key
+            )
         return deleted
     
     @property

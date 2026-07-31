@@ -20,12 +20,40 @@
 
         <section class="chat-section">
             <div class="chat-toolbar" aria-label="Chat settings">
-                <label class="chat-control" for="kbSelect">
-                    <span>Knowledge base</span>
-                    <select id="kbSelect">
-                        <option value="default">Loading knowledge bases...</option>
-                    </select>
-                </label>
+                <div class="chat-control kb-picker" id="kbPicker">
+                    <span id="kbPickerLabel">Knowledge bases</span>
+                    <button
+                        type="button"
+                        id="kbPickerButton"
+                        class="kb-picker-trigger"
+                        aria-labelledby="kbPickerLabel kbPickerSummary"
+                        aria-haspopup="dialog"
+                        aria-expanded="false"
+                        aria-controls="kbPickerPopover"
+                    >
+                        <span id="kbPickerSummary">Loading knowledge bases...</span>
+                        <span aria-hidden="true">▾</span>
+                    </button>
+                    <div
+                        id="kbPickerPopover"
+                        class="kb-picker-popover"
+                        role="dialog"
+                        aria-label="Select knowledge bases"
+                        hidden
+                    >
+                        <label class="kb-picker-search">
+                            <span class="sr-only">Search knowledge bases</span>
+                            <input id="kbPickerSearch" type="search" placeholder="Search knowledge bases">
+                        </label>
+                        <div id="kbPickerOptions" class="kb-picker-options"></div>
+                        <p id="kbPickerError" class="kb-picker-error" role="alert" hidden></p>
+                        <div class="kb-picker-actions">
+                            <span id="kbPickerLimit"></span>
+                            <button type="button" id="kbPickerCancel" class="secondary">Cancel</button>
+                            <button type="button" id="kbPickerApply">Apply</button>
+                        </div>
+                    </div>
+                </div>
                 <label class="chat-control" for="modelSelect">
                     <span>Model</span>
                     <select id="modelSelect">
@@ -40,6 +68,7 @@
                 </label>
                 <button type="button" id="clearChatButton" class="secondary">New chat</button>
             </div>
+            <div id="kbChips" class="kb-chip-list" aria-live="polite"></div>
 
             <div id="chatbox" class="chatbox" aria-live="polite">
                 <div id="emptyState" class="empty-state">

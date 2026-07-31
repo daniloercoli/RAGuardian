@@ -190,6 +190,20 @@ class ChromaPersistentVectorStore(VectorStore):
         log.info(f"Trovati {len(docs)} risultati")
         return docs
 
+    def query_by_embedding(
+        self,
+        query_embedding,
+        k: int,
+        *,
+        include_embeddings: bool = False,
+    ):
+        docs, embeddings = self._query_documents_by_embedding(
+            query_embedding,
+            k=k,
+            include_embeddings=include_embeddings,
+        )
+        return docs, embeddings
+
     def query_with_rerank(
         self,
         query: str,
@@ -248,11 +262,26 @@ class ChromaPersistentVectorStore(VectorStore):
         return reranked_docs
 
     def _query_documents(self, query: str, k: int, include_embeddings: bool):
-        collection = self._collection()
         query_emb = self._embedding_provider().encode_query(query)
+        docs, embeddings = self._query_documents_by_embedding(
+            query_emb,
+            k=k,
+            include_embeddings=include_embeddings,
+        )
+        return docs, embeddings, query_emb
+
+    def _query_documents_by_embedding(
+        self,
+        query_emb,
+        *,
+        k: int,
+        include_embeddings: bool,
+    ):
+        collection = self._collection()
         include = ["documents", "metadatas"]
+        include.append("distances")
         if include_embeddings:
-            include.extend(["embeddings", "distances"])
+            include.append("embeddings")
 
         results = collection.query(query_embeddings=[query_emb], n_results=k, include=include)
         docs = []
@@ -265,18 +294,20 @@ class ChromaPersistentVectorStore(VectorStore):
 
             metadatas = _first_result_list(results.get("metadatas"))
             embeddings = _first_result_list(results.get("embeddings")) if include_embeddings else []
-            distances = _first_result_list(results.get("distances")) if include_embeddings else []
+            distances = _first_result_list(results.get("distances"))
             for index, doc in enumerate(documents):
                 metadata = dict(metadatas[index] or {}) if index < len(metadatas) else {}
-                if include_embeddings:
-                    score = _cosine_similarity(query_emb, embeddings[index] if index < len(embeddings) else None)
-                    if score is None and index < len(distances):
-                        score = _distance_score(distances[index])
-                    if score is not None:
-                        metadata["chroma_score"] = round(score, 6)
+                score = _cosine_similarity(
+                    query_emb,
+                    embeddings[index] if index < len(embeddings) else None,
+                )
+                if score is None and index < len(distances):
+                    score = _distance_score(distances[index])
+                if score is not None:
+                    metadata["chroma_score"] = round(score, 6)
                 docs.append(Document(page_content=str(doc), metadata=metadata))
 
-        return docs, embeddings, query_emb
+        return docs, embeddings
 
     def reset_collection(self):
         client = self._client()

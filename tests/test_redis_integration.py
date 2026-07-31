@@ -37,6 +37,16 @@ def test_real_redis_state_backends(monkeypatch):
 
         RAGCache.reset()
         cache = RAGCache()
+        monkeypatch.setattr(
+            cache,
+            "_get_config",
+            lambda: {
+                "enable_cache": True,
+                "query_k": 5,
+                "default_model": "integration-model",
+                "cache_ttl": 60,
+            },
+        )
         documents = [Document(page_content="Redis context", metadata={"source": "redis.pdf"})]
         cache.set("real redis query", documents, k=1, model="integration-model")
         restored = cache.get("real redis query", k=1, model="integration-model")
@@ -52,7 +62,7 @@ def test_real_redis_state_backends(monkeypatch):
         conversations.append_turn("conversation-1", user="Question", assistant="Answer")
         assert "Question" in conversations.render_for_prompt("conversation-1")
         assert client.get("rag-integration-test:conversation:conversation-1").startswith(
-            b'{"schema_version":1'
+            b'{"schema_version":2'
         )
 
         jobs = RedisJobStore(redis_client=client)

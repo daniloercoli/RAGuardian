@@ -12,7 +12,17 @@ document.addEventListener("DOMContentLoaded", () => {
     const userInput = document.getElementById("userInput");
     const sendButton = document.getElementById("sendButton");
     const modelSelect = document.getElementById("modelSelect");
-    const kbSelect = document.getElementById("kbSelect");
+    const kbPicker = document.getElementById("kbPicker");
+    const kbPickerButton = document.getElementById("kbPickerButton");
+    const kbPickerSummary = document.getElementById("kbPickerSummary");
+    const kbPickerPopover = document.getElementById("kbPickerPopover");
+    const kbPickerSearch = document.getElementById("kbPickerSearch");
+    const kbPickerOptions = document.getElementById("kbPickerOptions");
+    const kbPickerError = document.getElementById("kbPickerError");
+    const kbPickerLimit = document.getElementById("kbPickerLimit");
+    const kbPickerApply = document.getElementById("kbPickerApply");
+    const kbPickerCancel = document.getElementById("kbPickerCancel");
+    const kbChips = document.getElementById("kbChips");
     const promptSelect = document.getElementById("promptSelect");
     const clearChatButton = document.getElementById("clearChatButton");
     const streamStatus = document.getElementById("streamStatus");
@@ -30,8 +40,12 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const promptStorageKey = "ragSystemPromptId";
-    const knowledgeBaseStorageKey = "ragKnowledgeBaseId";
-    let knowledgeBaseId = loadKnowledgeBaseId();
+    const knowledgeBaseStorageKey = "ragKnowledgeBaseIds";
+    const legacyKnowledgeBaseStorageKey = "ragKnowledgeBaseId";
+    let knowledgeBaseIds = loadKnowledgeBaseIds();
+    let knowledgeBaseCatalog = [];
+    let draftKnowledgeBaseIds = [...knowledgeBaseIds];
+    let maxQueryKnowledgeBases = 5;
     let systemPromptId = loadSystemPromptId();
     let codeInterpreterEnabled = false;
     const uploadedFiles = [];
@@ -56,9 +70,26 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     userInput.addEventListener("input", resizeInput);
     modelSelect.addEventListener("change", () => updateChatStatus());
-    if (kbSelect) {
-        kbSelect.addEventListener("change", handleKnowledgeBaseChange);
-    }
+    if (kbPickerButton) kbPickerButton.addEventListener("click", toggleKnowledgeBasePicker);
+    if (kbPickerApply) kbPickerApply.addEventListener("click", applyKnowledgeBaseDraft);
+    if (kbPickerCancel) kbPickerCancel.addEventListener("click", closeKnowledgeBasePicker);
+    if (kbPickerSearch) kbPickerSearch.addEventListener("input", renderKnowledgeBaseOptions);
+    document.addEventListener("pointerdown", (event) => {
+        if (
+            kbPickerPopover
+            && !kbPickerPopover.hidden
+            && kbPicker
+            && !kbPicker.contains(event.target)
+        ) {
+            closeKnowledgeBasePicker();
+        }
+    });
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && kbPickerPopover && !kbPickerPopover.hidden) {
+            event.preventDefault();
+            closeKnowledgeBasePicker();
+        }
+    });
     if (promptSelect) {
         promptSelect.addEventListener("change", () => {
             const selValue = promptSelect.value;
@@ -187,16 +218,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (!response.ok) {
                 const data = await readErrorPayload(response);
-                msgDiv.innerHTML = window.marked
-                    ? DOMPurify.sanitize(marked.parse(formatError(data, "Transcription failed")))
-                    : escapeHtml("Transcription failed: " + (data.error || response.statusText));
+                msgDiv.innerHTML = renderSafeMarkdown(
+                    formatError(data, "Transcription failed")
+                );
             } else {
                 const data = await response.json();
                 const transcript = data.transcript || "";
                 if (transcript) {
-                    msgDiv.innerHTML = window.marked
-                        ? DOMPurify.sanitize(marked.parse("**Transcription**:\n\n" + escapeHtml(transcript)))
-                        : escapeHtml("Transcription:\n\n" + transcript);
+                    msgDiv.innerHTML = renderSafeMarkdown(
+                        "**Transcription**:\n\n" + escapeHtml(transcript)
+                    );
                     userInput.value = transcript;
                     resizeInput();
                 } else {
@@ -205,9 +236,9 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             highlightCodeBlocks(msgDiv);
         } catch (error) {
-            msgDiv.innerHTML = window.marked
-                ? DOMPurify.sanitize(marked.parse("Transcription failed: " + error.message))
-                : escapeHtml("Transcription failed: " + error.message);
+            msgDiv.innerHTML = renderSafeMarkdown(
+                "Transcription failed: " + error.message
+            );
         } finally {
             uploadAudioButton.disabled = false;
             setControlLabel(uploadAudioButton, originalBtnText || "Record audio for transcription");
@@ -307,7 +338,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         name: f.name,
                         type: f.type
                     })),
-                    knowledge_base_id: knowledgeBaseId
+                    knowledge_base_ids: [...knowledgeBaseIds]
                 };
                 const response = await postAsk(ciBody, askTimeout);
                 if (!response.ok) {
@@ -335,7 +366,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 stream_format: "ndjson",
                 system_prompt_id: systemPromptId || undefined,
                 use_code_interpreter: false,
-                knowledge_base_id: knowledgeBaseId
+                knowledge_base_ids: [...knowledgeBaseIds]
             };
             if (uploadedFiles.length > 0) {
                 body.attached_files = uploadedFiles.map(f => ({
@@ -381,7 +412,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function renderCodeInterpreterStream(response, messageDiv, timeout) {
-        const state = {code: "", result: null, hasError: false, status: "Preparing analysis..."};
+        const state = {
+            code: "",
+            result: null,
+            hasError: false,
+            status: "Preparing analysis...",
+            recoveryPromise: null
+        };
 
         const onEvent = (event) => {
             if (!event || state.hasError) return;
@@ -407,13 +444,17 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (event.type === "error") {
                 state.hasError = true;
                 renderBotAnswer(messageDiv, formatError(event, "Code interpreter interrupted"));
-                handleUnavailableKnowledgeBase(event, messageDiv).catch(() => {});
+                state.recoveryPromise = handleUnavailableKnowledgeBase(
+                    event,
+                    messageDiv
+                );
             }
         };
 
         if (!response.body || !response.body.getReader) {
             const text = await response.text();
             parseNdjsonLines(text, onEvent);
+            await waitForKnowledgeBaseRecovery(state);
             return;
         }
 
@@ -430,11 +471,13 @@ document.addEventListener("DOMContentLoaded", () => {
             parseNdjsonLines(lines.join("\n"), onEvent);
             if (state.hasError) {
                 reader.cancel().catch(() => {});
+                await waitForKnowledgeBaseRecovery(state);
                 return;
             }
         }
         buffer += decoder.decode();
         parseNdjsonLines(buffer, onEvent);
+        await waitForKnowledgeBaseRecovery(state);
     }
 
     function renderCodeInterpreterPayload(messageDiv, code, result, statusText) {
@@ -466,9 +509,7 @@ document.addEventListener("DOMContentLoaded", () => {
             content = "_Preparing analysis..._";
         }
 
-        messageDiv.innerHTML = window.marked
-            ? DOMPurify.sanitize(marked.parse(content))
-            : escapeHtml(content);
+        messageDiv.innerHTML = renderSafeMarkdown(content);
         highlightCodeBlocks(messageDiv);
     }
 
@@ -476,7 +517,11 @@ document.addEventListener("DOMContentLoaded", () => {
         busy = isBusy;
         sendButton.disabled = isBusy || !modelSelect.value;
         userInput.disabled = isBusy;
-        if (kbSelect) kbSelect.disabled = isBusy;
+        if (clearChatButton) clearChatButton.disabled = isBusy;
+        if (kbPickerButton) kbPickerButton.disabled = isBusy || knowledgeBaseCatalog.length === 0;
+        if (kbPickerApply) kbPickerApply.disabled = isBusy;
+        if (isBusy) closeKnowledgeBasePicker();
+        renderKnowledgeBaseSelection();
         sendButton.textContent = isBusy ? "Waiting" : "Send";
         if (streamStatus) {
             streamStatus.hidden = !isBusy;
@@ -524,11 +569,16 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function renderStreamingResponse(response, messageDiv, timeout) {
-        const state = {answerText: "", hasError: false};
+        const state = {
+            answerText: "",
+            hasError: false,
+            recoveryPromise: null
+        };
 
         if (!response.body || !response.body.getReader) {
             const text = await response.text();
             parseNdjsonLines(text, (event) => handleStreamEvent(event, state, messageDiv));
+            await waitForKnowledgeBaseRecovery(state);
             return;
         }
 
@@ -547,12 +597,14 @@ document.addEventListener("DOMContentLoaded", () => {
             parseNdjsonLines(lines.join("\n"), (event) => handleStreamEvent(event, state, messageDiv));
             if (state.hasError) {
                 reader.cancel().catch(() => {});
+                await waitForKnowledgeBaseRecovery(state);
                 return;
             }
         }
 
         buffer += decoder.decode();
         parseNdjsonLines(buffer, (event) => handleStreamEvent(event, state, messageDiv));
+        await waitForKnowledgeBaseRecovery(state);
     }
 
     function parseNdjsonLines(text, onEvent) {
@@ -584,7 +636,19 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (event.type === "error") {
             state.hasError = true;
             renderBotAnswer(messageDiv, formatError(event, "Streaming interrupted"));
-            handleUnavailableKnowledgeBase(event, messageDiv).catch(() => {});
+            state.recoveryPromise = handleUnavailableKnowledgeBase(
+                event,
+                messageDiv
+            );
+        }
+    }
+
+    async function waitForKnowledgeBaseRecovery(state) {
+        if (!state || !state.recoveryPromise) return;
+        try {
+            await state.recoveryPromise;
+        } catch (error) {
+            console.warn("Unable to refresh knowledge bases after stream failure", error);
         }
     }
 
@@ -631,10 +695,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function renderBotAnswer(messageDiv, answerText) {
-        const html = window.marked ? marked.parse(answerText || "") : escapeHtml(answerText || "");
-        const sanitizedHtml = window.DOMPurify ? DOMPurify.sanitize(html) : html;
-
-        messageDiv.innerHTML = sanitizedHtml;
+        messageDiv.innerHTML = renderSafeMarkdown(answerText);
         highlightCodeBlocks(messageDiv);
         chatbox.scrollTop = chatbox.scrollHeight;
     }
@@ -647,8 +708,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const seenUrls = new Set();
         const uniqueSources = contextData.filter(ctx => {
             if (!ctx.download_url) return false;
-            if (seenUrls.has(ctx.download_url)) return false;
-            seenUrls.add(ctx.download_url);
+            const metadata = ctx.metadata || {};
+            const sourceKey = `${metadata.knowledge_base_id || ""}:${ctx.download_url}`;
+            if (seenUrls.has(sourceKey)) return false;
+            seenUrls.add(sourceKey);
             return true;
         });
 
@@ -688,7 +751,21 @@ document.addEventListener("DOMContentLoaded", () => {
         const meta = document.createElement("span");
         meta.textContent = sourceMeta(ctx);
 
-        header.append(link, meta);
+        const identity = document.createElement("div");
+        identity.className = "source-card-identity";
+        const knowledgeBaseName = ctx.metadata && ctx.metadata.knowledge_base_name;
+        if (knowledgeBaseName) {
+            const badge = document.createElement("span");
+            badge.className = "source-kb-badge";
+            badge.textContent = knowledgeBaseName;
+            const origins = ctx.metadata.knowledge_base_origins || [];
+            if (origins.length > 1) {
+                badge.title = `Also found in ${origins.length - 1} other knowledge base(s)`;
+            }
+            identity.appendChild(badge);
+        }
+        identity.appendChild(link);
+        header.append(identity, meta);
 
         const snippet = document.createElement("p");
         snippet.textContent = sourceSnippet(ctx.text || "");
@@ -699,7 +776,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function sourceFilename(ctx) {
         if (ctx.download_url) {
-            return decodeURIComponent(ctx.download_url.split("/").pop() || "Document");
+            try {
+                const url = new URL(ctx.download_url, window.location.origin);
+                return decodeURIComponent(url.pathname.split("/").pop() || "Document");
+            } catch (error) {
+                return "Document";
+            }
         }
         const source = ctx.metadata && ctx.metadata.source;
         return source ? source.split("/").pop() : "Document";
@@ -744,6 +826,14 @@ document.addEventListener("DOMContentLoaded", () => {
         return div.innerHTML;
     }
 
+    function renderSafeMarkdown(value) {
+        const text = String(value || "");
+        if (!window.marked || !window.DOMPurify) {
+            return escapeHtml(text);
+        }
+        return DOMPurify.sanitize(marked.parse(text));
+    }
+
     function updateChatStatus() {
         if (!busy) {
             sendButton.disabled = !modelSelect.value;
@@ -764,10 +854,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function clearChat() {
+        if (busy) return;
         const previousConversationId = conversationId;
         conversationId = createConversationId();
         persistConversationId(conversationId);
-        clearServerConversation(previousConversationId, knowledgeBaseId);
+        clearServerConversation(previousConversationId, knowledgeBaseIds);
         chatbox.replaceChildren();
         clearUploadedFiles();
         if (emptyState) {
@@ -813,11 +904,12 @@ document.addEventListener("DOMContentLoaded", () => {
         persistConversationId(value);
     }
 
-    async function clearServerConversation(value, targetKnowledgeBaseId = knowledgeBaseId) {
+    async function clearServerConversation(value, targetKnowledgeBaseIds = knowledgeBaseIds) {
         if (!value) return;
         try {
-            const query = new URLSearchParams({
-                knowledge_base_id: targetKnowledgeBaseId || "default"
+            const query = new URLSearchParams();
+            (targetKnowledgeBaseIds || ["default"]).forEach(id => {
+                query.append("knowledge_base_ids", id);
             });
             await fetch(
                 `/conversation/${encodeURIComponent(value)}?${query.toString()}`,
@@ -862,17 +954,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (!response.ok) {
                 const data = await readErrorPayload(response);
-                msgDiv.innerHTML = window.marked
-                    ? DOMPurify.sanitize(marked.parse(formatError(data, "OCR failed")))
-                    : escapeHtml(`OCR failed: ${data.error || response.statusText}`);
+                msgDiv.innerHTML = renderSafeMarkdown(
+                    formatError(data, "OCR failed")
+                );
             } else {
                 const data = await response.json();
                 const text = data.text || "";
                 if (text) {
                     const method = data.ocr_used ? "OCR" : "PDF text parser";
-                    msgDiv.innerHTML = window.marked
-                        ? DOMPurify.sanitize(marked.parse(`**Extracted text** (${data.filename || "document"}, ${method}):\n\n${escapeHtml(text)}`))
-                        : escapeHtml(`Extracted text:\n\n${text}`);
+                    msgDiv.innerHTML = renderSafeMarkdown(
+                        `**Extracted text** (${data.filename || "document"}, ${method}):\n\n${escapeHtml(text)}`
+                    );
                     userInput.value = text;
                     resizeInput();
                 } else {
@@ -881,9 +973,9 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             highlightCodeBlocks(msgDiv);
         } catch (error) {
-            msgDiv.innerHTML = window.marked
-                ? DOMPurify.sanitize(marked.parse(`OCR failed: ${error.message}`))
-                : escapeHtml(`OCR failed: ${error.message}`);
+            msgDiv.innerHTML = renderSafeMarkdown(
+                `OCR failed: ${error.message}`
+            );
         } finally {
             uploadOcrButton.disabled = false;
             setControlLabel(uploadOcrButton, originalBtnText || "Extract text from image or PDF");
@@ -963,77 +1055,286 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function loadKnowledgeBases() {
-        if (!kbSelect) return;
+        if (!kbPickerButton) return;
         try {
             const response = await fetch("/api/knowledge-bases");
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || response.statusText);
-            const knowledgeBases = (data.knowledge_bases || []).filter(
+            knowledgeBaseCatalog = (data.knowledge_bases || []).filter(
                 item => item.status === "active"
             );
-            kbSelect.replaceChildren();
-            knowledgeBases.forEach(item => {
-                const label = item.is_default ? `${item.name} (Default)` : item.name;
-                kbSelect.appendChild(new Option(label, item.id));
-            });
-            const availableIds = new Set(knowledgeBases.map(item => item.id));
-            if (!availableIds.has(knowledgeBaseId)) {
-                knowledgeBaseId = availableIds.has("default")
-                    ? "default"
-                    : (knowledgeBases[0] && knowledgeBases[0].id) || "default";
-                persistKnowledgeBaseId(knowledgeBaseId);
+            maxQueryKnowledgeBases = Math.max(
+                1,
+                Number(data.limits && data.limits.max_query_knowledge_bases) || 5
+            );
+            const availableIds = new Set(knowledgeBaseCatalog.map(item => item.id));
+            const reconciled = normalizeKnowledgeBaseIds(knowledgeBaseIds).filter(
+                id => availableIds.has(id)
+            );
+            if (reconciled.length === 0 && knowledgeBaseCatalog.length > 0) {
+                reconciled.push(
+                    availableIds.has("default")
+                        ? "default"
+                        : knowledgeBaseCatalog[0].id
+                );
             }
-            kbSelect.value = knowledgeBaseId;
-            kbSelect.disabled = busy || knowledgeBases.length === 0;
+            const nextKnowledgeBaseIds = reconciled.slice(
+                0,
+                maxQueryKnowledgeBases
+            );
+            const selectionChanged = !sameKnowledgeBaseSelection(
+                nextKnowledgeBaseIds,
+                knowledgeBaseIds
+            );
+            knowledgeBaseIds = nextKnowledgeBaseIds;
+            draftKnowledgeBaseIds = [...knowledgeBaseIds];
+            persistKnowledgeBaseIds(knowledgeBaseIds);
+            renderKnowledgeBaseSelection();
+            renderKnowledgeBaseOptions();
+            kbPickerButton.disabled = busy || knowledgeBaseCatalog.length === 0;
+            if (selectionChanged && chatbox.querySelector(".message")) {
+                appendKnowledgeBaseNotice(
+                    "Knowledge base access changed. The active context was updated."
+                );
+            }
         } catch (error) {
-            kbSelect.replaceChildren(new Option("Knowledge bases unavailable", ""));
-            kbSelect.disabled = true;
+            knowledgeBaseCatalog = [];
+            kbPickerSummary.textContent = "Knowledge bases unavailable";
+            kbPickerButton.disabled = true;
             console.warn("Knowledge bases not available:", error);
         }
     }
 
-    function handleKnowledgeBaseChange() {
-        const nextKnowledgeBaseId = kbSelect.value || "default";
-        if (nextKnowledgeBaseId === knowledgeBaseId) return;
-        const hasTranscript = Boolean(chatbox.querySelector(".message"));
-        if (
-            hasTranscript
-            && !window.confirm(
-                "Changing knowledge base starts a new conversation. Continue?"
-            )
-        ) {
-            kbSelect.value = knowledgeBaseId;
+    function toggleKnowledgeBasePicker() {
+        if (!kbPickerPopover || kbPickerButton.disabled) return;
+        if (!kbPickerPopover.hidden) {
+            closeKnowledgeBasePicker();
             return;
         }
-        const previousKnowledgeBaseId = knowledgeBaseId;
-        const previousConversationId = conversationId;
+        draftKnowledgeBaseIds = [...knowledgeBaseIds];
+        kbPickerSearch.value = "";
+        setKnowledgeBasePickerError("");
+        renderKnowledgeBaseOptions();
+        kbPickerPopover.hidden = false;
+        kbPickerButton.setAttribute("aria-expanded", "true");
+        requestAnimationFrame(() => kbPickerSearch.focus());
+    }
 
-        // Commit the local switch as one synchronous transition. A new request
-        // can never use the new KB while the old transcript is still visible.
-        resetKnowledgeBaseConversation(nextKnowledgeBaseId);
-        if (hasTranscript) {
-            clearServerConversation(
-                previousConversationId,
-                previousKnowledgeBaseId
-            );
+    function closeKnowledgeBasePicker() {
+        if (!kbPickerPopover) return;
+        kbPickerPopover.hidden = true;
+        kbPickerButton.setAttribute("aria-expanded", "false");
+        draftKnowledgeBaseIds = [...knowledgeBaseIds];
+        setKnowledgeBasePickerError("");
+        kbPickerButton.focus({preventScroll: true});
+    }
+
+    function renderKnowledgeBaseOptions() {
+        if (!kbPickerOptions) return;
+        const term = String(kbPickerSearch && kbPickerSearch.value || "")
+            .trim()
+            .toLocaleLowerCase();
+        kbPickerOptions.replaceChildren();
+        const visible = knowledgeBaseCatalog.filter(item => {
+            const haystack = `${item.name || ""} ${item.description || ""}`.toLocaleLowerCase();
+            return !term || haystack.includes(term);
+        });
+        visible.forEach(item => {
+            const label = document.createElement("label");
+            label.className = "kb-picker-option";
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.value = item.id;
+            checkbox.checked = draftKnowledgeBaseIds.includes(item.id);
+            checkbox.disabled = busy;
+            checkbox.addEventListener("change", () => {
+                if (checkbox.checked) {
+                    if (draftKnowledgeBaseIds.length >= maxQueryKnowledgeBases) {
+                        checkbox.checked = false;
+                        setKnowledgeBasePickerError(
+                            `Select up to ${maxQueryKnowledgeBases} knowledge bases.`
+                        );
+                        return;
+                    }
+                    draftKnowledgeBaseIds.push(item.id);
+                } else {
+                    draftKnowledgeBaseIds = draftKnowledgeBaseIds.filter(
+                        id => id !== item.id
+                    );
+                }
+                setKnowledgeBasePickerError("");
+                updateKnowledgeBaseDraftStatus();
+            });
+            const text = document.createElement("span");
+            const title = document.createElement("strong");
+            title.textContent = item.is_default
+                ? `${item.name} (Default)`
+                : item.name;
+            const description = document.createElement("small");
+            description.textContent = item.description || "No description";
+            text.append(title, description);
+            label.append(checkbox, text);
+            kbPickerOptions.appendChild(label);
+        });
+        if (visible.length === 0) {
+            const empty = document.createElement("p");
+            empty.className = "kb-picker-empty";
+            empty.textContent = "No matching knowledge bases.";
+            kbPickerOptions.appendChild(empty);
         }
+        updateKnowledgeBaseDraftStatus();
+    }
+
+    function updateKnowledgeBaseDraftStatus() {
+        if (kbPickerLimit) {
+            kbPickerLimit.textContent =
+                `${draftKnowledgeBaseIds.length}/${maxQueryKnowledgeBases} selected`;
+        }
+        if (kbPickerApply) {
+            kbPickerApply.disabled = busy || draftKnowledgeBaseIds.length === 0;
+        }
+    }
+
+    function applyKnowledgeBaseDraft() {
+        if (draftKnowledgeBaseIds.length === 0) {
+            setKnowledgeBasePickerError("Select at least one knowledge base.");
+            return;
+        }
+        commitKnowledgeBaseSelection(draftKnowledgeBaseIds);
+        closeKnowledgeBasePicker();
         userInput.focus();
     }
 
-    function loadKnowledgeBaseId() {
-        try {
-            return window.sessionStorage
-                ? (sessionStorage.getItem(knowledgeBaseStorageKey) || "default")
-                : "default";
-        } catch (error) {
-            return "default";
+    function commitKnowledgeBaseSelection(nextIds) {
+        const normalized = normalizeKnowledgeBaseIds(nextIds).slice(
+            0,
+            maxQueryKnowledgeBases
+        );
+        if (normalized.length === 0 || sameKnowledgeBaseSelection(normalized, knowledgeBaseIds)) {
+            return;
+        }
+        knowledgeBaseIds = normalized;
+        draftKnowledgeBaseIds = [...normalized];
+        persistKnowledgeBaseIds(knowledgeBaseIds);
+        renderKnowledgeBaseSelection();
+        appendKnowledgeBaseNotice(
+            `Knowledge base context updated: ${knowledgeBaseSelectionLabel(knowledgeBaseIds)}.`
+        );
+    }
+
+    function renderKnowledgeBaseSelection() {
+        if (!kbPickerSummary || !kbChips) return;
+        kbPickerSummary.textContent = knowledgeBaseSelectionLabel(knowledgeBaseIds);
+        kbChips.replaceChildren();
+        knowledgeBaseIds.forEach((id, index) => {
+            const item = knowledgeBaseCatalog.find(candidate => candidate.id === id);
+            if (!item) return;
+            const chip = document.createElement("span");
+            chip.className = "kb-chip";
+            const label = document.createElement("span");
+            label.textContent = item.name;
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "×";
+            remove.disabled = busy || knowledgeBaseIds.length === 1;
+            remove.setAttribute("aria-label", `Remove ${item.name}`);
+            remove.addEventListener("click", () => {
+                if (knowledgeBaseIds.length === 1) return;
+                commitKnowledgeBaseSelection(
+                    knowledgeBaseIds.filter(value => value !== id)
+                );
+                requestAnimationFrame(
+                    () => focusKnowledgeBaseControlAfterRemoval(index)
+                );
+            });
+            chip.append(label, remove);
+            kbChips.appendChild(chip);
+        });
+    }
+
+    function focusKnowledgeBaseControlAfterRemoval(removedIndex) {
+        const removeButtons = kbChips
+            ? [...kbChips.querySelectorAll(".kb-chip button")]
+            : [];
+        const nextButton = removeButtons[
+            Math.min(removedIndex, removeButtons.length - 1)
+        ];
+        if (nextButton && !nextButton.disabled) {
+            nextButton.focus({preventScroll: true});
+            return;
+        }
+        if (kbPickerButton) {
+            kbPickerButton.focus({preventScroll: true});
         }
     }
 
-    function persistKnowledgeBaseId(value) {
+    function knowledgeBaseSelectionLabel(ids) {
+        const names = ids.map(id => {
+            const item = knowledgeBaseCatalog.find(candidate => candidate.id === id);
+            return item ? item.name : id;
+        });
+        if (names.length <= 2) return names.join(", ") || "Select knowledge bases";
+        return `${names[0]}, ${names[1]} +${names.length - 2}`;
+    }
+
+    function appendKnowledgeBaseNotice(text) {
+        if (!text || !chatbox.querySelector(".message")) return;
+        const notice = document.createElement("div");
+        notice.className = "kb-context-notice";
+        notice.textContent = text;
+        chatbox.appendChild(notice);
+        chatbox.scrollTop = chatbox.scrollHeight;
+    }
+
+    function setKnowledgeBasePickerError(message) {
+        if (!kbPickerError) return;
+        kbPickerError.textContent = message || "";
+        kbPickerError.hidden = !message;
+    }
+
+    function sameKnowledgeBaseSelection(left, right) {
+        return left.length === right.length
+            && left.every((value, index) => value === right[index]);
+    }
+
+    function normalizeKnowledgeBaseIds(values) {
+        if (!Array.isArray(values)) return [];
+        return [...new Set(
+            values
+                .filter(value => typeof value === "string")
+                .map(value => value.trim())
+                .filter(Boolean)
+        )];
+    }
+
+    function loadKnowledgeBaseIds() {
+        try {
+            if (!window.sessionStorage) return ["default"];
+            const stored = sessionStorage.getItem(knowledgeBaseStorageKey);
+            if (stored) {
+                const parsed = JSON.parse(stored);
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    const normalized = normalizeKnowledgeBaseIds(parsed);
+                    return normalized.length > 0 ? normalized : ["default"];
+                }
+            }
+            const legacy = sessionStorage.getItem(legacyKnowledgeBaseStorageKey);
+            const normalized = normalizeKnowledgeBaseIds([legacy || "default"]);
+            return normalized.length > 0 ? normalized : ["default"];
+        } catch (error) {
+            return ["default"];
+        }
+    }
+
+    function persistKnowledgeBaseIds(values) {
         try {
             if (window.sessionStorage) {
-                sessionStorage.setItem(knowledgeBaseStorageKey, value || "default");
+                const normalized = normalizeKnowledgeBaseIds(values);
+                sessionStorage.setItem(
+                    knowledgeBaseStorageKey,
+                    JSON.stringify(normalized.length > 0 ? normalized : ["default"])
+                );
+                sessionStorage.removeItem(legacyKnowledgeBaseStorageKey);
             }
         } catch (error) {/* best effort */}
     }
@@ -1046,28 +1347,13 @@ document.addEventListener("DOMContentLoaded", () => {
             return false;
         }
 
-        // Drop the failed transcript but keep the actionable stream error in
-        // view while the selector refreshes to an available fallback.
-        resetKnowledgeBaseConversation("default", preservedMessage);
         await loadKnowledgeBases();
-        return true;
-    }
-
-    function resetKnowledgeBaseConversation(nextKnowledgeBaseId, preservedMessage = null) {
-        knowledgeBaseId = nextKnowledgeBaseId || "default";
-        persistKnowledgeBaseId(knowledgeBaseId);
-        conversationId = createConversationId();
-        persistConversationId(conversationId);
-        chatbox.replaceChildren();
-        clearUploadedFiles();
-
         if (preservedMessage) {
-            hideEmptyState();
-            chatbox.appendChild(preservedMessage);
-        } else if (emptyState) {
-            emptyState.hidden = false;
-            chatbox.appendChild(emptyState);
+            appendKnowledgeBaseNotice(
+                "One or more knowledge bases are no longer available. Server memory was revalidated."
+            );
         }
+        return true;
     }
 
     async function handleFileUpload(event) {

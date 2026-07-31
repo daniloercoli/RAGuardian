@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -119,6 +119,43 @@ def lifecycle_read_lock(scope: str | None = None):
             publish=False,
         ):
             yield
+
+
+@contextmanager
+def lifecycle_read_locks(scopes) -> None:
+    """Hold the global read gate and every requested KB read lock.
+
+    Scopes are normalized and acquired in lexical order so concurrent
+    multi-knowledge-base queries cannot deadlock by choosing a different
+    request order.
+    """
+
+    ordered_scopes = sorted(
+        {
+            str(scope).strip()
+            for scope in (scopes or ())
+            if str(scope or "").strip()
+        }
+    )
+    with _lifecycle_lock(
+        shared=True,
+        scope=None,
+        synchronize=True,
+        publish=False,
+    ):
+        with ExitStack() as stack:
+            for scope in ordered_scopes:
+                stack.enter_context(
+                    _lifecycle_lock(
+                        shared=True,
+                        scope=scope,
+                        synchronize=False,
+                        publish=False,
+                    )
+                )
+            assert_distributed_locks_healthy()
+            yield
+            assert_distributed_locks_healthy()
 
 
 @contextmanager

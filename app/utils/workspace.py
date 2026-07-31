@@ -231,6 +231,33 @@ def knowledge_base_context(
     )
 
 
+def knowledge_base_contexts(
+    workspace: WorkspaceContext,
+    knowledge_base_ids,
+    *,
+    api_key: dict | None = None,
+    allow_inactive: bool = False,
+    create_dirs: bool = False,
+) -> tuple[KnowledgeBaseContext, ...]:
+    """Resolve a complete KB set before performing any filesystem mutation."""
+
+    contexts = tuple(
+        knowledge_base_context(
+            workspace,
+            knowledge_base_id,
+            api_key=api_key,
+            allow_inactive=allow_inactive,
+            create_dirs=False,
+        )
+        for knowledge_base_id in knowledge_base_ids
+    )
+    if create_dirs:
+        for context in contexts:
+            Path(context.file_index).parent.mkdir(parents=True, exist_ok=True)
+            Path(context.upload_folder).mkdir(parents=True, exist_ok=True)
+    return contexts
+
+
 def knowledge_base_from_request(
     knowledge_base_id: str | None = None,
     *,

@@ -198,6 +198,72 @@ def test_session_crud_keeps_default_and_returns_stats(client):
     assert delete_default.get_json()["status"] == "default_knowledge_base"
 
 
+def test_knowledge_base_rename_invalidates_cache_inside_scoped_writer(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    routes = importlib.import_module("routes.knowledge_bases")
+    rag_engine = importlib.import_module("utils.rag_engine")
+    created = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Cached name"},
+    ).get_json()
+    user = UserStore(flask_app.config["USERS_FILE"]).get(
+        flask_app.config["TEST_USER_ID"]
+    )
+    workspace = workspace_for_user(user, app=flask_app)
+    collection_name = collection_for_knowledge_base(
+        workspace.workspace_id,
+        created["id"],
+    )
+    writer = {"active": False, "scope": None, "publish": None}
+    invalidated = []
+
+    @contextmanager
+    def fake_lifecycle_write_lock(scope=None, *, publish=None):
+        writer.update(active=True, scope=scope, publish=publish)
+        try:
+            yield
+        finally:
+            writer["active"] = False
+
+    def fake_clear_cache(target_collection):
+        assert writer["active"] is True
+        invalidated.append(target_collection)
+        return 1
+
+    monkeypatch.setattr(
+        routes,
+        "lifecycle_write_lock",
+        fake_lifecycle_write_lock,
+    )
+    monkeypatch.setattr(
+        routes,
+        "assert_distributed_locks_healthy",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "clear_cache_for_collection",
+        fake_clear_cache,
+    )
+
+    response = client.patch(
+        f"/api/knowledge-bases/{created['id']}",
+        json={"name": "Fresh name"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["name"] == "Fresh name"
+    assert writer == {
+        "active": False,
+        "scope": collection_name,
+        "publish": True,
+    }
+    assert invalidated == [collection_name]
+
+
 def test_list_skips_a_knowledge_base_deleted_after_catalog_snapshot(
     client,
     flask_app,
@@ -350,6 +416,36 @@ def test_api_key_allowlist_is_fail_closed_and_manage_key_authorizes_created_kb(
         headers=reader_headers,
     )
     assert hidden_query.status_code == 404
+    user = user_store.get(user_id)
+    workspace = workspace_for_user(user, app=flask_app)
+    conversation_id = "unauthorized-clear-1234"
+    scoped_conversation_id = (
+        f"{workspace.workspace_id}:multi-chat:{conversation_id}"
+    )
+    reset_conversation_store()
+    get_conversation_store().append_turn(
+        scoped_conversation_id,
+        user="Domanda da preservare",
+        assistant="Risposta da preservare",
+        knowledge_base_ids=["default"],
+    )
+    hidden_plural_query = flask_app.test_client().post(
+        "/api/v1/query",
+        json={
+            "query": "La selezione deve fallire interamente.",
+            "knowledge_base_ids": ["default", existing["id"]],
+            "conversation_id": conversation_id,
+        },
+        headers=reader_headers,
+    )
+    assert hidden_plural_query.status_code == 404
+    assert (
+        hidden_plural_query.get_json()["status"]
+        == "knowledge_base_not_found"
+    )
+    assert "Risposta da preservare" in get_conversation_store().render_for_prompt(
+        scoped_conversation_id
+    )
 
     manager_headers = {"X-API-Key": "manager-key"}
     manager_list = flask_app.test_client().get(
@@ -733,6 +829,353 @@ def test_query_selection_freezes_collection_file_index_and_memory_namespace(
     )
 
 
+def test_plural_query_resolves_all_targets_and_returns_plural_contract(
+    client,
+    monkeypatch,
+):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    captured = {}
+
+    def fake_query(_query, **kwargs):
+        captured.update(kwargs)
+        return {
+            "answer": "ok",
+            "context": [],
+            "sources": [],
+            "model": "test-model",
+            "provider": "test-provider",
+            "usage": None,
+        }
+
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query)
+    secondary = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Legal multi"},
+    ).get_json()
+
+    response = client.post(
+        "/ask",
+        json={
+            "query": "Confronta i documenti",
+            "conversation_id": "conv-multi-1234",
+            "knowledge_base_ids": ["default", secondary["id"]],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["knowledge_base_ids"] == ["default", secondary["id"]]
+    assert "knowledge_base_id" not in payload
+    assert [
+        target["knowledge_base_id"]
+        for target in captured["knowledge_base_targets"]
+    ] == ["default", secondary["id"]]
+    assert captured["conversation_id"].endswith(
+        ":multi-chat:conv-multi-1234"
+    )
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"knowledge_base_ids": []},
+        {"knowledge_base_ids": ["default", "default"]},
+        {"knowledge_base_ids": ["not-valid"]},
+        {
+            "knowledge_base_id": "default",
+            "knowledge_base_ids": ["default"],
+        },
+    ],
+)
+def test_plural_query_rejects_invalid_selection(client, selection):
+    response = client.post(
+        "/ask",
+        json={"query": "Domanda valida?", **selection},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["status"] == "invalid_knowledge_base_selection"
+
+
+def test_plural_conversation_namespace_survives_selection_changes(
+    client,
+    monkeypatch,
+):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    conversation_ids = []
+
+    def fake_query(_query, **kwargs):
+        conversation_ids.append(kwargs["conversation_id"])
+        return {"answer": "ok", "context": [], "sources": []}
+
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query)
+    secondary = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Stable memory"},
+    ).get_json()
+    base_payload = {
+        "query": "Domanda valida?",
+        "conversation_id": "conv-stable-1234",
+    }
+
+    first = client.post(
+        "/ask",
+        json={
+            **base_payload,
+            "knowledge_base_ids": ["default", secondary["id"]],
+        },
+    )
+    second = client.post(
+        "/ask",
+        json={
+            **base_payload,
+            "knowledge_base_ids": [secondary["id"]],
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert conversation_ids[0] == conversation_ids[1]
+    assert ":multi-chat:" in conversation_ids[0]
+
+
+def test_plural_query_uses_an_authorized_atomic_conversation_snapshot(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    secondary = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Secret concurrent memory"},
+    ).get_json()
+    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store.create_api_key(
+        user_id=flask_app.config["TEST_USER_ID"],
+        name="snapshot-reader",
+        scopes=["query"],
+        knowledge_base_ids=["default"],
+        api_key_value="snapshot-reader-key",
+    )
+    user = user_store.get(flask_app.config["TEST_USER_ID"])
+    workspace = workspace_for_user(user, app=flask_app)
+    raw_conversation_id = "conv-snapshot-1234"
+    scoped_conversation_id = (
+        f"{workspace.workspace_id}:multi-chat:{raw_conversation_id}"
+    )
+    reset_conversation_store()
+    store = get_conversation_store()
+    store.append_turn(
+        scoped_conversation_id,
+        user="Domanda autorizzata",
+        assistant="Contesto autorizzato",
+        knowledge_base_ids=["default"],
+    )
+
+    def fake_query(_query, **kwargs):
+        store.append_turn(
+            kwargs["conversation_id"],
+            user="Domanda concorrente segreta",
+            assistant="SEGRETO KB B",
+            knowledge_base_ids=[secondary["id"]],
+        )
+        assert "SEGRETO KB B" in store.render_for_prompt(
+            kwargs["conversation_id"]
+        )
+        return {
+            "answer": kwargs["conversation_prompt_context"],
+            "context": [],
+            "sources": [],
+        }
+
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query)
+    response = flask_app.test_client().post(
+        "/api/v1/query",
+        headers={"X-API-Key": "snapshot-reader-key"},
+        json={
+            "query": "Usa soltanto lo snapshot autorizzato",
+            "conversation_id": raw_conversation_id,
+            "knowledge_base_ids": ["default"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Contesto autorizzato" in response.get_json()["answer"]
+    assert "SEGRETO KB B" not in response.get_json()["answer"]
+
+
+def test_unauthorized_remembered_kb_clears_an_unchanged_conversation(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    secondary = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Revoked conversation KB"},
+    ).get_json()
+    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store.create_api_key(
+        user_id=flask_app.config["TEST_USER_ID"],
+        name="revoked-memory-reader",
+        scopes=["query"],
+        knowledge_base_ids=["default"],
+        api_key_value="revoked-memory-reader-key",
+    )
+    user = user_store.get(flask_app.config["TEST_USER_ID"])
+    workspace = workspace_for_user(user, app=flask_app)
+    raw_conversation_id = "conv-revoked-clear-1234"
+    scoped_conversation_id = (
+        f"{workspace.workspace_id}:multi-chat:{raw_conversation_id}"
+    )
+    reset_conversation_store()
+    store = get_conversation_store()
+    store.append_turn(
+        scoped_conversation_id,
+        user="Domanda ormai non autorizzata",
+        assistant="Contesto ormai non autorizzato",
+        knowledge_base_ids=[secondary["id"]],
+    )
+    captured = {}
+
+    def fake_query(_query, **kwargs):
+        captured.update(kwargs)
+        return {"answer": "ok", "context": [], "sources": []}
+
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query)
+    response = flask_app.test_client().post(
+        "/api/v1/query",
+        headers={"X-API-Key": "revoked-memory-reader-key"},
+        json={
+            "query": "Riparti dalla KB autorizzata",
+            "conversation_id": raw_conversation_id,
+            "knowledge_base_ids": ["default"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["conversation_prompt_context"] == ""
+    assert captured["conversation_retrieval_context"] == ""
+    assert store.render_for_prompt(scoped_conversation_id) == ""
+
+
+def test_unauthorized_remembered_kb_does_not_clear_a_concurrent_append(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    rag_engine = importlib.import_module("utils.rag_engine")
+    secondary = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Revoked concurrent KB"},
+    ).get_json()
+    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store.create_api_key(
+        user_id=flask_app.config["TEST_USER_ID"],
+        name="concurrent-memory-reader",
+        scopes=["query"],
+        knowledge_base_ids=["default"],
+        api_key_value="concurrent-memory-reader-key",
+    )
+    user = user_store.get(flask_app.config["TEST_USER_ID"])
+    workspace = workspace_for_user(user, app=flask_app)
+    raw_conversation_id = "conv-revoked-race-1234"
+    scoped_conversation_id = (
+        f"{workspace.workspace_id}:multi-chat:{raw_conversation_id}"
+    )
+    reset_conversation_store()
+    store = get_conversation_store()
+    store.append_turn(
+        scoped_conversation_id,
+        user="Domanda ormai non autorizzata",
+        assistant="Contesto ormai non autorizzato",
+        knowledge_base_ids=[secondary["id"]],
+    )
+    original_snapshot = store.snapshot
+
+    def snapshot_then_append(conversation_id):
+        snapshot = original_snapshot(conversation_id)
+        store.append_turn(
+            conversation_id,
+            user="Domanda concorrente autorizzata",
+            assistant="AGGIORNAMENTO CONCORRENTE",
+            knowledge_base_ids=["default"],
+        )
+        return snapshot
+
+    captured = {}
+
+    def fake_query(_query, **kwargs):
+        captured.update(kwargs)
+        return {"answer": "ok", "context": [], "sources": []}
+
+    monkeypatch.setattr(store, "snapshot", snapshot_then_append)
+    monkeypatch.setattr(rag_engine, "query_rag", fake_query)
+    response = flask_app.test_client().post(
+        "/api/v1/query",
+        headers={"X-API-Key": "concurrent-memory-reader-key"},
+        json={
+            "query": "Non cancellare il turno concorrente",
+            "conversation_id": raw_conversation_id,
+            "knowledge_base_ids": ["default"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["conversation_prompt_context"] == ""
+    assert captured["conversation_retrieval_context"] == ""
+    assert "AGGIORNAMENTO CONCORRENTE" in store.render_for_prompt(
+        scoped_conversation_id
+    )
+
+
+@pytest.mark.parametrize(
+    "query_string",
+    [
+        "knowledge_base_ids=default&knowledge_base_ids=default",
+        "knowledge_base_ids=not-valid",
+        "knowledge_base_id=default&knowledge_base_ids=default",
+    ],
+)
+def test_plural_conversation_clear_rejects_invalid_selection(
+    client,
+    query_string,
+):
+    response = client.delete(
+        f"/conversation/clear-invalid-1234?{query_string}"
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.get_json()["status"]
+        == "invalid_knowledge_base_selection"
+    )
+
+
+def test_public_plural_conversation_clear_rejects_invalid_selection(
+    flask_app,
+):
+    UserStore(flask_app.config["USERS_FILE"]).create_api_key(
+        user_id=flask_app.config["TEST_USER_ID"],
+        name="clear-reader",
+        scopes=["query"],
+        knowledge_base_ids=["default"],
+        api_key_value="clear-reader-key",
+    )
+
+    response = flask_app.test_client().delete(
+        "/api/v1/conversations/clear-invalid-1234"
+        "?knowledge_base_ids=default&knowledge_base_ids=default",
+        headers={"X-API-Key": "clear-reader-key"},
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.get_json()["status"]
+        == "invalid_knowledge_base_selection"
+    )
+
+
 def test_shared_ocr_and_transcription_ignore_the_selected_kb(
     client,
     monkeypatch,
@@ -1095,6 +1538,7 @@ def test_code_interpreter_stream_preserves_kb_unavailable_errors(
         "error": "Knowledge base in eliminazione",
         "status": "knowledge_base_deleting",
         "knowledge_base_id": knowledge_base_id,
+        "knowledge_base_ids": [knowledge_base_id],
     }
 
 
@@ -1280,6 +1724,55 @@ def test_collection_cache_invalidation_does_not_clear_other_kbs(monkeypatch):
         assert cache.clear_collection("documents_a") == 1
         assert cache.get("documents_a\nquestion", k=1, model="test") is None
         assert cache.get("documents_b\nquestion", k=1, model="test") == ["b"]
+    finally:
+        RAGCache.reset()
+
+
+def test_collection_cache_invalidation_clears_federated_sets_only_when_used(
+    monkeypatch,
+):
+    from app.utils.cache import RAGCache
+
+    RAGCache.reset()
+    cache = RAGCache()
+    monkeypatch.setattr(
+        cache,
+        "_get_config",
+        lambda: {
+            "enable_cache": True,
+            "query_k": 4,
+            "default_model": "test",
+            "cache_ttl": 60,
+        },
+    )
+    try:
+        cache.set(
+            "multi-v2:documents_a|documents_b\nquestion",
+            ["ab"],
+            k=1,
+            model="test",
+        )
+        cache.set(
+            "multi-v2:documents_b|documents_c\nquestion",
+            ["bc"],
+            k=1,
+            model="test",
+        )
+
+        assert cache.clear_collection("documents_a") == 1
+        assert (
+            cache.get(
+                "multi-v2:documents_a|documents_b\nquestion",
+                k=1,
+                model="test",
+            )
+            is None
+        )
+        assert cache.get(
+            "multi-v2:documents_b|documents_c\nquestion",
+            k=1,
+            model="test",
+        ) == ["bc"]
     finally:
         RAGCache.reset()
 

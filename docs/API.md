@@ -120,11 +120,14 @@ initiating API key can continue polling with `kb_manage` after target cleanup
 removes that knowledge base from its allowlist. Other keys cannot poll that
 deletion job, even when they have `kb_manage` in the same workspace.
 
-Existing operations accept `knowledge_base_id` in the JSON query body, as a
-multipart field for file/audio uploads, and as a query parameter for health,
-conversation clear, and file delete. Jobs freeze the target at creation.
-Omitted or null means `default`; malformed IDs return 400; missing or
-unauthorized IDs return 404 without fallback.
+Query operations use `knowledge_base_ids` in the JSON body to select up to
+`RAG_MAX_QUERY_KNOWLEDGE_BASES` active KBs (default 5). Ingestion and
+administrative operations remain single-KB and accept `knowledge_base_id`.
+Conversation clear accepts repeated `knowledge_base_ids` query parameters.
+Jobs freeze the target at creation.
+For query operations, omitting the selector means `["default"]`; an explicitly
+null or empty selector is invalid and returns 400. Malformed IDs return 400;
+missing or unauthorized IDs return 404 without fallback.
 
 ### Request
 
@@ -260,9 +263,11 @@ Use `provider` and `id` in queries. `value` is a compact form useful for UI sele
 
 ## POST /api/v1/query
 
-Queries the RAG using indexed documents.
+Queries the RAG using documents from one or more knowledge bases.
 
-The query runs only against the Chroma collection and FileIndex of the workspace resolved by `X-API-Key`.
+The service validates the entire selection, embeds the question once, retrieves
+from each collection concurrently, deduplicates identical chunks, and performs
+one global ranking. A failure or unauthorized KB fails the whole request.
 
 ### Request JSON
 
@@ -272,7 +277,7 @@ The query runs only against the Chroma collection and FileIndex of the workspace
 | `provider` | string | no | runtime configuration | Must exist in registry |
 | `model` | string | no | default model | Must belong to provider |
 | `conversation_id` | string | no | stateless | 8-80 characters; if present enables conversational memory |
-| `knowledge_base_id` | string | no | `default` | `default` or an authorized opaque `kb_...` ID |
+| `knowledge_base_ids` | string[] | no | `["default"]` | 1 to `RAG_MAX_QUERY_KNOWLEDGE_BASES` unique, authorized active KB IDs; discover the runtime value from `GET /api/v1/knowledge-bases` |
 | `system_prompt_id` | string | no | active/default prompt | ID of a saved system prompt |
 | `client_context` | object | no | none | Safe site/page metadata used only in the prompt |
 | `response_language` | string | no | `auto` | `auto` answers in the question language; `it` forces Italian; `en` forces English |
@@ -300,7 +305,10 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
     "provider": "mistral",
     "model": "mistral-medium",
     "conversation_id": "chat-20260616-demo",
-    "knowledge_base_id": "kb_11111111111111111111111111111111",
+    "knowledge_base_ids": [
+      "default",
+      "kb_11111111111111111111111111111111"
+    ],
     "system_prompt_id": "support",
     "response_language": "auto",
     "client_context": {
@@ -325,7 +333,10 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
   "provider": "mistral",
   "provider_name": "Mistral AI",
   "conversation_id": "chat-20260616-demo",
-  "knowledge_base_id": "kb_11111111111111111111111111111111",
+  "knowledge_base_ids": [
+    "default",
+    "kb_11111111111111111111111111111111"
+  ],
   "response_language": "auto",
   "context": [
     {
@@ -333,6 +344,15 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
       "metadata": {
         "source": "app/uploads/workspaces/user_123/demo.pdf",
         "chunk_id": 0,
+        "knowledge_base_id": "default",
+        "knowledge_base_name": "General",
+        "knowledge_base_origins": [
+          {
+            "knowledge_base_id": "default",
+            "knowledge_base_name": "General",
+            "source": "app/uploads/workspaces/user_123/demo.pdf"
+          }
+        ],
         "chunk_length": 924
       }
     }
@@ -383,10 +403,10 @@ curl -N -X POST http://127.0.0.1:5000/api/v1/query \
 The response is `application/x-ndjson`: one JSON line per event.
 
 ```json
-{"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_id":"default"}
+{"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_ids":["default"],"knowledge_base_id":"default"}
 {"type":"token","text":"Progressive "}
 {"type":"token","text":"response..."}
-{"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_id":"default","context":[],"sources":[],"usage":null}
+{"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_ids":["default"],"knowledge_base_id":"default","context":[],"sources":[],"usage":null}
 ```
 
 In case of error during streaming, the server sends an event:
@@ -398,9 +418,12 @@ In case of error during streaming, the server sends an event:
 ## DELETE /api/v1/conversations/{conversation_id}
 
 Deletes the conversational memory associated with a `conversation_id`.
+Repeat `knowledge_base_ids` once for every KB in the plural selection. A
+missing or unauthorized KB returns 404; a KB being deleted or in
+`delete_failed` returns 409.
 
 ```bash
-curl -X DELETE 'http://127.0.0.1:5000/api/v1/conversations/chat-20260616-demo?knowledge_base_id=kb_11111111111111111111111111111111' \
+curl -X DELETE 'http://127.0.0.1:5000/api/v1/conversations/chat-20260616-demo?knowledge_base_ids=default&knowledge_base_ids=kb_11111111111111111111111111111111' \
   -H "X-API-Key: $RAG_API_KEY"
 ```
 
@@ -410,7 +433,10 @@ Response:
 {
   "conversation_id": "chat-20260616-demo",
   "cleared": true,
-  "knowledge_base_id": "kb_11111111111111111111111111111111"
+  "knowledge_base_ids": [
+    "default",
+    "kb_11111111111111111111111111111111"
+  ]
 }
 ```
 

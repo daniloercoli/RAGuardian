@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+from langchain_core.documents import Document
+
 from app.utils import rag_engine
 from app.utils.conversation_memory import get_conversation_store, reset_conversation_store
 from app.utils.file_index import FileIndex
@@ -161,6 +164,165 @@ def test_query_rag_stream_events_uses_conversation_memory(monkeypatch):
     assert events[-1]["conversation_id"] == conversation_id
     assert "Risposta contestuale" in get_conversation_store().render_for_prompt(conversation_id)
     reset_conversation_store()
+
+
+def test_query_rag_stream_events_uses_frozen_conversation_context(
+    monkeypatch,
+):
+    reset_conversation_store()
+    conversation_id = "conv-frozen-12345678"
+    get_conversation_store().append_turn(
+        conversation_id,
+        user="Domanda live",
+        assistant="SEGRETO AGGIUNTO DOPO LO SNAPSHOT",
+    )
+    settings = {
+        "rag": {
+            "query_k": 5,
+            "temperature": 0.2,
+            "enable_cache": False,
+        }
+    }
+    captured = {}
+    monkeypatch.setattr(
+        rag_engine,
+        "_load_settings",
+        lambda settings_path=None: settings,
+    )
+    monkeypatch.setattr(
+        rag_engine.ProviderFactory,
+        "resolve",
+        staticmethod(
+            lambda model=None, provider=None, settings=None: (
+                "mistral",
+                "mistral-medium",
+                {"name": "Mistral"},
+            )
+        ),
+    )
+
+    def fake_get_context(query, *args, **kwargs):
+        captured["retrieval_query"] = query
+        return []
+
+    def fake_generate_response(query, context_docs, **kwargs):
+        captured["conversation_context"] = kwargs["conversation_context"]
+        return iter(["Risposta"])
+
+    monkeypatch.setattr(rag_engine, "_get_context", fake_get_context)
+    monkeypatch.setattr(
+        rag_engine,
+        "generate_response",
+        fake_generate_response,
+    )
+
+    list(
+        query_rag_stream_events(
+            "Domanda corrente",
+            model="mistral-medium",
+            provider="mistral",
+            conversation_id=conversation_id,
+            conversation_prompt_context="SNAPSHOT PROMPT AUTORIZZATO",
+            conversation_retrieval_context=(
+                "SNAPSHOT RETRIEVAL AUTORIZZATO"
+            ),
+        )
+    )
+
+    assert captured["conversation_context"] == (
+        "SNAPSHOT PROMPT AUTORIZZATO"
+    )
+    assert "SNAPSHOT RETRIEVAL AUTORIZZATO" in captured[
+        "retrieval_query"
+    ]
+    assert "SEGRETO AGGIUNTO" not in captured["retrieval_query"]
+    reset_conversation_store()
+
+
+def test_conversation_append_checks_lease_before_mutating(monkeypatch):
+    calls = []
+
+    class FakeStore:
+        def append_turn(self, *_args, **_kwargs):
+            calls.append("append")
+
+    monkeypatch.setattr(
+        rag_engine,
+        "get_conversation_store",
+        lambda: FakeStore(),
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "assert_distributed_locks_healthy",
+        lambda: (_ for _ in ()).throw(RuntimeError("lease lost")),
+    )
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        rag_engine._append_conversation_turn(
+            "conv-lease-12345678",
+            query="Domanda",
+            answer="Risposta",
+            provider="fake",
+            model="fake-model",
+            temperature=0.2,
+            settings={},
+            knowledge_base_ids=["default"],
+        )
+
+    assert calls == []
+
+
+def test_conversation_summary_checks_lease_before_apply(monkeypatch):
+    calls = []
+    checks = 0
+    summary_job = SimpleNamespace()
+
+    class FakeStore:
+        def append_turn(self, *_args, **_kwargs):
+            calls.append("append")
+            return summary_job
+
+        def apply_summary(self, *_args, **_kwargs):
+            calls.append("apply")
+
+    def check_lease():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("lease lost before summary apply")
+
+    monkeypatch.setattr(
+        rag_engine,
+        "get_conversation_store",
+        lambda: FakeStore(),
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "assert_distributed_locks_healthy",
+        check_lease,
+    )
+    monkeypatch.setattr(
+        rag_engine,
+        "_summarize_conversation",
+        lambda *_args, **_kwargs: "Riassunto",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="lease lost before summary apply",
+    ):
+        rag_engine._append_conversation_turn(
+            "conv-summary-12345678",
+            query="Domanda",
+            answer="Risposta",
+            provider="fake",
+            model="fake-model",
+            temperature=0.2,
+            settings={},
+            knowledge_base_ids=["default"],
+        )
+
+    assert calls == ["append"]
 
 
 def test_context_cache_is_namespaced_by_conversation_id(monkeypatch):
@@ -354,3 +516,315 @@ def test_get_context_defaults_diversity_mode_off(monkeypatch):
 
     assert rag_engine._get_context("domanda", 4, "model", settings, use_cache=False) == ["doc"]
     assert captured["diversity_mode"] == "none"
+
+
+def test_federated_context_embeds_once_deduplicates_and_preserves_origins(
+    monkeypatch,
+):
+    calls = {"embeddings": 0, "collections": []}
+
+    class FakeEmbeddingProvider:
+        def encode_query(self, query):
+            calls["embeddings"] += 1
+            assert query == "domanda federata"
+            return [1.0, 0.0]
+
+    def fake_query(query_embedding, *, k, collection_name, include_embeddings):
+        assert query_embedding == [1.0, 0.0]
+        assert k == 3
+        calls["collections"].append(collection_name)
+        if collection_name == "collection-a":
+            return (
+                [
+                    Document(
+                        page_content="Documento condiviso",
+                        metadata={"source": "/a/shared.pdf", "chunk_id": 1},
+                    ),
+                    Document(
+                        page_content="Solo A",
+                        metadata={"source": "/a/only.pdf", "chunk_id": 2},
+                    ),
+                ],
+                [],
+            )
+        return (
+            [
+                Document(
+                    page_content="  Documento   condiviso ",
+                    metadata={"source": "/b/shared.pdf", "chunk_id": 4},
+                ),
+                Document(
+                    page_content="Solo B",
+                    metadata={"source": "/b/only.pdf", "chunk_id": 5},
+                ),
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(
+        rag_engine.EmbeddingFactory,
+        "get_provider",
+        staticmethod(lambda: FakeEmbeddingProvider()),
+    )
+    monkeypatch.setattr(rag_engine, "query_chroma_by_embedding", fake_query)
+    settings = {
+        "rag": {
+            "enable_cache": False,
+            "reranker_enabled": False,
+        }
+    }
+    targets = [
+        {
+            "knowledge_base_id": "default",
+            "knowledge_base_name": "General",
+            "collection_name": "collection-a",
+        },
+        {
+            "knowledge_base_id": "kb_b",
+            "knowledge_base_name": "Legal",
+            "collection_name": "collection-b",
+        },
+    ]
+
+    result = rag_engine._get_context(
+        "domanda federata",
+        3,
+        "model",
+        settings,
+        use_cache=False,
+        knowledge_base_targets=targets,
+    )
+
+    assert calls["embeddings"] == 1
+    assert sorted(calls["collections"]) == ["collection-a", "collection-b"]
+    assert len(result) == 3
+    shared = next(doc for doc in result if "condiviso" in doc.page_content)
+    assert len(shared.metadata["knowledge_base_origins"]) == 2
+    assert shared.metadata["rrf_score"] == pytest.approx(2 / 61)
+    assert {
+        origin["knowledge_base_id"]
+        for origin in shared.metadata["knowledge_base_origins"]
+    } == {"default", "kb_b"}
+    assert {
+        origin["local_rank"]
+        for origin in shared.metadata["knowledge_base_origins"]
+    } == {1}
+
+
+def test_federated_context_treats_zero_chroma_score_as_a_real_score(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rag_engine.EmbeddingFactory,
+        "get_provider",
+        staticmethod(
+            lambda: SimpleNamespace(encode_query=lambda _query: [1.0, 0.0])
+        ),
+    )
+
+    def fake_query(_embedding, *, collection_name, **_kwargs):
+        score = 0.0 if collection_name == "exact" else -0.2
+        return [
+            Document(
+                page_content=f"Content {collection_name}",
+                metadata={
+                    "source": f"/{collection_name}.pdf",
+                    "chroma_score": score,
+                },
+            )
+        ], []
+
+    monkeypatch.setattr(rag_engine, "query_chroma_by_embedding", fake_query)
+
+    result = rag_engine._get_context(
+        "domanda",
+        1,
+        "model",
+        {"rag": {"enable_cache": False, "reranker_enabled": False}},
+        use_cache=False,
+        knowledge_base_targets=[
+            {
+                "knowledge_base_id": "kb_exact",
+                "knowledge_base_name": "Exact",
+                "collection_name": "exact",
+            },
+            {
+                "knowledge_base_id": "kb_worse",
+                "knowledge_base_name": "Worse",
+                "collection_name": "worse",
+            },
+        ],
+    )
+
+    assert [doc.metadata["knowledge_base_id"] for doc in result] == ["kb_exact"]
+
+
+def test_federated_context_counts_each_kb_once_for_rrf_deduplication(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rag_engine.EmbeddingFactory,
+        "get_provider",
+        staticmethod(
+            lambda: SimpleNamespace(encode_query=lambda _query: [1.0, 0.0])
+        ),
+    )
+
+    def fake_query(_embedding, *, collection_name, **_kwargs):
+        if collection_name == "duplicated":
+            return [
+                Document(
+                    page_content="Repeated content",
+                    metadata={
+                        "source": "/duplicated/one.pdf",
+                        "chunk_id": 1,
+                        "chroma_score": -0.3,
+                    },
+                ),
+                Document(
+                    page_content="  Repeated   content ",
+                    metadata={
+                        "source": "/duplicated/two.pdf",
+                        "chunk_id": 2,
+                        "chroma_score": -0.4,
+                    },
+                ),
+            ], []
+        return [
+            Document(
+                page_content="Unique content",
+                metadata={
+                    "source": "/unique.pdf",
+                    "chunk_id": 1,
+                    "chroma_score": -0.1,
+                },
+            )
+        ], []
+
+    monkeypatch.setattr(rag_engine, "query_chroma_by_embedding", fake_query)
+
+    result = rag_engine._get_context(
+        "domanda",
+        2,
+        "model",
+        {"rag": {"enable_cache": False, "reranker_enabled": False}},
+        use_cache=False,
+        knowledge_base_targets=[
+            {
+                "knowledge_base_id": "kb_duplicated",
+                "knowledge_base_name": "Duplicated",
+                "collection_name": "duplicated",
+            },
+            {
+                "knowledge_base_id": "kb_unique",
+                "knowledge_base_name": "Unique",
+                "collection_name": "unique",
+            },
+        ],
+    )
+
+    repeated = next(doc for doc in result if "Repeated" in doc.page_content)
+    assert repeated.metadata["rrf_score"] == pytest.approx(1 / 61)
+    assert len(repeated.metadata["knowledge_base_origins"]) == 2
+    assert result[0].metadata["knowledge_base_id"] == "kb_unique"
+
+
+def test_federated_context_fails_whole_query_on_collection_error(monkeypatch):
+    monkeypatch.setattr(
+        rag_engine.EmbeddingFactory,
+        "get_provider",
+        staticmethod(
+            lambda: SimpleNamespace(encode_query=lambda _query: [1.0, 0.0])
+        ),
+    )
+
+    def fake_query(_embedding, *, collection_name, **_kwargs):
+        if collection_name == "broken":
+            raise RuntimeError("collection unavailable")
+        return [], []
+
+    monkeypatch.setattr(rag_engine, "query_chroma_by_embedding", fake_query)
+
+    with pytest.raises(RuntimeError, match="collection unavailable"):
+        rag_engine._get_context(
+            "domanda",
+            3,
+            "model",
+            {"rag": {"enable_cache": False, "reranker_enabled": False}},
+            use_cache=False,
+            knowledge_base_targets=[
+                {
+                    "knowledge_base_id": "default",
+                    "knowledge_base_name": "General",
+                    "collection_name": "healthy",
+                },
+                {
+                    "knowledge_base_id": "kb_b",
+                    "knowledge_base_name": "Broken",
+                    "collection_name": "broken",
+                },
+            ],
+        )
+
+
+def test_federated_context_invokes_global_reranker_once(monkeypatch):
+    monkeypatch.setattr(
+        rag_engine.EmbeddingFactory,
+        "get_provider",
+        staticmethod(
+            lambda: SimpleNamespace(encode_query=lambda _query: [1.0, 0.0])
+        ),
+    )
+
+    def fake_query(_embedding, *, collection_name, **_kwargs):
+        return [
+            Document(
+                page_content=f"Content {collection_name}",
+                metadata={"source": f"/{collection_name}.pdf"},
+            )
+        ], []
+
+    calls = []
+
+    class FakeReranker:
+        def rerank(self, query, docs, top_n):
+            calls.append((query, len(docs), top_n))
+            return docs[:top_n]
+
+    monkeypatch.setattr(rag_engine, "query_chroma_by_embedding", fake_query)
+    monkeypatch.setattr(
+        rag_engine,
+        "_resolve_reranker",
+        lambda _settings: FakeReranker(),
+    )
+    targets = [
+        {
+            "knowledge_base_id": "default",
+            "knowledge_base_name": "General",
+            "collection_name": "a",
+        },
+        {
+            "knowledge_base_id": "kb_b",
+            "knowledge_base_name": "Legal",
+            "collection_name": "b",
+        },
+    ]
+
+    result = rag_engine._get_context(
+        "domanda",
+        2,
+        "model",
+        {
+            "rag": {
+                "enable_cache": False,
+                "reranker_enabled": True,
+                "reranker_top_n": 10,
+                "reranker_diversity_mode": "none",
+            }
+        },
+        use_cache=False,
+        knowledge_base_targets=targets,
+    )
+
+    assert len(result) == 2
+    assert calls == [("domanda", 2, 2)]

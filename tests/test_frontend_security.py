@@ -28,6 +28,12 @@ def test_chat_markdown_is_sanitized_before_dom_insert():
     assert "demo-readiness" not in template
     assert "data-prompt" in template
     assert "loadHealth()" not in script
+    assert "knowledge_base_ids: [...knowledgeBaseIds]" in script
+    assert 'const knowledgeBaseStorageKey = "ragKnowledgeBaseIds"' in script
+    assert "kbPickerPopover" in script
+    assert "appendKnowledgeBaseNotice" in script
+    assert 'aria-haspopup="dialog"' in template
+    assert 'id="kbChips"' in template
 
 
 def test_chat_ask_button_recovers_from_stalled_streams():
@@ -41,6 +47,25 @@ def test_chat_ask_button_recovers_from_stalled_streams():
     assert "renderCodeInterpreterStream(response, messageDiv, askTimeout)" in script
     assert script.count("reader.cancel().catch") >= 2
     assert "formatConnectionError" in script
+
+
+def test_multi_kb_chat_fails_closed_and_waits_for_recovery():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert "function renderSafeMarkdown(value)" in script
+    assert "if (!window.marked || !window.DOMPurify)" in script
+    assert "return escapeHtml(text)" in script
+    assert script.count("DOMPurify.sanitize") == 1
+    assert "messageDiv.innerHTML = renderSafeMarkdown(content)" in script
+    assert "messageDiv.innerHTML = renderSafeMarkdown(answerText)" in script
+    assert script.count(
+        "state.recoveryPromise = handleUnavailableKnowledgeBase("
+    ) == 2
+    assert script.count("await waitForKnowledgeBaseRecovery(state)") >= 4
+    assert "clearChatButton.disabled = isBusy" in script
+    assert "function clearChat() {\n        if (busy) return;" in script
+    assert "function normalizeKnowledgeBaseIds(values)" in script
+    assert "focusKnowledgeBaseControlAfterRemoval(index)" in script
 
 
 def test_templates_include_browser_icons():

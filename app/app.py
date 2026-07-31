@@ -22,6 +22,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    stream_with_context,
     url_for,
 )
 from werkzeug.utils import secure_filename
@@ -149,6 +150,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["WORKSPACE_DATA_DIR"] = os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
     app.config["WORKSPACE_UPLOAD_DIR"] = os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces")
     app.config["MAX_KNOWLEDGE_BASES"] = int(os.getenv("RAG_MAX_KNOWLEDGE_BASES", "20"))
+    app.config["MAX_QUERY_KNOWLEDGE_BASES"] = max(
+        1,
+        int(os.getenv("RAG_MAX_QUERY_KNOWLEDGE_BASES", "5")),
+    )
     app.config["SECRET_KEY"] = Config.api_keys.flask_secret_key or os.getenv("FLASK_SECRET_KEY") or "dev-secret"
     app.config["RAG_SECRET_KEY"] = os.getenv("RAG_SECRET_KEY") or app.config["SECRET_KEY"]
     app.config["MAX_UPLOAD_SIZE_MB"] = Config.paths.max_upload_size_mb
@@ -410,18 +415,27 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     def conversation_clear(conversation_id):
         conversation_id = validate_conversation_id(conversation_id, required=True)
         from utils.conversation_memory import get_conversation_store
-        from utils.index_lock import lifecycle_read_lock
+        from utils.index_lock import lifecycle_read_locks
 
-        config = _workspace_config(app)
-        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-            _raise_if_knowledge_base_became_unavailable(config)
+        try:
+            configs, plural_request = _conversation_clear_configs(app)
+        except ValidationError as exc:
+            return jsonify(exc.to_dict()), 400
+        with lifecycle_read_locks(
+            config["CHROMA_COLLECTION"] for config in configs
+        ):
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
             cleared = get_conversation_store().clear(
-                _scoped_conversation_id(conversation_id, config)
+                _query_scoped_conversation_id(
+                    conversation_id,
+                    configs[0],
+                    plural_request=plural_request,
+                )
             )
         payload = {
             "conversation_id": conversation_id,
             "cleared": cleared,
-            "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+            **_query_knowledge_base_response_fields(configs),
         }
         return jsonify(payload)
 
@@ -478,7 +492,9 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             if payload.get("use_code_interpreter") and payload.get("attached_files"):
                 if payload["stream"] and payload["stream_format"] == "ndjson":
                     return Response(
-                        run_code_interpreter_query_events(payload),
+                        stream_with_context(
+                            run_code_interpreter_query_events(payload)
+                        ),
                         mimetype="application/x-ndjson",
                     )
                 return jsonify(run_code_interpreter_query(payload))
@@ -495,7 +511,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
                     stream,
                     mimetype="text/plain",
                 )
-                response.headers["X-Knowledge-Base-Id"] = payload["knowledge_base_id"]
+                _set_query_knowledge_base_headers(response, payload)
                 return response
 
             result = run_rag_query(payload, stream=False)
@@ -949,7 +965,7 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
                     stream,
                     mimetype="text/plain",
                 )
-                response.headers["X-Knowledge-Base-Id"] = payload["knowledge_base_id"]
+                _set_query_knowledge_base_headers(response, payload)
                 return response
             return jsonify(run_rag_query(payload, stream=False, public=True))
         except ValidationError as e:
@@ -1052,18 +1068,27 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     def api_conversation_clear(conversation_id):
         conversation_id = validate_conversation_id(conversation_id, required=True)
         from utils.conversation_memory import get_conversation_store
-        from utils.index_lock import lifecycle_read_lock
+        from utils.index_lock import lifecycle_read_locks
 
-        config = _workspace_config(app)
-        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-            _raise_if_knowledge_base_became_unavailable(config)
+        try:
+            configs, plural_request = _conversation_clear_configs(app)
+        except ValidationError as exc:
+            return jsonify(exc.to_dict()), 400
+        with lifecycle_read_locks(
+            config["CHROMA_COLLECTION"] for config in configs
+        ):
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
             cleared = get_conversation_store().clear(
-                _scoped_conversation_id(conversation_id, config)
+                _query_scoped_conversation_id(
+                    conversation_id,
+                    configs[0],
+                    plural_request=plural_request,
+                )
             )
         return jsonify(
             conversation_id=conversation_id,
             cleared=cleared,
-            knowledge_base_id=config["KNOWLEDGE_BASE_ID"],
+            **_query_knowledge_base_response_fields(configs),
         )
 
     @app.route("/api/v1/files/<path:filename>", methods=["DELETE"])
@@ -1082,7 +1107,10 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
 
 
 def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
-    from utils.index_lock import lifecycle_read_lock
+    from utils.index_lock import (
+        assert_distributed_locks_healthy,
+        lifecycle_read_locks,
+    )
     from utils.rag_engine import query_rag
     from utils.metrics import get_metrics
 
@@ -1090,23 +1118,34 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
     metrics.begin_query()
     start = time.time()
     status = "success"
-    config = None
+    configs = ()
 
     try:
         _ensure_request_not_timed_out()
-        config = _workspace_config(
-            current_app,
-            payload.get("knowledge_base_id"),
-        )
+        selected_ids = _payload_query_knowledge_base_ids(payload)
+        configs = _query_configs_for_payload(current_app, payload)
+        primary = configs[0]
+        targets = _knowledge_base_query_targets(configs)
         raw_conversation_id = payload.get("conversation_id")
-        conversation_id = _scoped_conversation_id(raw_conversation_id, config)
+        conversation_id = _query_scoped_conversation_id(
+            raw_conversation_id,
+            primary,
+            plural_request=payload.get("knowledge_base_ids_explicit", False),
+        )
+        conversation_snapshot = _validate_conversation_knowledge_bases(
+            conversation_id,
+            configs,
+        )
         custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
-        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-            _raise_if_knowledge_base_became_unavailable(config)
+        with lifecycle_read_locks(
+            config["CHROMA_COLLECTION"] for config in configs
+        ):
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
+            assert_distributed_locks_healthy()
             _ensure_request_not_timed_out()
             extra_context_docs = _temporary_attachment_context_docs(
                 payload,
-                config,
+                primary,
             )
             result = query_rag(
                 payload["query"],
@@ -1115,9 +1154,17 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
                 stream=stream,
                 temperature=payload.get("temperature"),
                 k=payload.get("k"),
-                settings_path=config["SETTINGS_FILE"],
-                file_index_path=config["FILE_INDEX"],
-                collection_name=config["CHROMA_COLLECTION"],
+                settings_path=primary["SETTINGS_FILE"],
+                file_index_path=primary["FILE_INDEX"],
+                collection_name=primary["CHROMA_COLLECTION"],
+                knowledge_base_targets=targets,
+                conversation_knowledge_base_ids=selected_ids,
+                conversation_prompt_context=(
+                    conversation_snapshot.prompt_context
+                ),
+                conversation_retrieval_context=(
+                    conversation_snapshot.retrieval_context
+                ),
                 conversation_id=conversation_id,
                 client_context=payload.get("client_context"),
                 response_language=payload.get("response_language"),
@@ -1129,20 +1176,20 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             if isinstance(result, dict) and raw_conversation_id:
                 result["conversation_id"] = raw_conversation_id
             if isinstance(result, dict):
-                result["knowledge_base_id"] = config["KNOWLEDGE_BASE_ID"]
+                result.update(_query_knowledge_base_response_fields(configs))
                 _add_knowledge_base_to_download_urls(
                     result.get("context"),
-                    config["KNOWLEDGE_BASE_ID"],
+                    primary["KNOWLEDGE_BASE_ID"],
                 )
             elif stream:
-                result = _guard_stream_for_knowledge_base(result, config)
+                result = _guard_stream_for_knowledge_bases(result, configs)
             return result
     except RequestTimeoutExceeded:
         status = "timeout"
         raise
     except Exception:
         status = "error"
-        _raise_if_knowledge_base_became_unavailable(config)
+        _raise_if_query_knowledge_bases_became_unavailable(configs)
         raise
     finally:
         metrics.end_query()
@@ -1151,7 +1198,10 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
 
 
 def run_rag_query_events(payload: dict, public: bool = False):
-    from utils.index_lock import lifecycle_read_lock
+    from utils.index_lock import (
+        assert_distributed_locks_healthy,
+        lifecycle_read_locks,
+    )
     from utils.rag_engine import query_rag_stream_events
     from utils.metrics import get_metrics
 
@@ -1160,23 +1210,34 @@ def run_rag_query_events(payload: dict, public: bool = False):
     start = time.time()
     status = "success"
 
-    config = _workspace_config(
-        current_app,
-        payload.get("knowledge_base_id"),
-    )
+    selected_ids = _payload_query_knowledge_base_ids(payload)
+    configs = _query_configs_for_payload(current_app, payload)
+    primary = configs[0]
+    targets = _knowledge_base_query_targets(configs)
     _ensure_request_not_timed_out()
     raw_conversation_id = payload.get("conversation_id")
-    conversation_id = _scoped_conversation_id(raw_conversation_id, config)
+    conversation_id = _query_scoped_conversation_id(
+        raw_conversation_id,
+        primary,
+        plural_request=payload.get("knowledge_base_ids_explicit", False),
+    )
+    conversation_snapshot = _validate_conversation_knowledge_bases(
+        conversation_id,
+        configs,
+    )
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
 
     def encode_events():
         nonlocal status
         try:
-            with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-                _raise_if_knowledge_base_became_unavailable(config)
+            with lifecycle_read_locks(
+                config["CHROMA_COLLECTION"] for config in configs
+            ):
+                _raise_if_query_knowledge_bases_became_unavailable(configs)
+                assert_distributed_locks_healthy()
                 extra_context_docs = _temporary_attachment_context_docs(
                     payload,
-                    config,
+                    primary,
                 )
                 _ensure_request_not_timed_out()
                 events = query_rag_stream_events(
@@ -1185,9 +1246,17 @@ def run_rag_query_events(payload: dict, public: bool = False):
                     provider=payload.get("provider"),
                     temperature=payload.get("temperature"),
                     k=payload.get("k"),
-                    settings_path=config["SETTINGS_FILE"],
-                    file_index_path=config["FILE_INDEX"],
-                    collection_name=config["CHROMA_COLLECTION"],
+                    settings_path=primary["SETTINGS_FILE"],
+                    file_index_path=primary["FILE_INDEX"],
+                    collection_name=primary["CHROMA_COLLECTION"],
+                    knowledge_base_targets=targets,
+                    conversation_knowledge_base_ids=selected_ids,
+                    conversation_prompt_context=(
+                        conversation_snapshot.prompt_context
+                    ),
+                    conversation_retrieval_context=(
+                        conversation_snapshot.retrieval_context
+                    ),
                     conversation_id=conversation_id,
                     client_context=payload.get("client_context"),
                     response_language=payload.get("response_language"),
@@ -1199,13 +1268,15 @@ def run_rag_query_events(payload: dict, public: bool = False):
                     _ensure_request_not_timed_out()
                     if isinstance(event, dict) and event.get("type") == "error":
                         try:
-                            _raise_if_knowledge_base_became_unavailable(config)
+                            _raise_if_query_knowledge_bases_became_unavailable(
+                                configs
+                            )
                         except KnowledgeBaseValidationError as exc:
                             event = {
                                 "type": "error",
                                 "error": exc.message,
                                 "status": exc.code,
-                                "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                                **_query_knowledge_base_response_fields(configs),
                             }
                     if (
                         isinstance(event, dict)
@@ -1213,11 +1284,11 @@ def run_rag_query_events(payload: dict, public: bool = False):
                     ):
                         event = {
                             **event,
-                            "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                            **_query_knowledge_base_response_fields(configs),
                         }
                         _add_knowledge_base_to_download_urls(
                             event.get("context"),
-                            config["KNOWLEDGE_BASE_ID"],
+                            primary["KNOWLEDGE_BASE_ID"],
                         )
                     if (
                         raw_conversation_id
@@ -1235,14 +1306,14 @@ def run_rag_query_events(payload: dict, public: bool = False):
         except Exception:
             status = "error"
             try:
-                _raise_if_knowledge_base_became_unavailable(config)
+                _raise_if_query_knowledge_bases_became_unavailable(configs)
             except KnowledgeBaseValidationError as exc:
                 yield json.dumps(
                     {
                         "type": "error",
                         "error": exc.message,
                         "status": exc.code,
-                        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+                        **_query_knowledge_base_response_fields(configs),
                     },
                     ensure_ascii=False,
                 ) + "\n"
@@ -1256,19 +1327,26 @@ def run_rag_query_events(payload: dict, public: bool = False):
     return encode_events()
 
 
-def _guard_stream_for_knowledge_base(stream, config: dict):
+def _guard_stream_for_knowledge_bases(stream, configs):
     def guarded():
-        from utils.index_lock import lifecycle_read_lock
+        from utils.index_lock import lifecycle_read_locks
 
         try:
-            with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-                _raise_if_knowledge_base_became_unavailable(config)
+            with lifecycle_read_locks(
+                config["CHROMA_COLLECTION"] for config in configs
+            ):
+                _raise_if_query_knowledge_bases_became_unavailable(configs)
                 yield from stream
         except Exception:
-            _raise_if_knowledge_base_became_unavailable(config)
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
             raise
 
     return guarded()
+
+
+def _guard_stream_for_knowledge_base(stream, config: dict):
+    """Backward-compatible single-KB stream guard."""
+    return _guard_stream_for_knowledge_bases(stream, (config,))
 
 
 def _prime_stream(stream):
@@ -1331,6 +1409,11 @@ def _raise_if_knowledge_base_became_unavailable(config: dict | None) -> None:
     )
 
 
+def _raise_if_query_knowledge_bases_became_unavailable(configs) -> None:
+    for config in configs or ():
+        _raise_if_knowledge_base_became_unavailable(config)
+
+
 def _temporary_attachment_context_docs(payload: dict, config: dict) -> list:
     """Build ephemeral RAG context for chat attachments when Python mode is off."""
     if payload.get("use_code_interpreter") or not payload.get("attached_files"):
@@ -1358,16 +1441,22 @@ def _add_knowledge_base_to_download_urls(
     for item in context_items:
         if not isinstance(item, dict) or not item.get("download_url"):
             continue
+        metadata = item.get("metadata")
+        item_knowledge_base_id = (
+            metadata.get("knowledge_base_id")
+            if isinstance(metadata, dict)
+            else None
+        ) or knowledge_base_id
         separator = "&" if "?" in item["download_url"] else "?"
         item["download_url"] = (
             f"{item['download_url']}{separator}"
-            f"knowledge_base_id={knowledge_base_id}"
+            f"knowledge_base_id={item_knowledge_base_id}"
         )
 
 
 def run_code_interpreter_query(payload: dict) -> dict:
     """Generate Python from query + RAG context, then execute it on attached files."""
-    from utils.index_lock import lifecycle_read_lock
+    from utils.index_lock import lifecycle_read_locks
     from utils.metrics import get_metrics
 
     metrics = get_metrics()
@@ -1375,14 +1464,16 @@ def run_code_interpreter_query(payload: dict) -> dict:
     start = time.time()
     status = "success"
     try:
-        config = _workspace_config(
-            current_app,
-            payload.get("knowledge_base_id"),
-        )
-        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-            _raise_if_knowledge_base_became_unavailable(config)
+        configs = _query_configs_for_payload(current_app, payload)
+        with lifecycle_read_locks(
+            config["CHROMA_COLLECTION"] for config in configs
+        ):
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
             _ensure_request_not_timed_out()
-            prepared = _prepare_code_interpreter_run(payload, config=config)
+            prepared = _prepare_code_interpreter_run(
+                payload,
+                configs=configs,
+            )
             _ensure_request_not_timed_out()
             code = _generate_code_for_interpreter(prepared)
             _ensure_request_not_timed_out()
@@ -1403,7 +1494,7 @@ def run_code_interpreter_query(payload: dict) -> dict:
 
 def run_code_interpreter_query_events(payload: dict):
     """NDJSON event stream for code interpreter mode."""
-    from utils.index_lock import lifecycle_read_lock
+    from utils.index_lock import lifecycle_read_locks
     from utils.metrics import get_metrics
 
     metrics = get_metrics()
@@ -1415,14 +1506,16 @@ def run_code_interpreter_query_events(payload: dict):
         return json.dumps(event, ensure_ascii=False) + "\n"
 
     try:
-        config = _workspace_config(
-            current_app,
-            payload.get("knowledge_base_id"),
-        )
-        with lifecycle_read_lock(scope=config["CHROMA_COLLECTION"]):
-            _raise_if_knowledge_base_became_unavailable(config)
+        configs = _query_configs_for_payload(current_app, payload)
+        with lifecycle_read_locks(
+            config["CHROMA_COLLECTION"] for config in configs
+        ):
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
             _ensure_request_not_timed_out()
-            prepared = _prepare_code_interpreter_run(payload, config=config)
+            prepared = _prepare_code_interpreter_run(
+                payload,
+                configs=configs,
+            )
             yield encode(_code_interpreter_meta_event(prepared))
             _ensure_request_not_timed_out()
             code = _generate_code_for_interpreter(prepared)
@@ -1434,8 +1527,8 @@ def run_code_interpreter_query_events(payload: dict):
             _append_code_interpreter_conversation_turn(payload, prepared, result)
             yield encode(
                 {
-                    "type": "done",
                     **_code_interpreter_response(prepared, code, result),
+                    "type": "done",
                 }
             )
     except RequestTimeoutExceeded:
@@ -1448,7 +1541,15 @@ def run_code_interpreter_query_events(payload: dict):
                 "type": "error",
                 "error": exc.message,
                 "status": exc.code,
-                "knowledge_base_id": payload.get("knowledge_base_id") or "default",
+                "knowledge_base_ids": _payload_query_knowledge_base_ids(payload),
+                **(
+                    {
+                        "knowledge_base_id":
+                        _payload_query_knowledge_base_ids(payload)[0]
+                    }
+                    if len(_payload_query_knowledge_base_ids(payload)) == 1
+                    else {}
+                ),
             }
         )
     except Exception as exc:
@@ -1579,14 +1680,20 @@ def _prepare_code_interpreter_run(
     payload: dict,
     *,
     config: dict | None = None,
+    configs=None,
 ) -> dict:
     if not _code_interpreter_enabled():
         raise ValidationError("Code interpreter disabilitato", "use_code_interpreter", "disabled")
 
-    config = config or _workspace_config(
-        current_app,
-        payload.get("knowledge_base_id"),
-    )
+    configs = tuple(configs or ())
+    if not configs:
+        config = config or _workspace_config(
+            current_app,
+            payload.get("knowledge_base_id"),
+        )
+        configs = (config,)
+    config = configs[0]
+    targets = _knowledge_base_query_targets(configs)
     _cleanup_code_interpreter_files(config)
     attached_files = _resolve_chat_attachments(config, payload.get("attached_files") or [])
     if not attached_files:
@@ -1603,7 +1710,15 @@ def _prepare_code_interpreter_run(
     from utils.settings_store import SettingsStore
 
     raw_conversation_id = payload.get("conversation_id")
-    conversation_id = _scoped_conversation_id(raw_conversation_id, config)
+    conversation_id = _query_scoped_conversation_id(
+        raw_conversation_id,
+        config,
+        plural_request=payload.get("knowledge_base_ids_explicit", False),
+    )
+    conversation_snapshot = _validate_conversation_knowledge_bases(
+        conversation_id,
+        configs,
+    )
     custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
     rag_error = ""
     try:
@@ -1615,12 +1730,21 @@ def _prepare_code_interpreter_run(
             k=payload.get("k"),
             settings_path=config["SETTINGS_FILE"],
             collection_name=config["CHROMA_COLLECTION"],
+            knowledge_base_targets=targets,
             conversation_id=conversation_id,
+            conversation_prompt_context=(
+                conversation_snapshot.prompt_context
+            ),
+            conversation_retrieval_context=(
+                conversation_snapshot.retrieval_context
+            ),
             response_language=payload.get("response_language"),
             use_cache=False,
         )
     except Exception as exc:
-        _raise_if_knowledge_base_became_unavailable(config)
+        _raise_if_query_knowledge_bases_became_unavailable(configs)
+        if payload.get("knowledge_base_ids_explicit"):
+            raise
         log.warning("RAG context unavailable for code interpreter: %s", exc)
         rag_error = str(exc)
         settings = SettingsStore(config["SETTINGS_FILE"]).load()
@@ -1647,6 +1771,7 @@ def _prepare_code_interpreter_run(
     serialized_context = _serialize_context(
         context_docs,
         file_index_path=config["FILE_INDEX"],
+        knowledge_base_targets=targets,
         include_downloads=True,
     )
     _add_knowledge_base_to_download_urls(
@@ -1679,7 +1804,7 @@ def _prepare_code_interpreter_run(
         "context": serialized_context,
         "sources": _serialize_sources(context_docs),
         "rag_error": rag_error,
-        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+        **_query_knowledge_base_response_fields(configs),
     }
 
 
@@ -1694,13 +1819,21 @@ def _rag_context_for_code_prompt(context_docs, rag_error: str = "", max_chars: i
     for index, doc in enumerate(context_docs, start=1):
         metadata = getattr(doc, "metadata", {}) or {}
         source = os.path.basename(str(metadata.get("source") or "documento"))
+        knowledge_base_name = str(
+            metadata.get("knowledge_base_name") or ""
+        ).strip()
         text = " ".join(str(getattr(doc, "page_content", "") or "").split())
         if not text:
             continue
         snippet = text[: max(0, min(len(text), remaining - 120))]
         if not snippet:
             break
-        blocks.append(f"[{index}] Fonte: {source}\n{snippet}")
+        provenance = (
+            f"Knowledge base: {knowledge_base_name} | Fonte: {source}"
+            if knowledge_base_name
+            else f"Fonte: {source}"
+        )
+        blocks.append(f"[{index}] {provenance}\n{snippet}")
         remaining -= len(snippet)
         if remaining <= 300:
             break
@@ -1750,6 +1883,7 @@ def _append_code_interpreter_conversation_turn(payload: dict, prepared: dict, re
         model=prepared["model"],
         temperature=min(float(prepared.get("temperature") or 0.0), 0.2),
         settings=prepared["settings"],
+        knowledge_base_ids=payload.get("knowledge_base_ids"),
     )
 
 
@@ -1785,8 +1919,10 @@ def _code_interpreter_meta_event(prepared: dict) -> dict:
         ],
         "context": prepared["context"],
         "sources": prepared["sources"],
-        "knowledge_base_id": prepared["knowledge_base_id"],
+        "knowledge_base_ids": prepared["knowledge_base_ids"],
     }
+    if prepared.get("knowledge_base_id"):
+        event["knowledge_base_id"] = prepared["knowledge_base_id"]
     if prepared.get("raw_conversation_id"):
         event["conversation_id"] = prepared["raw_conversation_id"]
     return event
@@ -1813,8 +1949,10 @@ def _code_interpreter_response(prepared: dict, code: str, result: dict) -> dict:
         "context": prepared["context"],
         "sources": prepared["sources"],
         "usage": None,
-        "knowledge_base_id": prepared["knowledge_base_id"],
+        "knowledge_base_ids": prepared["knowledge_base_ids"],
     }
+    if prepared.get("knowledge_base_id"):
+        response["knowledge_base_id"] = prepared["knowledge_base_id"]
     if prepared.get("raw_conversation_id"):
         response["conversation_id"] = prepared["raw_conversation_id"]
     if prepared.get("rag_error"):
@@ -1855,6 +1993,92 @@ def _workspace_config(
     config = context.as_config()
     config["USERS_FILE"] = app.config["USERS_FILE"]
     return config
+
+
+def _workspace_query_configs(app: Flask, knowledge_base_ids) -> tuple[dict, ...]:
+    from utils.index_lock import lifecycle_read_lock
+    from utils.workspace import knowledge_base_contexts
+
+    with lifecycle_read_lock():
+        workspace = workspace_from_request(app)
+        contexts = knowledge_base_contexts(
+            workspace,
+            knowledge_base_ids,
+            api_key=getattr(request, "api_key", None),
+            create_dirs=False,
+        )
+    configs = []
+    for context in contexts:
+        config = context.as_config()
+        config["USERS_FILE"] = app.config["USERS_FILE"]
+        configs.append(config)
+    ids = [config["KNOWLEDGE_BASE_ID"] for config in configs]
+    request._rag_knowledge_base_ids = ids
+    request._rag_knowledge_base_id = ids[0] if len(ids) == 1 else ",".join(ids)
+    return tuple(configs)
+
+
+def _query_configs_for_payload(app: Flask, payload: dict) -> tuple[dict, ...]:
+    if "knowledge_base_ids" not in payload:
+        return (
+            _workspace_config(
+                app,
+                payload.get("knowledge_base_id"),
+            ),
+        )
+    return _workspace_query_configs(
+        app,
+        _payload_query_knowledge_base_ids(payload),
+    )
+
+
+def _knowledge_base_query_targets(configs) -> list[dict]:
+    return [
+        {
+            "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+            "knowledge_base_name": config["KNOWLEDGE_BASE_NAME"],
+            "collection_name": config["CHROMA_COLLECTION"],
+            "file_index_path": config["FILE_INDEX"],
+        }
+        for config in configs
+    ]
+
+
+def _query_knowledge_base_response_fields(configs) -> dict:
+    ids = [config["KNOWLEDGE_BASE_ID"] for config in configs]
+    payload = {"knowledge_base_ids": ids}
+    if len(ids) == 1:
+        payload["knowledge_base_id"] = ids[0]
+    return payload
+
+
+def _set_query_knowledge_base_headers(response: Response, payload: dict) -> None:
+    ids = _payload_query_knowledge_base_ids(payload)
+    response.headers["X-Knowledge-Base-Ids"] = ",".join(ids)
+    if len(ids) == 1:
+        response.headers["X-Knowledge-Base-Id"] = ids[0]
+
+
+def _payload_query_knowledge_base_ids(payload: dict) -> list[str]:
+    values = payload.get("knowledge_base_ids")
+    if isinstance(values, list) and values:
+        return list(values)
+    return [payload.get("knowledge_base_id") or "default"]
+
+
+def _conversation_clear_configs(app: Flask) -> tuple[tuple[dict, ...], bool]:
+    plural_values = request.args.getlist("knowledge_base_ids")
+    if "knowledge_base_ids" in request.args:
+        selection = {"knowledge_base_ids": plural_values}
+        if "knowledge_base_id" in request.args:
+            selection["knowledge_base_id"] = request.args.get(
+                "knowledge_base_id"
+            )
+        knowledge_base_ids, _plural = _parse_query_knowledge_base_ids(
+            selection
+        )
+        return _workspace_query_configs(app, knowledge_base_ids), True
+    return (_workspace_config(app),), False
 
 
 def _workspace_shared_config(app: Flask) -> dict:
@@ -1928,6 +2152,54 @@ def _scoped_conversation_id(
         f"{config['WORKSPACE_ID']}:kb:"
         f"{config['KNOWLEDGE_BASE_ID']}:{conversation_id}"
     )
+
+
+def _query_scoped_conversation_id(
+    conversation_id: str | None,
+    config: dict,
+    *,
+    plural_request: bool,
+) -> str | None:
+    if not conversation_id:
+        return None
+    if plural_request:
+        return f"{config['WORKSPACE_ID']}:multi-chat:{conversation_id}"
+    return _scoped_conversation_id(conversation_id, config)
+
+
+def _validate_conversation_knowledge_bases(
+    conversation_id: str | None,
+    configs,
+) -> object:
+    """Return one authorized, immutable snapshot of conversation memory."""
+
+    from utils.conversation_memory import ConversationSnapshot, get_conversation_store
+    from utils.workspace import knowledge_base_context, workspace_from_request
+
+    store = get_conversation_store()
+    snapshot = store.snapshot(conversation_id)
+    if not conversation_id or ":multi-chat:" not in conversation_id:
+        return snapshot
+    remembered_ids = snapshot.knowledge_base_ids
+    if not remembered_ids:
+        if snapshot.prompt_context or snapshot.retrieval_context:
+            store.clear_if_version(conversation_id, snapshot.version)
+            return ConversationSnapshot()
+        return snapshot
+    workspace = workspace_from_request(current_app)
+    api_key = getattr(request, "api_key", None)
+    try:
+        for knowledge_base_id in remembered_ids:
+            knowledge_base_context(
+                workspace,
+                knowledge_base_id,
+                api_key=api_key,
+                create_dirs=False,
+            )
+    except KnowledgeBaseValidationError:
+        store.clear_if_version(conversation_id, snapshot.version)
+        return ConversationSnapshot()
+    return snapshot
 
 
 def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
@@ -3837,13 +4109,11 @@ def _parse_query_payload(require_json: bool = True) -> dict:
                 required=True,
             )
             validate_string(f.get("name"), f"attached_files[{i}].name", required=False)
-    config = _workspace_config(
-        current_app,
-        data.get("knowledge_base_id"),
-    )
+    knowledge_base_ids, plural_selection = _parse_query_knowledge_base_ids(data)
+    config = _workspace_shared_config(current_app)
     _validate_model_selection(model, provider, config=config)
 
-    return {
+    payload = {
         "query": query,
         "model": model,
         "provider": provider,
@@ -3857,8 +4127,62 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "system_prompt_id": system_prompt_id,
         "use_code_interpreter": use_code_interpreter,
         "attached_files": attached_files,
-        "knowledge_base_id": config["KNOWLEDGE_BASE_ID"],
+        "knowledge_base_ids": knowledge_base_ids,
+        "knowledge_base_ids_explicit": plural_selection,
     }
+    if len(knowledge_base_ids) == 1:
+        payload["knowledge_base_id"] = knowledge_base_ids[0]
+    return payload
+
+
+def _parse_query_knowledge_base_ids(data: dict) -> tuple[list[str], bool]:
+    from utils.knowledge_base_store import validate_knowledge_base_id
+
+    has_singular = "knowledge_base_id" in data
+    has_plural = "knowledge_base_ids" in data
+    if has_singular and has_plural:
+        raise ValidationError(
+            "Usa knowledge_base_id oppure knowledge_base_ids, non entrambi",
+            "knowledge_base_ids",
+            "invalid_knowledge_base_selection",
+        )
+    if not has_plural:
+        raw_ids = [data.get("knowledge_base_id")] if has_singular else ["default"]
+    else:
+        raw_ids = data.get("knowledge_base_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValidationError(
+                "knowledge_base_ids deve contenere almeno un elemento",
+                "knowledge_base_ids",
+                "invalid_knowledge_base_selection",
+            )
+
+    max_ids = int(current_app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5))
+    if len(raw_ids) > max_ids:
+        raise ValidationError(
+            f"Puoi interrogare al massimo {max_ids} knowledge base",
+            "knowledge_base_ids",
+            "invalid_knowledge_base_selection",
+        )
+    normalized = []
+    try:
+        for value in raw_ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError
+            normalized.append(validate_knowledge_base_id(value.strip()))
+    except (KnowledgeBaseValidationError, ValueError, TypeError):
+        raise ValidationError(
+            "Selezione knowledge base non valida",
+            "knowledge_base_ids" if has_plural else "knowledge_base_id",
+            "invalid_knowledge_base_selection",
+        ) from None
+    if len(set(normalized)) != len(normalized):
+        raise ValidationError(
+            "knowledge_base_ids non può contenere duplicati",
+            "knowledge_base_ids",
+            "invalid_knowledge_base_selection",
+        )
+    return normalized, has_plural
 
 
 def _extract_code_block(text: str) -> str:

@@ -67,6 +67,20 @@ def query_chroma(query, k=None, collection_name: str | None = None):
     return _vector_store(collection_name).query(query, k=k)
 
 
+def query_chroma_by_embedding(
+    query_embedding,
+    *,
+    k: int,
+    collection_name: str,
+    include_embeddings: bool = False,
+):
+    return _vector_store(collection_name).query_by_embedding(
+        query_embedding,
+        k,
+        include_embeddings=include_embeddings,
+    )
+
+
 def query_chroma_with_rerank(
     query: str,
     k: int = 5,

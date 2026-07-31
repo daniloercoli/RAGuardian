@@ -164,8 +164,11 @@ paths:
       operationId: postApiV1Query
       summary: Query the RAG service
       description: |
-        Answers a question using indexed RAG documents. By default the response
-        is JSON. When `stream` is `true`, the response body is progressive
+        Answers a question using one or more authorized knowledge bases, up to
+        the runtime limit returned by the knowledge-base list endpoint. The
+        service embeds the question once, retrieves candidates from every
+        selected collection, deduplicates them, and applies one global ranking.
+        By default the response is JSON. When `stream` is `true`, the response body is progressive
         `text/plain` output. Set `stream_format` to `ndjson` to receive one
         structured JSON event per line, including final context sources.
       requestBody:
@@ -181,6 +184,9 @@ paths:
                     provider: mistral
                     model: mistral-medium
                     conversation_id: chat-20260616-demo
+                    knowledge_base_ids:
+                      - default
+                      - kb_11111111111111111111111111111111
                     response_language: auto
                     temperature: 0.3
                     k: 5
@@ -196,6 +202,15 @@ paths:
       responses:
         "200":
           description: Query answer. JSON when `stream` is false, text or NDJSON events when `stream` is true.
+          headers:
+            X-Knowledge-Base-Ids:
+              description: Comma-separated knowledge base IDs used by the query.
+              schema:
+                type: string
+            X-Knowledge-Base-Id:
+              description: Present for text streaming only when exactly one KB was selected.
+              schema:
+                $ref: "#/components/schemas/KnowledgeBaseId"
           content:
             application/json:
               schema:
@@ -208,17 +223,24 @@ paths:
                     provider: mistral
                     provider_name: Mistral AI
                     conversation_id: chat-20260616-demo
+                    knowledge_base_ids:
+                      - default
+                      - kb_11111111111111111111111111111111
                     response_language: auto
                     context:
                       - text: Chunk retrieved from document...
                         metadata:
                           source: app/uploads/workspaces/user_123/demo.pdf
                           chunk_id: 0
+                          knowledge_base_id: default
+                          knowledge_base_name: General
                           chunk_length: 924
                     sources:
                       - filename: demo.pdf
                         source_type: pdf
                         chunk_id: 0
+                        knowledge_base_id: default
+                        knowledge_base_name: General
                         snippet: Chunk retrieved from document...
                     usage: null
             text/plain:
@@ -234,14 +256,18 @@ paths:
               examples:
                 streamedEvents:
                   value: |
-                     {"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo"}
+                     {"type":"meta","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_ids":["default"],"knowledge_base_id":"default"}
                      {"type":"token","text":"Progressive "}
                      {"type":"token","text":"response..."}
-                     {"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","context":[],"sources":[],"usage":null}
+                     {"type":"done","answer":"Progressive response...","model":"mistral-medium","provider":"mistral","provider_name":"Mistral AI","response_language":"auto","conversation_id":"chat-20260616-demo","knowledge_base_ids":["default"],"knowledge_base_id":"default","context":[],"sources":[],"usage":null}
         "400":
           $ref: "#/components/responses/ValidationError"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/KnowledgeBaseNotFound"
+        "409":
+          $ref: "#/components/responses/KnowledgeBaseConflict"
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
@@ -260,12 +286,19 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [knowledge_bases]
+                required: [knowledge_bases, limits]
                 properties:
                   knowledge_bases:
                     type: array
                     items:
                       $ref: "#/components/schemas/KnowledgeBase"
+                  limits:
+                    type: object
+                    required: [max_query_knowledge_bases]
+                    properties:
+                      max_query_knowledge_bases:
+                        type: integer
+                        minimum: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -358,7 +391,10 @@ paths:
         - Query
       operationId: deleteApiV1Conversation
       summary: Clear conversation memory
-      description: Removes the in-process conversational memory associated with the supplied `conversation_id`.
+      description: |
+        Removes the conversation memory associated with the supplied
+        `conversation_id`. Repeat `knowledge_base_ids` for the KB selection
+        whose plural conversation namespace must be cleared.
       parameters:
         - name: conversation_id
           in: path
@@ -369,7 +405,7 @@ paths:
             maxLength: 80
             pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
           example: chat-20260616-demo
-        - $ref: "#/components/parameters/KnowledgeBaseId"
+        - $ref: "#/components/parameters/KnowledgeBaseIds"
       responses:
         "200":
           description: Conversation memory reset result.
@@ -380,20 +416,38 @@ paths:
                 required:
                   - conversation_id
                   - cleared
+                  - knowledge_base_ids
                 properties:
                   conversation_id:
                     type: string
                   cleared:
                     type: boolean
+                  knowledge_base_ids:
+                    type: array
+                    minItems: 1
+                    uniqueItems: true
+                    items:
+                      $ref: "#/components/schemas/KnowledgeBaseId"
+                  knowledge_base_id:
+                    allOf:
+                      - $ref: "#/components/schemas/KnowledgeBaseId"
+                    description: Present only when exactly one knowledge base was selected.
               examples:
-                cleared:
+                pluralSelectionCleared:
                   value:
                     conversation_id: chat-20260616-demo
                     cleared: true
+                    knowledge_base_ids:
+                      - default
+                      - kb_11111111111111111111111111111111
         "400":
           $ref: "#/components/responses/ValidationError"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/KnowledgeBaseNotFound"
+        "409":
+          $ref: "#/components/responses/KnowledgeBaseConflict"
         "500":
           $ref: "#/components/responses/ServerError"
   /api/v1/files:
@@ -683,6 +737,21 @@ components:
       description: Omit or use `default` for the legacy-compatible default KB.
       schema:
         $ref: "#/components/schemas/KnowledgeBaseId"
+    KnowledgeBaseIds:
+      name: knowledge_base_ids
+      in: query
+      required: false
+      description: |
+        Repeat this parameter for every selected KB. Omission targets the
+        legacy default conversation namespace rather than a plural namespace.
+      style: form
+      explode: true
+      schema:
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          $ref: "#/components/schemas/KnowledgeBaseId"
     KnowledgeBaseIdPath:
       name: knowledge_base_id
       in: path
@@ -746,6 +815,32 @@ components:
                 error: query must have at least 3 characters
                 status: validation_error
                 field: query
+    KnowledgeBaseNotFound:
+      description: A selected knowledge base is missing or not authorized to the API key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missingOrUnauthorized:
+              value:
+                error: Knowledge base non trovata
+                status: knowledge_base_not_found
+    KnowledgeBaseConflict:
+      description: A selected knowledge base cannot currently serve queries.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            deleting:
+              value:
+                error: Knowledge base in eliminazione
+                status: knowledge_base_deleting
+            deleteFailed:
+              value:
+                error: Eliminazione knowledge base fallita
+                status: knowledge_base_delete_failed
     RateLimited:
       description: Too many requests in the configured time window.
       content:
@@ -1111,6 +1206,19 @@ components:
       properties:
         knowledge_base_id:
           $ref: "#/components/schemas/KnowledgeBaseId"
+          deprecated: true
+          description: Legacy single-KB selector. Do not combine with knowledge_base_ids.
+        knowledge_base_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: |
+            Ordered set of authorized active knowledge bases queried together.
+            The runtime maximum is returned as
+            `limits.max_query_knowledge_bases` by the knowledge-base list
+            endpoint.
+          items:
+            $ref: "#/components/schemas/KnowledgeBaseId"
         query:
           type: string
           minLength: 3
@@ -1189,6 +1297,7 @@ components:
     QueryResponse:
       type: object
       required:
+        - knowledge_base_ids
         - answer
         - model
         - provider
@@ -1197,6 +1306,12 @@ components:
       properties:
         knowledge_base_id:
           $ref: "#/components/schemas/KnowledgeBaseId"
+          description: Present only when exactly one knowledge base was selected.
+        knowledge_base_ids:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/KnowledgeBaseId"
         answer:
           type: string
         model:
@@ -1236,6 +1351,7 @@ components:
           type: string
         metadata:
           type: object
+          description: Includes knowledge_base_id, knowledge_base_name, and knowledge_base_origins provenance for federated retrieval.
           additionalProperties: true
     PublicSource:
       type: object
@@ -1263,6 +1379,15 @@ components:
             - type: integer
         score:
           type: number
+        knowledge_base_id:
+          $ref: "#/components/schemas/KnowledgeBaseId"
+        knowledge_base_name:
+          type: string
+        knowledge_base_origins:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
         snippet:
           type: string
     FileUploadResponse:

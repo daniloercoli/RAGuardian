@@ -138,6 +138,13 @@ Default conversation memory remains
 carry the KB ID. Secondary deletion is an asynchronous cascade with
 `deleting` and retryable `delete_failed` states.
 
+Plural query requests use
+`<workspace_id>:multi-chat:<conversation_id>`, so changing the selected KB set
+does not reset the conversation. The state records the union of KBs used and
+is cleared if any remembered KB is deleted, inactive, or no longer authorized.
+Federated retrieval supports up to `RAG_MAX_QUERY_KNOWLEDGE_BASES` KBs
+(default 5) and does not require reindexing.
+
 ## Migration and rollout
 
 Existing workspaces keep their legacy paths and Chroma collections. Run a

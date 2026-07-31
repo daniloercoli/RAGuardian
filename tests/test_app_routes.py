@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from flask import request
+from flask import has_request_context, request
 
 from app import create_app
 from app.utils.conversation_memory import get_conversation_store, reset_conversation_store
@@ -661,6 +661,7 @@ def test_conversation_clear_endpoint_resets_memory(client, flask_app):
         "conversation_id": conversation_id,
         "cleared": True,
         "knowledge_base_id": "default",
+        "knowledge_base_ids": ["default"],
     }
     assert get_conversation_store().render_for_prompt(scoped_id) == ""
 
@@ -3002,6 +3003,102 @@ def test_code_interpreter_prompt_includes_rag_context_and_data_path(client, flas
     assert "revenue" in captured["system"]
     assert "Regola aziendale" in captured["system"]
     assert response.get_json()["context"][0]["metadata"]["source"] == "policy.pdf"
+
+
+def test_code_interpreter_ndjson_preserves_request_context(
+    client,
+    monkeypatch,
+):
+    app_module = importlib.import_module("app.app")
+    _login(client)
+    captured = {}
+
+    def fake_prepare(payload, *, configs=None, **_kwargs):
+        assert has_request_context()
+        captured["request_path"] = request.path
+        captured["knowledge_base_ids"] = [
+            config["KNOWLEDGE_BASE_ID"] for config in configs
+        ]
+        attachment = {
+            "id": payload["attached_files"][0]["id"],
+            "name": "report.csv",
+            "type": "text/csv",
+            "size": 10,
+            "container_path": "/data/report.csv",
+        }
+        return {
+            "query": payload["query"],
+            "provider": "fake",
+            "model": "fake-model",
+            "provider_name": "Fake",
+            "response_language": "it",
+            "attached_files": [attachment],
+            "context": [],
+            "sources": [],
+            "knowledge_base_ids": ["default"],
+            "knowledge_base_id": "default",
+            "raw_conversation_id": payload.get("conversation_id"),
+        }
+
+    monkeypatch.setattr(
+        app_module,
+        "_prepare_code_interpreter_run",
+        fake_prepare,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_generate_code_for_interpreter",
+        lambda _prepared: "print('ok')",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_execute_interpreter_code",
+        lambda _prepared, _code: {
+            "success": True,
+            "text": "ok",
+            "images": [],
+        },
+    )
+    monkeypatch.setattr(
+        app_module,
+        "_append_code_interpreter_conversation_turn",
+        lambda *_args, **_kwargs: None,
+    )
+
+    response = client.post(
+        "/ask",
+        json={
+            "query": "Analizza il report",
+            "conversation_id": "conv-ci-stream-1234",
+            "stream": True,
+            "stream_format": "ndjson",
+            "use_code_interpreter": True,
+            "attached_files": [
+                {
+                    "id": "1" * 32,
+                    "name": "report.csv",
+                }
+            ],
+            "knowledge_base_ids": ["default"],
+        },
+    )
+    events = [
+        json.loads(line)
+        for line in response.get_data(as_text=True).splitlines()
+    ]
+
+    assert response.status_code == 200
+    assert captured == {
+        "request_path": "/ask",
+        "knowledge_base_ids": ["default"],
+    }
+    assert [event["type"] for event in events] == [
+        "meta",
+        "code",
+        "execution",
+        "done",
+    ]
+    assert events[-1]["knowledge_base_ids"] == ["default"]
 
 
 def test_ask_with_attachment_and_code_interpreter_off_uses_ephemeral_rag(client, flask_app, monkeypatch):

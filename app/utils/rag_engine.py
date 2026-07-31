@@ -1,12 +1,23 @@
 import os
 import time
+import hashlib
+import math
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Generator, List, Optional
 
 from config import Config
 from utils import RAG_LOGGER as log
 from utils.cache import RAGCache
-from utils.chroma_manager import query_chroma, query_chroma_with_rerank
-from utils.index_lock import register_lifecycle_invalidator
+from utils.chroma_manager import (
+    query_chroma,
+    query_chroma_by_embedding,
+    query_chroma_with_rerank,
+)
+from utils.index_lock import (
+    assert_distributed_locks_healthy,
+    register_lifecycle_invalidator,
+)
 from utils.conversation_memory import (
     fallback_summary,
     format_turns,
@@ -53,6 +64,10 @@ def query_rag(
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
     extra_context_docs: Optional[list] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
+    conversation_knowledge_base_ids: Optional[list[str]] = None,
+    conversation_prompt_context: Optional[str] = None,
+    conversation_retrieval_context: Optional[str] = None,
 ):
     if stream:
         return query_rag_stream(
@@ -70,6 +85,10 @@ def query_rag(
             public=public,
             custom_system_prompt=custom_system_prompt,
             extra_context_docs=extra_context_docs,
+            knowledge_base_targets=knowledge_base_targets,
+            conversation_knowledge_base_ids=conversation_knowledge_base_ids,
+            conversation_prompt_context=conversation_prompt_context,
+            conversation_retrieval_context=conversation_retrieval_context,
         )
     return query_rag_non_stream(
         query,
@@ -86,6 +105,10 @@ def query_rag(
         public=public,
         custom_system_prompt=custom_system_prompt,
         extra_context_docs=extra_context_docs,
+        knowledge_base_targets=knowledge_base_targets,
+        conversation_knowledge_base_ids=conversation_knowledge_base_ids,
+        conversation_prompt_context=conversation_prompt_context,
+        conversation_retrieval_context=conversation_retrieval_context,
     )
 
 
@@ -104,6 +127,10 @@ def query_rag_non_stream(
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
     extra_context_docs: Optional[list] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
+    conversation_knowledge_base_ids: Optional[list[str]] = None,
+    conversation_prompt_context: Optional[str] = None,
+    conversation_retrieval_context: Optional[str] = None,
 ) -> Dict[str, object]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -117,8 +144,15 @@ def query_rag_non_stream(
         f"(provider={provider_id}, model={selected_model}, temperature={effective_temperature}, k={effective_k})"
     )
 
-    conversation_context = _conversation_context(conversation_id)
-    retrieval_query = _retrieval_query(query, conversation_id)
+    conversation_context = _conversation_context(
+        conversation_id,
+        frozen_context=conversation_prompt_context,
+    )
+    retrieval_query = _retrieval_query(
+        query,
+        conversation_id,
+        frozen_context=conversation_retrieval_context,
+    )
     context_docs = _get_context(
         retrieval_query,
         effective_k,
@@ -126,7 +160,9 @@ def query_rag_non_stream(
         settings,
         collection_name=collection_name,
         conversation_id=conversation_id,
+        knowledge_base_targets=knowledge_base_targets,
     )
+    assert_distributed_locks_healthy()
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer = "".join(
         generate_response(
@@ -150,6 +186,7 @@ def query_rag_non_stream(
         model=selected_model,
         temperature=effective_temperature,
         settings=settings,
+        knowledge_base_ids=conversation_knowledge_base_ids,
     )
     result = {
         "answer": answer,
@@ -160,6 +197,7 @@ def query_rag_non_stream(
         "context": _serialize_context(
             context_docs,
             file_index_path=file_index_path,
+            knowledge_base_targets=knowledge_base_targets,
             include_downloads=not public,
         ),
         "sources": _serialize_sources(context_docs),
@@ -182,6 +220,9 @@ def prepare_rag_context(
     response_language: Optional[str] = None,
     use_cache: bool = True,
     extra_context_docs: Optional[list] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
+    conversation_prompt_context: Optional[str] = None,
+    conversation_retrieval_context: Optional[str] = None,
 ) -> Dict[str, object]:
     """Resolve model settings and retrieve context without generating an answer."""
     settings = _load_settings(settings_path)
@@ -194,8 +235,15 @@ def prepare_rag_context(
     )
     effective_k = k or rag["query_k"]
     effective_temperature = temperature if temperature is not None else rag["temperature"]
-    conversation_context = _conversation_context(conversation_id)
-    retrieval_query = _retrieval_query(query, conversation_id)
+    conversation_context = _conversation_context(
+        conversation_id,
+        frozen_context=conversation_prompt_context,
+    )
+    retrieval_query = _retrieval_query(
+        query,
+        conversation_id,
+        frozen_context=conversation_retrieval_context,
+    )
     context_docs = _get_context(
         retrieval_query,
         effective_k,
@@ -204,7 +252,9 @@ def prepare_rag_context(
         use_cache=use_cache,
         collection_name=collection_name,
         conversation_id=conversation_id,
+        knowledge_base_targets=knowledge_base_targets,
     )
+    assert_distributed_locks_healthy()
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     return {
         "settings": settings,
@@ -234,6 +284,10 @@ def query_rag_stream(
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
     extra_context_docs: Optional[list] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
+    conversation_knowledge_base_ids: Optional[list[str]] = None,
+    conversation_prompt_context: Optional[str] = None,
+    conversation_retrieval_context: Optional[str] = None,
 ) -> Generator[str, None, None]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -242,8 +296,15 @@ def query_rag_stream(
     effective_k = k or rag["query_k"]
     effective_temperature = temperature if temperature is not None else rag["temperature"]
 
-    conversation_context = _conversation_context(conversation_id)
-    retrieval_query = _retrieval_query(query, conversation_id)
+    conversation_context = _conversation_context(
+        conversation_id,
+        frozen_context=conversation_prompt_context,
+    )
+    retrieval_query = _retrieval_query(
+        query,
+        conversation_id,
+        frozen_context=conversation_retrieval_context,
+    )
     context_docs = _get_context(
         retrieval_query,
         effective_k,
@@ -252,7 +313,9 @@ def query_rag_stream(
         use_cache=False,
         collection_name=collection_name,
         conversation_id=conversation_id,
+        knowledge_base_targets=knowledge_base_targets,
     )
+    assert_distributed_locks_healthy()
     context_docs = _merge_context_docs(context_docs, extra_context_docs)
     answer_parts = []
     for chunk in generate_response(
@@ -279,6 +342,7 @@ def query_rag_stream(
         model=selected_model,
         temperature=effective_temperature,
         settings=settings,
+        knowledge_base_ids=conversation_knowledge_base_ids,
     )
 
 
@@ -297,6 +361,10 @@ def query_rag_stream_events(
     public: bool = False,
     custom_system_prompt: Optional[str] = None,
     extra_context_docs: Optional[list] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
+    conversation_knowledge_base_ids: Optional[list[str]] = None,
+    conversation_prompt_context: Optional[str] = None,
+    conversation_retrieval_context: Optional[str] = None,
 ) -> Generator[Dict[str, object], None, None]:
     try:
         settings = _load_settings(settings_path)
@@ -310,8 +378,15 @@ def query_rag_stream_events(
         effective_k = k or rag["query_k"]
         effective_temperature = temperature if temperature is not None else rag["temperature"]
 
-        conversation_context = _conversation_context(conversation_id)
-        retrieval_query = _retrieval_query(query, conversation_id)
+        conversation_context = _conversation_context(
+            conversation_id,
+            frozen_context=conversation_prompt_context,
+        )
+        retrieval_query = _retrieval_query(
+            query,
+            conversation_id,
+            frozen_context=conversation_retrieval_context,
+        )
         context_docs = _get_context(
             retrieval_query,
             effective_k,
@@ -320,7 +395,9 @@ def query_rag_stream_events(
             use_cache=False,
             collection_name=collection_name,
             conversation_id=conversation_id,
+            knowledge_base_targets=knowledge_base_targets,
         )
+        assert_distributed_locks_healthy()
         context_docs = _merge_context_docs(context_docs, extra_context_docs)
         provider_name = provider_config.get("name", provider_id)
         meta_event = {
@@ -363,6 +440,7 @@ def query_rag_stream_events(
             "context": _serialize_context(
                 context_docs,
                 file_index_path=file_index_path,
+                knowledge_base_targets=knowledge_base_targets,
                 include_downloads=not public,
             ),
             "sources": _serialize_sources(context_docs),
@@ -379,6 +457,7 @@ def query_rag_stream_events(
             model=selected_model,
             temperature=effective_temperature,
             settings=settings,
+            knowledge_base_ids=conversation_knowledge_base_ids,
         )
     except Exception as e:
         log.error(f"Errore streaming RAG: {e}")
@@ -458,7 +537,9 @@ def generate_response(
         yield "Nessun documento caricato. Carica PDF dalla pagina admin File."
         return
 
-    context = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
+    context = "\n\n---\n\n".join(
+        _document_prompt_block(doc) for doc in context_docs
+    )
     sources = [os.path.basename(doc.metadata.get("source", "?")) for doc in context_docs]
     log.info(f"Context: {len(context_docs)} docs ({len(context)} char) � sources: {sources}")
     language_instruction = _response_language_instruction(response_language)
@@ -526,6 +607,18 @@ def generate_response(
         yield f"Errore: {e}"
 
 
+def _document_prompt_block(doc) -> str:
+    metadata = getattr(doc, "metadata", {}) or {}
+    source = os.path.basename(str(metadata.get("source") or "documento"))
+    knowledge_base_name = str(metadata.get("knowledge_base_name") or "").strip()
+    if knowledge_base_name:
+        return (
+            f"[Knowledge base: {knowledge_base_name} | Fonte: {source}]\n"
+            f"{doc.page_content}"
+        )
+    return f"[Fonte: {source}]\n{doc.page_content}"
+
+
 def get_available_models():
     settings = _load_settings()
     return [
@@ -558,12 +651,27 @@ def clear_cache_for_collection(collection_name: str) -> int:
     return _cache.clear_collection(collection_name)
 
 
-def _conversation_context(conversation_id: Optional[str]) -> str:
+def _conversation_context(
+    conversation_id: Optional[str],
+    *,
+    frozen_context: Optional[str] = None,
+) -> str:
+    if frozen_context is not None:
+        return frozen_context
     return get_conversation_store().render_for_prompt(conversation_id)
 
 
-def _retrieval_query(query: str, conversation_id: Optional[str]) -> str:
-    context = get_conversation_store().render_for_retrieval(conversation_id)
+def _retrieval_query(
+    query: str,
+    conversation_id: Optional[str],
+    *,
+    frozen_context: Optional[str] = None,
+) -> str:
+    context = (
+        frozen_context
+        if frozen_context is not None
+        else get_conversation_store().render_for_retrieval(conversation_id)
+    )
     if not context:
         return query
 
@@ -583,12 +691,19 @@ def _append_conversation_turn(
     model: str,
     temperature: float,
     settings: dict,
+    knowledge_base_ids: Optional[list[str]] = None,
 ) -> None:
     if not conversation_id or not answer or answer.startswith("Errore:"):
         return
 
+    assert_distributed_locks_healthy()
     store = get_conversation_store()
-    summary_job = store.append_turn(conversation_id, user=query, assistant=answer)
+    summary_job = store.append_turn(
+        conversation_id,
+        user=query,
+        assistant=answer,
+        knowledge_base_ids=knowledge_base_ids,
+    )
     if not summary_job:
         return
 
@@ -604,6 +719,7 @@ def _append_conversation_turn(
         log.warning(f"Riassunto conversazione non riuscito, uso fallback locale: {e}")
         summary = fallback_summary(summary_job)
 
+    assert_distributed_locks_healthy()
     store.apply_summary(summary_job, summary)
 
 
@@ -652,13 +768,21 @@ def _get_context(
     use_cache: bool = True,
     collection_name: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
 ):
     from utils.metrics import get_metrics
 
     metrics = get_metrics()
     retrieval_start = time.time()
     cached_results = None
-    cache_query = f"{collection_name or 'documents'}\n{query}"
+    if knowledge_base_targets:
+        canonical_collections = sorted(
+            str(target["collection_name"])
+            for target in knowledge_base_targets
+        )
+        cache_query = f"multi-v2:{'|'.join(canonical_collections)}\n{query}"
+    else:
+        cache_query = f"{collection_name or 'documents'}\n{query}"
     cache_namespace = conversation_id or "stateless"
     if use_cache and settings["rag"]["enable_cache"]:
         cached_results = _cache.get(cache_query, k, model, namespace=cache_namespace)
@@ -672,8 +796,15 @@ def _get_context(
         metrics.set_context_docs_count(len(cached_results))
         return cached_results
 
+    if knowledge_base_targets:
+        context_docs = _get_federated_context(
+            query,
+            k,
+            settings,
+            knowledge_base_targets,
+        )
     # Usa reranker se abilitato
-    if settings["rag"].get("reranker_enabled", False):
+    elif settings["rag"].get("reranker_enabled", False):
         # Logica standard RAG con reranking:
         # 1. Recupera i candidati da ChromaDB, con eventuale diversity pre-reranker
         # 2. Re-ranka per rilevanza
@@ -751,6 +882,326 @@ def _get_context(
     return context_docs
 
 
+def _get_federated_context(
+    query: str,
+    k: int,
+    settings: dict,
+    knowledge_base_targets: list[dict],
+) -> list:
+    """Retrieve one globally ranked context from multiple Chroma collections."""
+
+    targets = [dict(target) for target in knowledge_base_targets]
+    if not targets:
+        return []
+    rag = settings["rag"]
+    reranker_enabled = bool(rag.get("reranker_enabled", False))
+    diversity_mode = str(
+        rag.get("reranker_diversity_mode", "none")
+    ).strip().lower()
+    top_n = max(k, int(rag.get("reranker_top_n", 20)))
+    mmr_pool = rag.get("reranker_mmr_candidate_pool")
+    try:
+        mmr_pool = int(mmr_pool) if mmr_pool is not None else 0
+    except (TypeError, ValueError):
+        mmr_pool = 0
+    if reranker_enabled:
+        global_budget = max(
+            k,
+            top_n,
+            mmr_pool if diversity_mode == "mmr" else 0,
+        )
+    else:
+        global_budget = max(k, k * 2)
+    global_budget = min(200, global_budget)
+    per_collection = min(
+        50,
+        max(k, math.ceil(global_budget / len(targets))),
+    )
+
+    query_embedding = EmbeddingFactory.get_provider().encode_query(query)
+    include_embeddings = diversity_mode == "mmr"
+
+    def retrieve(target: dict):
+        docs, embeddings = query_chroma_by_embedding(
+            query_embedding,
+            k=per_collection,
+            collection_name=target["collection_name"],
+            include_embeddings=include_embeddings,
+        )
+        return target, docs, embeddings
+
+    retrieved = []
+    with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
+        futures = [executor.submit(retrieve, target) for target in targets]
+        for future in as_completed(futures):
+            retrieved.append(future.result())
+    assert_distributed_locks_healthy()
+
+    grouped = {}
+    for target, docs, embeddings in retrieved:
+        for local_index, doc in enumerate(docs, start=1):
+            metadata = dict(getattr(doc, "metadata", {}) or {})
+            rrf_score = round(1.0 / (60 + local_index), 9)
+            origin = _knowledge_base_origin(
+                target,
+                metadata,
+                local_rank=local_index,
+                rrf_score=rrf_score,
+            )
+            metadata.update(
+                {
+                    "knowledge_base_id": target["knowledge_base_id"],
+                    "knowledge_base_name": target["knowledge_base_name"],
+                    "knowledge_base_origins": [origin],
+                    "local_rank": local_index,
+                    "rrf_score": rrf_score,
+                }
+            )
+            if include_embeddings and local_index <= len(embeddings):
+                metadata["_rag_embedding"] = embeddings[local_index - 1]
+            from langchain_core.documents import Document
+
+            candidate = Document(
+                page_content=str(getattr(doc, "page_content", "") or ""),
+                metadata=metadata,
+            )
+            content_key = hashlib.sha256(
+                _normalized_document_content(candidate.page_content).encode("utf-8")
+            ).hexdigest()
+            grouped.setdefault(content_key, []).append(candidate)
+
+    candidates = []
+    for duplicates in grouped.values():
+        primary = min(duplicates, key=_federated_candidate_sort_key)
+        origins = {}
+        rrf_scores_by_knowledge_base = {}
+        for duplicate in duplicates:
+            duplicate_metadata = duplicate.metadata or {}
+            knowledge_base_id = str(
+                duplicate_metadata.get("knowledge_base_id") or ""
+            )
+            rrf_score = float(duplicate_metadata.get("rrf_score") or 0.0)
+            rrf_scores_by_knowledge_base[knowledge_base_id] = max(
+                rrf_scores_by_knowledge_base.get(knowledge_base_id, 0.0),
+                rrf_score,
+            )
+            for origin in duplicate_metadata.get("knowledge_base_origins", []):
+                key = (
+                    str(origin.get("knowledge_base_id") or ""),
+                    str(origin.get("source") or ""),
+                    str(origin.get("chunk_id") or ""),
+                )
+                origins[key] = origin
+        primary.metadata = {
+            **primary.metadata,
+            "rrf_score": round(sum(rrf_scores_by_knowledge_base.values()), 9),
+            "knowledge_base_origins": [
+                origins[key] for key in sorted(origins)
+            ],
+        }
+        candidates.append(primary)
+
+    candidates.sort(key=_federated_candidate_sort_key)
+    candidates = candidates[:global_budget]
+
+    if reranker_enabled:
+        if diversity_mode == "mmr":
+            candidates = _federated_mmr(
+                candidates,
+                limit=top_n,
+                mmr_lambda=rag.get("reranker_mmr_lambda", 0.7),
+            )
+        elif diversity_mode == "source_diversity":
+            candidates = _federated_source_diversity(
+                candidates,
+                limit=top_n,
+                max_per_source=max(1, min(3, k)),
+            )
+        else:
+            candidates = candidates[:top_n]
+        reranker = _resolve_reranker(settings)
+        candidates = reranker.rerank(query, candidates, k)
+        threshold = float(rag.get("reranker_threshold", 0.0) or 0.0)
+        if threshold > 0:
+            candidates = [
+                doc
+                for doc in candidates
+                if _document_float(doc, "reranker_score") is None
+                or _document_float(doc, "reranker_score") >= threshold
+            ]
+    else:
+        candidates = candidates[:k]
+
+    for doc in candidates:
+        doc.metadata = {
+            key: value
+            for key, value in (doc.metadata or {}).items()
+            if key != "_rag_embedding"
+        }
+    return candidates
+
+
+def _normalized_document_content(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _knowledge_base_origin(
+    target: dict,
+    metadata: dict,
+    *,
+    local_rank: int,
+    rrf_score: float,
+) -> dict:
+    origin = {
+        "knowledge_base_id": target["knowledge_base_id"],
+        "knowledge_base_name": target["knowledge_base_name"],
+        "source": str(metadata.get("source") or ""),
+        "local_rank": local_rank,
+        "rrf_score": rrf_score,
+    }
+    for key in ("chunk_id", "page", "page_number", "document_id"):
+        if metadata.get(key) is not None:
+            origin[key] = metadata[key]
+    return origin
+
+
+def _federated_candidate_sort_key(doc) -> tuple:
+    metadata = getattr(doc, "metadata", {}) or {}
+    chroma_score = _document_float(doc, "chroma_score")
+    return (
+        -float(metadata.get("rrf_score") or 0.0),
+        -(chroma_score if chroma_score is not None else -1e9),
+        str(metadata.get("knowledge_base_id") or ""),
+        str(metadata.get("source") or ""),
+        str(metadata.get("chunk_id") or ""),
+    )
+
+
+def _federated_source_diversity(
+    docs,
+    *,
+    limit: int,
+    max_per_source: int,
+) -> list:
+    selected = []
+    overflow = []
+    counts = {}
+    for doc in docs:
+        metadata = doc.metadata or {}
+        key = (
+            str(metadata.get("knowledge_base_id") or ""),
+            str(metadata.get("source") or metadata.get("document_id") or ""),
+        )
+        if counts.get(key, 0) < max_per_source:
+            selected.append(doc)
+            counts[key] = counts.get(key, 0) + 1
+        else:
+            overflow.append(doc)
+        if len(selected) >= limit:
+            return selected
+    return (selected + overflow)[:limit]
+
+
+def _federated_mmr(docs, *, limit: int, mmr_lambda) -> list:
+    try:
+        weight = max(0.0, min(1.0, float(mmr_lambda)))
+    except (TypeError, ValueError):
+        weight = 0.7
+    candidates = list(docs)
+    selected = []
+    while candidates and len(selected) < limit:
+        scored = []
+        for index, doc in enumerate(candidates):
+            relevance = float((doc.metadata or {}).get("chroma_score") or 0.0)
+            embedding = (doc.metadata or {}).get("_rag_embedding")
+            redundancy = max(
+                (
+                    _cosine_similarity(
+                        embedding,
+                        (chosen.metadata or {}).get("_rag_embedding"),
+                    )
+                    for chosen in selected
+                ),
+                default=0.0,
+            )
+            score = (weight * relevance) - ((1.0 - weight) * redundancy)
+            scored.append((score, -index, index, doc))
+        _score, _position, best_index, best = max(
+            scored,
+            key=lambda item: (item[0], item[1]),
+        )
+        best.metadata = {**best.metadata, "mmr_score": round(_score, 6)}
+        selected.append(best)
+        candidates.pop(best_index)
+    return selected
+
+
+def _cosine_similarity(left, right) -> float:
+    if left is None or right is None:
+        return 0.0
+    try:
+        pairs = [(float(a), float(b)) for a, b in zip(left, right)]
+    except (TypeError, ValueError):
+        return 0.0
+    if not pairs:
+        return 0.0
+    left_norm = math.sqrt(sum(a * a for a, _ in pairs))
+    right_norm = math.sqrt(sum(b * b for _, b in pairs))
+    if not left_norm or not right_norm:
+        return 0.0
+    return sum(a * b for a, b in pairs) / (left_norm * right_norm)
+
+
+def _document_float(doc, key: str) -> Optional[float]:
+    try:
+        value = (doc.metadata or {}).get(key)
+        return float(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _resolve_reranker(settings: dict):
+    rag = settings["rag"]
+    reranker_model = rag.get(
+        "reranker_model",
+        "local/BAAI/bge-reranker-v2-m3",
+    )
+    reranker_type = rag.get("reranker_type", "local")
+    provider_id, provider_model = _split_reranker_model(reranker_model)
+    if provider_id == "local" or (
+        reranker_type == "local" and not provider_model
+    ):
+        return get_reranker(
+            enabled=True,
+            model_name=provider_model or reranker_model.removeprefix("local/"),
+        )
+    provider_id = provider_id or reranker_type
+    provider = _find_reranker_provider(settings, provider_id)
+    base_url = provider.get("base_url") if provider else None
+    api_key = (
+        rag.get("reranker_api_key")
+        or rag.get("reranker_regolo_api_key")
+        or (resolve_api_key(provider) if provider else "")
+    )
+    requires_api_key = bool(provider.get("requires_api_key", False)) if provider else False
+    if (
+        provider
+        and provider.get("enabled", True)
+        and base_url
+        and (api_key or not requires_api_key)
+    ):
+        return get_reranker(
+            enabled=True,
+            model_name=provider_model,
+            base_url=base_url,
+            api_key=api_key or "openai-compatible-reranker",
+            mode=provider.get("reranker_mode", "chat_completions"),
+        )
+    from utils.reranker import DummyReranker
+
+    return DummyReranker()
+
+
 def _merge_context_docs(context_docs, extra_context_docs: Optional[list] = None) -> list:
     merged = list(context_docs or [])
     seen = {
@@ -777,9 +1228,16 @@ def _merge_context_docs(context_docs, extra_context_docs: Optional[list] = None)
 def _serialize_context(
     context_docs,
     file_index_path: Optional[str] = None,
+    knowledge_base_targets: Optional[list[dict]] = None,
     include_downloads: bool = True,
 ) -> List[dict]:
-    file_index = FileIndex(file_index_path or Config.paths.file_index)
+    target_indexes = {
+        str(target.get("knowledge_base_id")): FileIndex(
+            target.get("file_index_path") or file_index_path or Config.paths.file_index
+        )
+        for target in (knowledge_base_targets or [])
+    }
+    fallback_index = FileIndex(file_index_path or Config.paths.file_index)
     serialized = []
     for doc in (context_docs or []):
         entry = {
@@ -787,7 +1245,14 @@ def _serialize_context(
             "metadata": doc.metadata,
         }
         if include_downloads:
-            entry["download_url"] = _get_download_url(file_index, doc)
+            knowledge_base_id = str(
+                (getattr(doc, "metadata", {}) or {}).get("knowledge_base_id")
+                or ""
+            )
+            entry["download_url"] = _get_download_url(
+                target_indexes.get(knowledge_base_id, fallback_index),
+                doc,
+            )
         serialized.append(entry)
     return serialized
 
@@ -806,6 +1271,13 @@ def _source_payload(doc) -> dict:
         "source_type": source_type,
         "snippet": _source_snippet(doc.page_content),
     }
+    for key in (
+        "knowledge_base_id",
+        "knowledge_base_name",
+        "knowledge_base_origins",
+    ):
+        if metadata.get(key) is not None:
+            payload[key] = metadata[key]
     for key in ("chunk_id", "page", "page_number"):
         if metadata.get(key) is not None:
             public_key = "page" if key == "page_number" else key

@@ -30,6 +30,16 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
+    def query_by_embedding(
+        self,
+        query_embedding,
+        k: int,
+        *,
+        include_embeddings: bool = False,
+    ):
+        pass
+
+    @abstractmethod
     def query_with_rerank(
         self,
         query: str,

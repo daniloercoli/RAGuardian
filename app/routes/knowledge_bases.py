@@ -17,7 +17,11 @@ from utils.auth import (
     require_login,
 )
 from utils.job_store import RUNNING_JOB_STATUSES, get_job_store, queue_name
-from utils.index_lock import lifecycle_read_lock
+from utils.index_lock import (
+    assert_distributed_locks_healthy,
+    lifecycle_read_lock,
+    lifecycle_write_lock,
+)
 from utils.knowledge_base_store import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     KnowledgeBaseValidationError,
@@ -50,7 +54,7 @@ def register_knowledge_base_routes(app) -> None:
     @app.route("/api/knowledge-bases", methods=["GET"])
     @require_login
     def knowledge_bases_list():
-        return jsonify({"knowledge_bases": _list_payload(app, public=False)})
+        return jsonify(_list_response(app, public=False))
 
     @app.route("/api/knowledge-bases", methods=["POST"])
     @require_login
@@ -88,7 +92,7 @@ def register_knowledge_base_routes(app) -> None:
     @app.route("/api/v1/knowledge-bases", methods=["GET"])
     @require_api_any_scope("query", "ingest", "kb_manage")
     def api_knowledge_bases_list():
-        return jsonify({"knowledge_bases": _list_payload(app, public=True)})
+        return jsonify(_list_response(app, public=True))
 
     @app.route("/api/v1/knowledge-bases", methods=["POST"])
     @require_api_scope("kb_manage")
@@ -134,6 +138,17 @@ def _list_payload(app, *, public: bool) -> list[dict]:
                     continue
                 payload.append(_with_stats(workspace, current))
         return payload
+
+
+def _list_response(app, *, public: bool) -> dict:
+    return {
+        "knowledge_bases": _list_payload(app, public=public),
+        "limits": {
+            "max_query_knowledge_bases": int(
+                app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5)
+            ),
+        },
+    }
 
 
 def _get_payload(app, knowledge_base_id: str, *, public: bool) -> dict:
@@ -210,24 +225,30 @@ def _update_response(app, knowledge_base_id: str, *, public: bool):
     knowledge_base_id = validate_knowledge_base_id(knowledge_base_id)
     if public:
         _ensure_api_key_allowed(knowledge_base_id)
-    with lifecycle_read_lock():
-        workspace = workspace_from_request(app)
-        collection_name = collection_for_knowledge_base(
-            workspace.workspace_id,
+    workspace = workspace_from_request(app)
+    collection_name = collection_for_knowledge_base(
+        workspace.workspace_id,
+        knowledge_base_id,
+    )
+    with lifecycle_write_lock(scope=collection_name, publish=True):
+        assert_distributed_locks_healthy()
+        if "name" in data:
+            from utils.rag_engine import clear_cache_for_collection
+
+            clear_cache_for_collection(collection_name)
+            assert_distributed_locks_healthy()
+        record = knowledge_base_store(workspace, app=app).update(
             knowledge_base_id,
+            name=data.get("name") if "name" in data else None,
+            description=(
+                data.get("description")
+                if "description" in data
+                else None
+            ),
         )
-        with lifecycle_read_lock(scope=collection_name):
-            record = knowledge_base_store(workspace, app=app).update(
-                knowledge_base_id,
-                name=data.get("name") if "name" in data else None,
-                description=(
-                    data.get("description")
-                    if "description" in data
-                    else None
-                ),
-            )
-            request._rag_knowledge_base_id = knowledge_base_id
-            return jsonify(_with_stats(workspace, record))
+        assert_distributed_locks_healthy()
+        request._rag_knowledge_base_id = knowledge_base_id
+        return jsonify(_with_stats(workspace, record))
 
 
 def _delete_response(app, knowledge_base_id: str, *, public: bool):
@@ -756,8 +777,9 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             from utils.conversation_memory import get_conversation_store
 
             assert_distributed_locks_healthy()
-            get_conversation_store().clear_by_prefix(
-                f"{workspace_id}:kb:{knowledge_base_id}:"
+            get_conversation_store().clear_by_knowledge_base(
+                workspace_id,
+                knowledge_base_id,
             )
             assert_distributed_locks_healthy()
             job_store.clear_by_knowledge_base(
