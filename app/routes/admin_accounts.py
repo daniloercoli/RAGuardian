@@ -160,10 +160,10 @@ def register_admin_account_routes(app) -> None:
                     effective_scopes = [
                         scope
                         for scope in scopes
-                        if scope in {"query", "ingest", "speech", "kb_manage"}
+                        if scope in {"query", "ingest", "speech", "kb_manage", "agent_manage"}
                     ] or ["query"]
                     if (
-                        {"query", "ingest"} & set(effective_scopes)
+                        {"query", "ingest", "agent_manage"} & set(effective_scopes)
                         and not knowledge_base_ids
                     ):
                         knowledge_base_ids = ["default"]
@@ -222,11 +222,14 @@ def register_admin_account_routes(app) -> None:
                     effective_scopes = [
                         scope
                         for scope in scopes
-                        if scope in {"query", "ingest", "speech", "kb_manage"}
+                        if scope in {"query", "ingest", "speech", "kb_manage", "agent_manage"}
                     ] or ["query"]
-                    if {"query", "ingest"} & set(effective_scopes) and not knowledge_base_ids:
+                    if (
+                        {"query", "ingest", "agent_manage"} & set(effective_scopes)
+                        and not knowledge_base_ids
+                    ):
                         raise ValueError(
-                            "Seleziona almeno una knowledge base per gli scope query o ingest"
+                            "Seleziona almeno una knowledge base per gli scope query, ingest o agent_manage"
                         )
                     with lifecycle_read_lock():
                         updated = store.update_api_key_access(

@@ -10,7 +10,7 @@ API keys provide per-user authentication for API access to the RAG service via t
 | **Expiration** | Set TTL as `Nd`, `Nh`, or `Nm` (e.g. `7d`, `48h`, `30m`) with second-level UTC precision |
 | **Rotation** | Replace key value while preserving name, scopes, and expiration |
 | **Renaming** | Update key label without affecting value or scopes |
-| **Scopes** | Restrict to `query`, `ingest`, `speech`, `kb_manage` |
+| **Scopes** | Restrict to `query`, `ingest`, `speech`, `kb_manage`, `agent_manage` |
 | **KB allowlist** | Restrict access to selected knowledge base IDs |
 | **Usage** | Logged to `app/data/api_keys_usage.json` with retention |
 
@@ -24,8 +24,8 @@ Navigate to **Admin API Keys** → **Create API Key** form:
 | Name | Yes | Arbitrary string | Label for the key (e.g. `production`, `testing`) |
 | Description | No | Free text | Human-readable purpose |
 | Expires In | No | `N[dhm]` | TTL (e.g. `7d`, `24h`, `60m`). Leave blank for never |
-| Scopes | Yes | Checkboxes | `query`, `ingest`, `speech`, `kb_manage` |
-| Knowledge bases | For query/ingest | Checkboxes | One or more authorized targets |
+| Scopes | Yes | Checkboxes | `query`, `ingest`, `speech`, `kb_manage`, `agent_manage` |
+| Knowledge bases | For query/ingest/agent_manage | Checkboxes | One or more authorized targets |
 | Status | Yes | Select | `Enabled` or `Disabled` |
 
 The raw value is displayed once, immediately after creation. Copy it at that point: the server stores only a SHA-256 hash plus the masked prefix/suffix and cannot reveal the key again.
@@ -77,13 +77,16 @@ Valid scopes:
 | `ingest` | `/upload`, `/api/v1/upload`, `/api/v1/files`, file ingestion |
 | `speech` | `POST /api/v1/tts` text-to-speech synthesis |
 | `kb_manage` | Create, update, and asynchronously delete knowledge bases |
+| `agent_manage` | Create, update, and delete chat agents; read with `query` |
 
 Scopes and the `knowledge_base_ids` allowlist are both enforced. `kb_manage`
-does not grant query or ingest by itself. Existing keys migrate to
-`["default"]`. Deleting a KB removes it from every allowlist; keys left without
-a target are disabled rather than reassigned.
+and `agent_manage` do not grant query or ingest by themselves. Keys with
+`query`, `ingest`, or `agent_manage` require at least one allowed KB so Agent
+CRUD can enforce the same boundary. Existing keys migrate to `["default"]`.
+Deleting a KB removes it from every allowlist; keys left without a target are
+disabled rather than reassigned.
 
-An integration normally needs one key with the required combination of scopes. For example, the WordPress plugin can run chat with `query`, article import/sync and audio upload with `ingest`, and the optional TTS button with `speech`.
+An integration normally needs one key with the required combination of scopes. For example, the WordPress plugin can run chat with `query`, article import/sync and audio upload with `ingest`, the optional TTS button with `speech`, and wp-admin Agent CRUD with `agent_manage`.
 
 ## Disabling and Deleting
 

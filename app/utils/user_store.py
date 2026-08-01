@@ -222,8 +222,13 @@ class UserStore:
         normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(
             knowledge_base_ids
         )
-        if {"query", "ingest"} & set(normalized_scopes) and not normalized_knowledge_base_ids:
-            raise ValueError("At least one knowledge base is required for query or ingest")
+        if (
+            {"query", "ingest", "agent_manage"} & set(normalized_scopes)
+            and not normalized_knowledge_base_ids
+        ):
+            raise ValueError(
+                "At least one knowledge base is required for query, ingest, or agent_manage"
+            )
         new_key = {
             "id": uuid.uuid4().hex,
             "name": name,
@@ -452,6 +457,16 @@ class UserStore:
                     continue
                 for key in (usr.get("api_keys") or []):
                     if key.get("name") == key_name:
+                        knowledge_base_ids = self._normalize_knowledge_base_ids(
+                            key.get("knowledge_base_ids")
+                        )
+                        if (
+                            {"query", "ingest", "agent_manage"} & set(normalized)
+                            and not knowledge_base_ids
+                        ):
+                            raise ValueError(
+                                "At least one knowledge base is required for query, ingest, or agent_manage"
+                            )
                         key["scopes"] = normalized
                         break
                 else:
@@ -478,9 +493,9 @@ class UserStore:
                     if key.get("name") != key_name:
                         continue
                     scopes = set(key.get("scopes") or ["query"])
-                    if {"query", "ingest"} & scopes and not normalized:
+                    if {"query", "ingest", "agent_manage"} & scopes and not normalized:
                         raise ValueError(
-                            "At least one knowledge base is required for query or ingest"
+                            "At least one knowledge base is required for query, ingest, or agent_manage"
                         )
                     key["knowledge_base_ids"] = normalized
                     usr["updated_at"] = _now()
@@ -505,11 +520,11 @@ class UserStore:
             knowledge_base_ids
         )
         if (
-            {"query", "ingest"} & set(normalized_scopes)
+            {"query", "ingest", "agent_manage"} & set(normalized_scopes)
             and not normalized_knowledge_base_ids
         ):
             raise ValueError(
-                "At least one knowledge base is required for query or ingest"
+                "At least one knowledge base is required for query, ingest, or agent_manage"
             )
         with self._lock:
             users = self._list_unlocked()
@@ -637,7 +652,10 @@ class UserStore:
                     scopes = set(key.get("scopes") or ["query"])
                     if (
                         not key["knowledge_base_ids"]
-                        and "kb_manage" not in scopes
+                        and (
+                            bool({"query", "ingest", "agent_manage"} & scopes)
+                            or "kb_manage" not in scopes
+                        )
                     ):
                         key["enabled"] = False
                         disabled += 1
@@ -674,7 +692,7 @@ class UserStore:
 
     def _normalize_api_scopes(self, scopes: list[str]) -> list[str]:
         """Normalize scopes to known values."""
-        valid: set[str] = {"query", "ingest", "speech", "kb_manage"}
+        valid: set[str] = {"query", "ingest", "speech", "kb_manage", "agent_manage"}
         result: list[str] = []
         for s in scopes:
             cleaned = str(s).strip().lower()

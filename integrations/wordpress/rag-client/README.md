@@ -32,18 +32,39 @@ Recommended setup:
 
 1. In RAGuardian, create a local user such as `website@example.com`.
 2. Log in as that user or as admin and create one API key for that user's workspace.
-3. Give the key `query` scope for chat and `ingest` scope for article import/sync and audio upload. Add `speech` only if TTS is enabled.
+3. Give the key `query` scope for chat and `ingest` scope for article import/sync and audio upload. Add `speech` only if TTS is enabled and `agent_manage` only if WordPress administrators will manage Agents.
 4. Add that key to **Settings -> Raguardian** in WordPress.
 5. Use **Test RAGuardian health** to verify that WordPress can reach `/api/v1/health`.
 
 Do not create separate keys for chat, ingestion, and speech unless you intentionally want separate rotation or audit boundaries. The normal plugin setup uses one key with the required scopes.
 
-The selected KB is stored in WordPress options and injected by PHP into query,
-health, upload, audio, and delete calls. Visitors cannot override it. An empty
-setting means the default KB. Changing it does not move existing documents;
-run a new import or sync for the new target. WXR queues and post-sync cron jobs
-store the target when they are created, so later settings changes cannot
-redirect in-progress work.
+Legacy chat and ingestion have separate server-side KB targets. Visitors cannot
+override either one. An empty setting means the default KB. Changing the
+ingestion target does not move existing documents; run a new import or sync for
+the new target. WXR queues and post-sync cron jobs store that target when they
+are created, so later settings changes cannot redirect in-progress work.
+
+## Chat Agents
+
+Agent mode lets visitors choose from an administrator-maintained allowlist of
+RAGuardian Agents. An Agent bundles one provider/model, one or more knowledge
+bases, and exactly one personal or shared system prompt. The browser receives
+only each public Agent's ID, name, and description; the API key and Agent
+configuration remain server-side.
+
+In **Settings -> Raguardian**:
+
+1. enable Agent mode;
+2. select which currently available Agents visitors may use;
+3. optionally choose a default Agent, or require an explicit visitor choice;
+4. use **Manage Agents** to create, edit, or delete Agents when the API key has
+   `agent_manage` scope.
+
+The visitor selector has no automatic Custom-chat fallback. Switching Agents
+clears the visible transcript and starts a new conversation ID. Every message
+is checked again by PHP against both the saved allowlist and the current
+API-key-scoped Agent catalog. File ingestion and audio upload always use the
+dedicated ingestion KB, never an Agent.
 
 ## Architecture
 
@@ -55,6 +76,7 @@ The bootstrap file `rag-client.php` only wires the plugin together. Runtime beha
 | `EC_Rag_Options` and `EC_Rag_Settings_Form` | Settings registration, sanitization, and admin UI |
 | `EC_Rag_Widget` | Floating widget, shortcode rendering, asset loading, inline config |
 | `EC_Rag_Ajax` | Chat, TTS, and audio upload AJAX proxy endpoints |
+| `EC_Rag_Ajax_Agents` | Nonce/capability-protected wp-admin Agent CRUD proxy |
 | `EC_Rag_Ingestion` | WXR import queue and public-post live synchronization hooks |
 | `EC_Rag_Rate_Limiter` | WordPress transient-based abuse throttling |
 | `EC_Rag_Health_Check` | Periodic connectivity check, admin bar state, admin notices |

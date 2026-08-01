@@ -68,6 +68,11 @@ async function configurePlugin(page, options = {}) {
     await setCheckbox(page, 'input[name="ec_rag_client_options[enable_tts]"]', options.tts ?? false);
     await setCheckbox(page, 'input[name="ec_rag_client_options[enable_audio_upload]"]', options.audio ?? false);
     await setCheckbox(page, 'input[name="ec_rag_client_options[show_sources]"]', options.showSources ?? true);
+    await setCheckbox(
+        page,
+        'input[name="ec_rag_client_options[enable_chat_agents_mode]"]',
+        options.agentMode ?? false,
+    );
     await page.fill(
         'input[name="ec_rag_client_options[rate_limit_requests]"]',
         String(options.rateLimit ?? 10),
@@ -76,14 +81,40 @@ async function configurePlugin(page, options = {}) {
         'input[name="ec_rag_client_options[rate_limit_window]"]',
         String(options.rateLimitWindow ?? 60),
     );
-    await page.click("#submit");
+    await page.locator('form[action="options.php"] input[type="submit"]').click({force: true});
     await expect(page.locator(".notice-success, #setting-error-settings_updated")).toBeVisible();
+    if (options.agentMode) {
+        await setCheckbox(
+            page,
+            'input[name="ec_rag_client_options[enable_chat_agents_mode]"]',
+            true,
+        );
+        const allowed = page.locator(
+            'input[name="ec_rag_client_options[allowed_agent_ids][]"]',
+        );
+        for (let index = 0; index < await allowed.count(); index++) {
+            if (!(await allowed.nth(index).isChecked())) {
+                await allowed.nth(index).check({force: true});
+            }
+        }
+        await page.selectOption(
+            '#ec-rag-default-agent',
+            'agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            {force: true},
+        );
+        await page.locator('form[action="options.php"] input[type="submit"]').click({force: true});
+        await expect(page.locator(".notice-success, #setting-error-settings_updated")).toBeVisible();
+    }
 }
 
 async function setCheckbox(page, selector, checked) {
     const locator = page.locator(selector);
     if ((await locator.isChecked()) !== checked) {
-        await locator.click();
+        if (checked) {
+            await locator.check({force: true});
+        } else {
+            await locator.uncheck({force: true});
+        }
     }
 }
 
@@ -152,6 +183,33 @@ test("disabled sources are removed from the AJAX response", async ({page}) => {
     expect(payload.success).toBe(true);
     expect(payload.data.sources).toBeUndefined();
     await expect(page.locator(".ec-rag-sources")).toHaveCount(0);
+});
+
+test("guest Agent selector sends only an allowlisted Agent and rotates conversation", async ({page}) => {
+    await configurePlugin(page, {allowGuest: true, agentMode: true});
+    await page.context().clearCookies();
+    await page.goto("/");
+    await page.locator(".ec-rag-launcher").click({force: true});
+    const selector = page.locator("[data-ec-rag-agent]");
+    await expect(selector).toHaveValue("agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    await page.locator("[data-ec-rag-input]").fill("Question for support");
+    await page.locator(".ec-rag-form button[type='submit']").click({force: true});
+    await expect(page.getByText(/Fake RAG answer for:/i)).toBeVisible();
+
+    let requests = await fakeRagRequests();
+    const first = requests.find((entry) => entry.type === "query" && entry.body.query === "Question for support");
+    expect(first.body.agent_id).toBe("agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(first.body.knowledge_base_id).toBeUndefined();
+
+    await selector.selectOption("agent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    await expect(page.getByText(/Question for support/i)).toHaveCount(0);
+    await page.locator("[data-ec-rag-input]").fill("Question for sales");
+    await page.locator(".ec-rag-form button[type='submit']").click({force: true});
+    await expect(page.getByText(/Fake RAG answer for: Question for sales/i)).toBeVisible();
+    requests = await fakeRagRequests();
+    const second = requests.find((entry) => entry.type === "query" && entry.body.query === "Question for sales");
+    expect(second.body.agent_id).toBe("agent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(second.body.conversation_id).not.toBe(first.body.conversation_id);
 });
 
 test("rotating conversation IDs does not bypass guest rate limits", async ({page}) => {

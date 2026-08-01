@@ -89,7 +89,7 @@ final class EC_Rag_Ingestion_Tests extends TestCase {
     public function test_scheduled_post_sync_freezes_the_selected_knowledge_base(): void {
         $knowledge_base_id = 'kb_11111111111111111111111111111111';
         $options = \EC_Rag_Options::defaults();
-        $options['knowledge_base_id'] = $knowledge_base_id;
+        $options['ingestion_knowledge_base_id'] = $knowledge_base_id;
         $GLOBALS['ec_rag_test_options'][\EC_Rag_Options::OPTION_NAME] = $options;
 
         \EC_Rag_Ingestion::schedule_post_sync(42);
@@ -120,7 +120,7 @@ final class EC_Rag_Ingestion_Tests extends TestCase {
         $options = \EC_Rag_Options::defaults();
         $options['base_url'] = 'https://rag.example.test';
         $options['api_key'] = 'test-key';
-        $options['knowledge_base_id'] = $current_id;
+        $options['ingestion_knowledge_base_id'] = $current_id;
         $options['ingestion_batch_size'] = '1';
         $GLOBALS['ec_rag_test_options'][\EC_Rag_Options::OPTION_NAME] = $options;
         $GLOBALS['ec_rag_test_options'][\EC_Rag_Ingestion::IMPORT_OPTION] = [

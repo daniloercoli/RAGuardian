@@ -190,7 +190,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "updated_at": "",
 }
 
-API_SCOPES = {"query", "ingest", "speech", "kb_manage"}
+API_SCOPES = {"query", "ingest", "speech", "kb_manage", "agent_manage"}
 VOICE_FORMATS = {"mp3", "wav", "opus", "aac", "flac"}
 OCR_MODES = {"vision_chat", "ocr_endpoint", "local_engine"}
 OCR_INPUT_TYPES = {"image", "pdf"}

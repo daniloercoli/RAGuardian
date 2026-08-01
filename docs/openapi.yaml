@@ -23,6 +23,8 @@ tags:
     description: RAG file upload and indexing.
   - name: Knowledge Bases
     description: Catalog and lifecycle management for isolated knowledge bases.
+  - name: Chat Agents
+    description: Named presets bundling a provider, model, knowledge bases, and prompt for query-by-agent_id.
   - name: OCR
     description: Text extraction from images and PDFs.
   - name: Speech
@@ -385,6 +387,149 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Default KB, deleting KB, or active jobs prevent deletion.
+  /api/v1/agents:
+    get:
+      tags:
+        - Chat Agents
+      operationId: listApiV1Agents
+      summary: List chat agents visible to the API key
+      description: |
+        Requires `query` or `agent_manage`. Only agents whose
+        `knowledge_base_ids` are a subset of the key's allowlist are returned.
+      responses:
+        "200":
+          description: Visible agents and workspace limits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgentsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags:
+        - Chat Agents
+      operationId: createApiV1Agent
+      summary: Create a chat agent
+      description: Requires `agent_manage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatAgentCreateInput"
+      responses:
+        "201":
+          description: Agent created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgent"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/KnowledgeBaseNotFound"
+        "409":
+          description: KB limit, agent count limit, or duplicate name.
+  /api/v1/agents/options:
+    get:
+      tags:
+        - Chat Agents
+      operationId: getApiV1AgentOptions
+      summary: Models, knowledge bases, prompts, and limits for the API key
+      description: |
+        Requires `query` or `agent_manage`. Useful for building agent
+        create/edit forms in external clients.
+      responses:
+        "200":
+          description: Available options.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgentOptionsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/agents/{agent_id}:
+    parameters:
+      - $ref: "#/components/parameters/AgentIdPath"
+    get:
+      tags:
+        - Chat Agents
+      operationId: getApiV1Agent
+      summary: Get one chat agent
+      description: |
+        Requires `query` or `agent_manage`. An agent referencing a KB outside
+        the key's allowlist is hidden with 404.
+      responses:
+        "200":
+          description: Agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ChatAgentNotFound"
+    patch:
+      tags:
+        - Chat Agents
+      operationId: updateApiV1Agent
+      summary: Update a chat agent
+      description: |
+        Requires `agent_manage`. All fields are optional; only provided fields
+        change. At least one field is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatAgentUpdateInput"
+      responses:
+        "200":
+          description: Updated agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgent"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ChatAgentNotFound"
+        "409":
+          description: KB limit or duplicate name.
+    delete:
+      tags:
+        - Chat Agents
+      operationId: deleteApiV1Agent
+      summary: Delete a chat agent
+      description: Requires `agent_manage`.
+      responses:
+        "200":
+          description: Agent deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAgentDeleteResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/ChatAgentNotFound"
   /api/v1/conversations/{conversation_id}:
     delete:
       tags:
@@ -758,6 +903,12 @@ components:
       required: true
       schema:
         $ref: "#/components/schemas/KnowledgeBaseId"
+    AgentIdPath:
+      name: agent_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ChatAgentId"
   responses:
     Unauthorized:
       description: Missing or invalid API key.
@@ -841,6 +992,17 @@ components:
               value:
                 error: Eliminazione knowledge base fallita
                 status: knowledge_base_delete_failed
+    ChatAgentNotFound:
+      description: Chat agent does not exist or is outside the API key's KB allowlist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missingOrUnauthorized:
+              value:
+                error: Agent non trovato
+                status: chat_agent_not_found
     RateLimited:
       description: Too many requests in the configured time window.
       content:
@@ -940,6 +1102,229 @@ components:
             data_sources:
               type: integer
               minimum: 0
+    ChatAgentId:
+      type: string
+      pattern: "^agent_[0-9a-f]{32}$"
+    ChatAgentPromptRef:
+      type: object
+      required: [id, scope]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        scope:
+          type: string
+          enum: [personal, shared]
+      additionalProperties: false
+    ChatAgentAvailabilityIssue:
+      type: object
+      required: [code, field, message]
+      properties:
+        code:
+          type: string
+          examples:
+            - model_unavailable
+            - knowledge_base_missing
+            - knowledge_base_inactive
+            - knowledge_base_limit_exceeded
+            - prompt_missing
+            - prompt_inactive
+        field:
+          type: string
+        message:
+          type: string
+    ChatAgent:
+      type: object
+      required:
+        - id
+        - name
+        - description
+        - provider_id
+        - model_id
+        - knowledge_base_ids
+        - prompt_ref
+        - created_at
+        - updated_at
+        - available
+        - issues
+      properties:
+        id:
+          $ref: "#/components/schemas/ChatAgentId"
+        name:
+          type: string
+        description:
+          type: string
+        provider_id:
+          type: string
+        model_id:
+          type: string
+        knowledge_base_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/KnowledgeBaseId"
+        prompt_ref:
+          $ref: "#/components/schemas/ChatAgentPromptRef"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        available:
+          type: boolean
+          description: True when the agent can currently run (no availability issues).
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatAgentAvailabilityIssue"
+    ChatAgentsResponse:
+      type: object
+      required: [agents, limits, capabilities]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatAgent"
+        limits:
+          type: object
+          required: [max_chat_agents, max_query_knowledge_bases]
+          properties:
+            max_chat_agents:
+              type: integer
+              minimum: 0
+            max_query_knowledge_bases:
+              type: integer
+              minimum: 1
+        capabilities:
+          type: object
+          required: [can_manage]
+          properties:
+            can_manage:
+              type: boolean
+    ChatAgentCreateInput:
+      type: object
+      required:
+        - name
+        - provider_id
+        - model_id
+        - knowledge_base_ids
+        - prompt_ref
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+        provider_id:
+          type: string
+          minLength: 1
+          maxLength: 120
+        model_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        knowledge_base_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/KnowledgeBaseId"
+        prompt_ref:
+          $ref: "#/components/schemas/ChatAgentPromptRef"
+      additionalProperties: false
+    ChatAgentUpdateInput:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+        provider_id:
+          type: string
+          minLength: 1
+          maxLength: 120
+        model_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        knowledge_base_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/KnowledgeBaseId"
+        prompt_ref:
+          $ref: "#/components/schemas/ChatAgentPromptRef"
+      additionalProperties: false
+    ChatAgentDeleteResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+    ChatAgentOptionsResponse:
+      type: object
+      required:
+        - models
+        - default_provider
+        - default_model
+        - knowledge_bases
+        - prompts
+        - limits
+        - capabilities
+      properties:
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelInfo"
+        default_provider:
+          type: string
+        default_model:
+          type: string
+        knowledge_bases:
+          type: array
+          items:
+            $ref: "#/components/schemas/KnowledgeBase"
+        prompts:
+          type: array
+          items:
+            type: object
+            required: [id, name, scope, is_active]
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              scope:
+                type: string
+                enum: [personal, shared]
+              is_active:
+                type: boolean
+        limits:
+          type: object
+          required: [max_chat_agents, max_query_knowledge_bases]
+          properties:
+            max_chat_agents:
+              type: integer
+              minimum: 0
+            max_query_knowledge_bases:
+              type: integer
+              minimum: 1
+        capabilities:
+          type: object
+          required: [can_manage]
+          properties:
+            can_manage:
+              type: boolean
     ErrorResponse:
       type: object
       required:
@@ -1204,6 +1589,14 @@ components:
       required:
         - query
       properties:
+        agent_id:
+          $ref: "#/components/schemas/ChatAgentId"
+          description: |
+            Resolve provider, model, knowledge bases, and prompt from a chat
+            agent preset. When provided, `provider`, `model`,
+            `knowledge_base_ids`, `knowledge_base_id`, `system_prompt_id`, and
+            `system_prompt_scope` must be omitted or a 400 error with status
+            `agent_conflicting_params` is returned.
         knowledge_base_id:
           $ref: "#/components/schemas/KnowledgeBaseId"
           deprecated: true
@@ -1320,6 +1713,12 @@ components:
           type: string
         provider_name:
           type: string
+        agent_id:
+          $ref: "#/components/schemas/ChatAgentId"
+          description: Present only when the query was resolved from a chat agent.
+        agent_name:
+          type: string
+          description: Present only when the query was resolved from a chat agent.
         response_language:
           type: string
           description: Effective output language policy used in the RAG prompt.

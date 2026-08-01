@@ -29,6 +29,10 @@ class EC_Rag_Api_Client {
     /** Briefly cache failures so an unavailable service does not stall every page load. */
     const KNOWLEDGE_BASE_CATALOG_ERROR_TTL = 30;
 
+    /** Agent catalogs use the same short, fail-fast settings-page policy. */
+    const AGENT_CATALOG_TTL = 300;
+    const AGENT_CATALOG_ERROR_TTL = 30;
+
     /** The options array (injected via dependency). */
     public $options = [];
 
@@ -77,9 +81,6 @@ class EC_Rag_Api_Client {
             return $result;
         }
 
-        if (strpos($path, '/api/v1/health') === 0) {
-            $path = $this->append_knowledge_base_query($path);
-        }
         $url = $this->options['base_url'] . $path;
         $args = [
             'timeout' => absint($this->options['request_timeout'] ?? 45),
@@ -188,12 +189,6 @@ class EC_Rag_Api_Client {
             return $result;
         }
 
-        if (
-            strpos($path, '/api/v1/query') === 0
-            && $this->knowledge_base_id() !== ''
-        ) {
-            $payload['knowledge_base_id'] = $this->knowledge_base_id();
-        }
         $url = $this->options['base_url'] . $path;
         $args = [
             'timeout' => absint($this->options['request_timeout'] ?? 45),
@@ -210,6 +205,27 @@ class EC_Rag_Api_Client {
 
         $this->options = ($this->get_options)();
         return $response;
+    }
+
+    /**
+     * Submit a chat query with exactly one server-side routing mode.
+     *
+     * @param array  $payload Query payload without routing fields.
+     * @param string $agent_id Validated Agent ID, or empty for legacy KB mode.
+     * @return array|WP_Error
+     */
+    public function query(array $payload, string $agent_id = '') {
+        unset($payload['agent_id'], $payload['knowledge_base_id'], $payload['knowledge_base_ids']);
+        $agent_id = EC_Rag_Options::sanitize_agent_id($agent_id);
+        if ($agent_id !== '') {
+            $payload['agent_id'] = $agent_id;
+        } else {
+            $knowledge_base_id = $this->knowledge_base_id();
+            if ($knowledge_base_id !== '') {
+                $payload['knowledge_base_id'] = $knowledge_base_id;
+            }
+        }
+        return $this->post('/api/v1/query', $payload);
     }
 
     /**
@@ -233,9 +249,9 @@ class EC_Rag_Api_Client {
                 strpos($path, '/api/v1/files') === 0
                 || strpos($path, '/api/v1/audio') === 0
             )
-            && $this->knowledge_base_id() !== ''
+            && $this->ingestion_knowledge_base_id() !== ''
         ) {
-            $fields['knowledge_base_id'] = $this->knowledge_base_id();
+            $fields['knowledge_base_id'] = $this->ingestion_knowledge_base_id();
         }
 
         foreach ($fields as $name => $value) {
@@ -272,6 +288,184 @@ class EC_Rag_Api_Client {
     }
 
     /**
+     * GET Agents catalog.
+     *
+     * @return array|WP_Error
+     */
+    public function get_agents() {
+        return $this->get_agent_catalog();
+    }
+
+    /**
+     * Fetch the API-key-authorized Agent catalog with a credential-scoped cache.
+     *
+     * @return array|WP_Error
+     */
+    public function get_agent_catalog() {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+
+        $cache_key = $this->agent_catalog_cache_key();
+        $cached = get_transient($cache_key);
+        if (is_array($cached) && array_key_exists('ok', $cached)) {
+            if ($cached['ok'] && is_array($cached['payload'] ?? null)) {
+                return $cached['payload'];
+            }
+            return new WP_Error(
+                'ec_rag_agent_catalog_unavailable',
+                sanitize_text_field($cached['message'] ?? __('Agent catalog is unavailable', 'ec-rag'))
+            );
+        }
+
+        $url = $this->options['base_url'] . '/api/v1/agents';
+        $args = [
+            'timeout' => self::KNOWLEDGE_BASE_CATALOG_TIMEOUT,
+            'blocking' => true,
+            'headers' => [
+                'X-API-Key'    => $this->options['api_key'],
+                'X-Request-ID' => $this->request_id,
+            ],
+        ];
+        $decoded = self::decode_response($this->do_request('GET', $url, $args));
+        if (is_wp_error($decoded) || !is_array($decoded['agents'] ?? null)) {
+            $message = is_wp_error($decoded)
+                ? $decoded->get_error_message()
+                : __('Agent catalog returned an invalid response', 'ec-rag');
+            set_transient(
+                $cache_key,
+                ['ok' => false, 'message' => sanitize_text_field($message)],
+                self::AGENT_CATALOG_ERROR_TTL
+            );
+            return is_wp_error($decoded)
+                ? $decoded
+                : new WP_Error('ec_rag_invalid_agent_catalog', $message);
+        }
+        set_transient(
+            $cache_key,
+            ['ok' => true, 'payload' => $decoded],
+            self::AGENT_CATALOG_TTL
+        );
+        return $decoded;
+    }
+
+    /** @return array|WP_Error */
+    public function get_agent_options() {
+        return $this->get('/api/v1/agents/options');
+    }
+
+    /**
+     * Create a new Agent.
+     *
+     * @param string $name Agent name.
+     * @param string $description Agent description.
+     * @param string $provider_id Provider ID.
+     * @param string $model_id Model ID.
+     * @param array  $knowledge_base_ids Knowledge base IDs.
+     * @param array  $prompt_ref Prompt reference (id, scope).
+     * @return array|WP_Error
+     */
+    public function create_agent(string $name, string $description, string $provider_id, string $model_id, array $knowledge_base_ids, array $prompt_ref) {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        $payload = [
+            'name' => $name,
+            'description' => $description,
+            'provider_id' => $provider_id,
+            'model_id' => $model_id,
+            'knowledge_base_ids' => array_values(array_unique($knowledge_base_ids)),
+        ];
+        $payload['prompt_ref'] = $prompt_ref;
+        $response = $this->post('/api/v1/agents', $payload);
+        if (!is_wp_error($response)) {
+            $this->invalidate_agent_catalog_cache();
+        }
+        return $response;
+    }
+
+    /**
+     * Get a single Agent by ID.
+     *
+     * @param string $agent_id Agent ID.
+     * @return array|WP_Error
+     */
+    public function get_agent(string $agent_id) {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        return $this->get('/api/v1/agents/' . rawurlencode($agent_id));
+    }
+
+    /**
+     * Update an Agent.
+     *
+     * @param string $agent_id Agent ID.
+     * @param array  $fields Fields to update.
+     * @return array|WP_Error
+     */
+    public function update_agent(string $agent_id, array $fields) {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        $response = $this->patch('/api/v1/agents/' . rawurlencode($agent_id), $fields);
+        if (!is_wp_error($response)) {
+            $this->invalidate_agent_catalog_cache();
+        }
+        return $response;
+    }
+
+    /**
+     * Delete an Agent.
+     *
+     * @param string $agent_id Agent ID.
+     * @return array|WP_Error
+     */
+    public function delete_agent(string $agent_id) {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        $response = $this->delete('/api/v1/agents/' . rawurlencode($agent_id));
+        if (!is_wp_error($response)) {
+            $this->invalidate_agent_catalog_cache();
+        }
+        return $response;
+    }
+
+    /**
+     * JSON PATCH request.
+     *
+     * @return array|WP_Error
+     */
+    public function patch(string $path, array $payload) {
+        $result = $this->ensure_configured();
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        $args = [
+            'method' => 'PATCH',
+            'timeout' => absint($this->options['request_timeout'] ?? 45),
+            'blocking' => true,
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-API-Key'    => $this->options['api_key'],
+                'X-Request-ID' => $this->request_id,
+            ],
+            'body' => wp_json_encode($payload),
+        ];
+        return $this->request_with_retry(
+            'PATCH',
+            $this->options['base_url'] . $path,
+            $args
+        );
+    }
+
+    /**
      * DELETE request with retry logic.
      *
      * @param string $path The API path.
@@ -284,7 +478,10 @@ class EC_Rag_Api_Client {
         }
 
         if (strpos($path, '/api/v1/files/') === 0) {
-            $path = $this->append_knowledge_base_query($path);
+            $knowledge_base_id = $this->ingestion_knowledge_base_id();
+            if ($knowledge_base_id !== '') {
+                $path = add_query_arg('knowledge_base_id', $knowledge_base_id, $path);
+            }
         }
         $url = $this->options['base_url'] . $path;
         $args = [
@@ -392,18 +589,12 @@ class EC_Rag_Api_Client {
     }
 
     /**
-     * Append the configured target as a query parameter when non-default.
-     *
-     * @param string $path API path.
-     * @return string
+     * Return the dedicated ingestion target, falling back to the legacy KB.
      */
-    protected function append_knowledge_base_query(string $path): string {
-        $knowledge_base_id = $this->knowledge_base_id();
-        if ($knowledge_base_id === '') {
-            return $path;
-        }
-
-        return add_query_arg('knowledge_base_id', $knowledge_base_id, $path);
+    protected function ingestion_knowledge_base_id(): string {
+        $value = $this->options['ingestion_knowledge_base_id']
+            ?? ($this->options['knowledge_base_id'] ?? '');
+        return EC_Rag_Options::sanitize_knowledge_base_id($value);
     }
 
     /**
@@ -417,6 +608,19 @@ class EC_Rag_Api_Client {
             . (string) $this->options['api_key'];
 
         return 'ec_rag_kb_catalog_' . hash('sha256', $identity);
+    }
+
+    /** Return a credential-scoped Agent catalog cache key. */
+    protected function agent_catalog_cache_key(): string {
+        $identity = rtrim((string) $this->options['base_url'], '/')
+            . "\0"
+            . (string) $this->options['api_key'];
+        return 'ec_rag_agent_catalog_' . hash('sha256', $identity);
+    }
+
+    /** Invalidate the Agent catalog after any successful mutation. */
+    protected function invalidate_agent_catalog_cache(): void {
+        delete_transient($this->agent_catalog_cache_key());
     }
 
     /**
@@ -454,7 +658,7 @@ class EC_Rag_Api_Client {
             return wp_remote_post($url, $args);
         }
 
-        if ($method === 'DELETE') {
+        if ($method === 'DELETE' || $method === 'PATCH') {
             return wp_remote_request($url, $args);
         }
 

@@ -25,6 +25,10 @@ class EC_Rag_Settings_Form {
         $connection_test = null;
         $knowledge_bases = [];
         $knowledge_base_catalog_available = false;
+        $agents = [];
+        $agent_options = [];
+        $agent_catalog_available = false;
+        $can_manage_agents = false;
         if (!empty($options['base_url']) && !empty($options['api_key'])) {
             $api = new EC_Rag_Api_Client(fn() => $options);
             $knowledge_base_response = $api->get_knowledge_base_catalog();
@@ -35,6 +39,18 @@ class EC_Rag_Settings_Form {
             ) {
                 $knowledge_bases = $knowledge_base_response['knowledge_bases'];
                 $knowledge_base_catalog_available = true;
+            }
+            $agent_response = $api->get_agent_catalog();
+            if (!is_wp_error($agent_response) && is_array($agent_response['agents'] ?? null)) {
+                $agents = $agent_response['agents'];
+                $agent_catalog_available = true;
+                $can_manage_agents = !empty($agent_response['capabilities']['can_manage']);
+            }
+            $agent_options_response = $api->get_agent_options();
+            if (!is_wp_error($agent_options_response)) {
+                $agent_options = $agent_options_response;
+                $can_manage_agents = $can_manage_agents
+                    || !empty($agent_options_response['capabilities']['can_manage']);
             }
         }
 
@@ -81,9 +97,20 @@ class EC_Rag_Settings_Form {
                     $knowledge_bases,
                     $knowledge_base_catalog_available
                 ); ?>
+                <?php self::render_chat_agents_section(
+                    $options,
+                    $agents,
+                    $agent_catalog_available,
+                    $agent_options,
+                    $can_manage_agents
+                ); ?>
                 <?php self::render_appearance_section($options); ?>
                 <?php self::render_behavior_section($options); ?>
-                <?php self::render_ingestion_section($options); ?>
+                <?php self::render_ingestion_section(
+                    $options,
+                    $knowledge_bases,
+                    $knowledge_base_catalog_available
+                ); ?>
                 <?php self::render_rate_limit_section($options); ?>
                 <?php self::render_context_section($options); ?>
                 <?php self::render_css_section($options); ?>
@@ -159,7 +186,7 @@ class EC_Rag_Settings_Form {
             <tr>
                 <th scope="row">
                     <label for="<?php echo esc_attr('ec-rag-knowledge-base'); ?>">
-                        <?php esc_html_e('Knowledge base', 'ec-rag'); ?>
+                        <?php esc_html_e('Legacy chat knowledge base', 'ec-rag'); ?>
                     </label>
                 </th>
                 <td>
@@ -207,7 +234,7 @@ class EC_Rag_Settings_Form {
                         >
                     <?php endif; ?>
                     <p class="description">
-                        <?php esc_html_e('This target is fixed server-side for all visitors. Changing it does not move existing documents; run a new import or sync after saving.', 'ec-rag'); ?>
+                        <?php esc_html_e('Used for visitor chat only when Agent mode is disabled. Ingestion has a separate target below.', 'ec-rag'); ?>
                     </p>
                     <?php if (!$knowledge_base_catalog_available) : ?>
                         <p class="description" style="color:#b32d2e;">
@@ -315,6 +342,110 @@ class EC_Rag_Settings_Form {
         }
 
         return $choices;
+    }
+
+    /**
+     * Render Agent selection policy and CRUD bootstrap data.
+     */
+    public static function render_chat_agents_section(
+        array $options,
+        array $agents = [],
+        bool $catalog_available = false,
+        array $agent_options = [],
+        bool $can_manage = false
+    ): void {
+        $allowed = EC_Rag_Options::sanitize_agent_ids(
+            $options['allowed_agent_ids'] ?? []
+        );
+        $default_agent_id = EC_Rag_Options::sanitize_agent_id(
+            $options['default_agent_id'] ?? ''
+        );
+        ?>
+        <h2><?php esc_html_e('Chat Agents', 'ec-rag'); ?></h2>
+        <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row"><?php esc_html_e('Agent mode', 'ec-rag'); ?></th>
+                <td>
+                    <label><input type="checkbox"
+                        name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[enable_chat_agents_mode]"
+                        value="1" <?php checked($options['enable_chat_agents_mode'] ?? '0', '1'); ?>>
+                        <?php esc_html_e('Require visitors to use one of the selected Agents', 'ec-rag'); ?>
+                    </label>
+                    <p class="description"><?php esc_html_e('Each Agent fixes the model, one or more knowledge bases, and exactly one system prompt.', 'ec-rag'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><?php esc_html_e('Visitor allowlist', 'ec-rag'); ?></th>
+                <td data-ec-rag-agent-allowlist>
+                    <?php if (!$catalog_available) : ?>
+                        <?php foreach ($allowed as $agent_id) : ?>
+                            <input type="hidden" name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[allowed_agent_ids][]" value="<?php echo esc_attr($agent_id); ?>">
+                        <?php endforeach; ?>
+                        <p class="description" style="color:#b32d2e;"><?php esc_html_e('The Agent catalog is unavailable. The saved allowlist is preserved.', 'ec-rag'); ?></p>
+                    <?php elseif (!$agents) : ?>
+                        <p class="description"><?php esc_html_e('No Agents are available to this API key.', 'ec-rag'); ?></p>
+                    <?php else : ?>
+                        <?php foreach ($agents as $agent) :
+                            $agent_id = EC_Rag_Options::sanitize_agent_id($agent['id'] ?? '');
+                            if ($agent_id === '') {
+                                continue;
+                            }
+                            $is_allowed = in_array($agent_id, $allowed, true);
+                            $is_available = !empty($agent['available']);
+                            ?>
+                            <label style="display:block;margin-bottom:6px;">
+                                <input type="checkbox"
+                                    name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[allowed_agent_ids][]"
+                                    value="<?php echo esc_attr($agent_id); ?>"
+                                    <?php checked($is_allowed, true); ?>
+                                    <?php if (!$is_available && !$is_allowed) : ?>disabled<?php endif; ?>>
+                                <?php echo esc_html($agent['name'] ?? $agent_id); ?>
+                                <?php if (!$is_available) : ?> — <?php esc_html_e('unavailable', 'ec-rag'); ?><?php endif; ?>
+                            </label>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><label for="ec-rag-default-agent"><?php esc_html_e('Default Agent', 'ec-rag'); ?></label></th>
+                <td>
+                    <select id="ec-rag-default-agent" name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[default_agent_id]">
+                        <option value=""><?php esc_html_e('Require visitor selection', 'ec-rag'); ?></option>
+                        <?php foreach ($agents as $agent) :
+                            $agent_id = EC_Rag_Options::sanitize_agent_id($agent['id'] ?? '');
+                            if ($agent_id === '') {
+                                continue;
+                            }
+                            ?>
+                            <option value="<?php echo esc_attr($agent_id); ?>" <?php selected($default_agent_id, $agent_id); ?>>
+                                <?php echo esc_html($agent['name'] ?? $agent_id); ?><?php echo empty($agent['available']) ? ' — unavailable' : ''; ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <?php if (!$catalog_available) : ?>
+                        <input type="hidden" name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[default_agent_id]" value="<?php echo esc_attr($default_agent_id); ?>">
+                    <?php endif; ?>
+                </td>
+            </tr>
+        </table>
+        <div
+            class="ec-rag-agent-admin"
+            data-ec-rag-agent-admin
+            data-ajax-url="<?php echo esc_attr(admin_url('admin-ajax.php')); ?>"
+            data-nonce="<?php echo esc_attr(wp_create_nonce(EC_Rag_Ajax_Agents::NONCE_ACTION)); ?>"
+            data-can-manage="<?php echo $can_manage ? '1' : '0'; ?>"
+            data-agents="<?php echo esc_attr(wp_json_encode($agents)); ?>"
+            data-options="<?php echo esc_attr(wp_json_encode($agent_options)); ?>">
+            <h3><?php esc_html_e('Manage Agents', 'ec-rag'); ?></h3>
+            <p data-ec-rag-agent-notice class="description"></p>
+            <div data-ec-rag-agent-list></div>
+            <?php if ($can_manage) : ?>
+                <button type="button" class="button button-secondary" data-ec-rag-agent-create><?php esc_html_e('Create Agent', 'ec-rag'); ?></button>
+            <?php else : ?>
+                <p class="description"><?php echo wp_kses_post(__('Add the <code>agent_manage</code> scope to this API key to create, edit, or delete Agents.', 'ec-rag')); ?></p>
+            <?php endif; ?>
+        </div>
+        <?php
     }
 
     /**
@@ -498,10 +629,33 @@ class EC_Rag_Settings_Form {
      * @param array $options
      * @return void
      */
-    protected static function render_ingestion_section(array $options): void {
+    protected static function render_ingestion_section(
+        array $options,
+        array $knowledge_bases = [],
+        bool $catalog_available = false
+    ): void {
+        $choices = self::knowledge_base_choices($knowledge_bases);
+        $selected_target = EC_Rag_Options::sanitize_knowledge_base_id(
+            $options['ingestion_knowledge_base_id'] ?? ($options['knowledge_base_id'] ?? '')
+        );
         ?>
         <h2><?php esc_html_e('Article ingestion', 'ec-rag'); ?></h2>
         <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row"><label for="ec-rag-ingestion-kb"><?php esc_html_e('Ingestion knowledge base', 'ec-rag'); ?></label></th>
+                <td>
+                    <select id="ec-rag-ingestion-kb" name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[ingestion_knowledge_base_id]" <?php if (!$choices) : ?>disabled<?php endif; ?>>
+                        <?php foreach ($choices as $choice) : ?>
+                            <option value="<?php echo esc_attr($choice['value']); ?>" <?php selected($selected_target, $choice['value']); ?>><?php echo esc_html($choice['label']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <?php if (!$choices) : ?>
+                        <input type="hidden" name="<?php echo esc_attr(EC_Rag_Options::OPTION_NAME); ?>[ingestion_knowledge_base_id]" value="<?php echo esc_attr($selected_target); ?>">
+                    <?php endif; ?>
+                    <p class="description"><?php esc_html_e('Used only for post sync, imports, file deletion, and audio uploads. Agents never change this target.', 'ec-rag'); ?></p>
+                    <?php if (!$catalog_available) : ?><p class="description" style="color:#b32d2e;"><?php esc_html_e('The KB catalog is unavailable; the saved ingestion target is preserved.', 'ec-rag'); ?></p><?php endif; ?>
+                </td>
+            </tr>
             <tr>
                 <th scope="row"><?php esc_html_e('Live sync', 'ec-rag'); ?></th>
                 <td>

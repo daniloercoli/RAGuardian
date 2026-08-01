@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Raguardian
  * Description: Server-side WordPress client for a RAGuardian user/workspace API key.
- * Version: 0.5.3
+ * Version: 0.6.0
  * Requires at least: 5.1
  * Requires PHP: 7.4
  * Author: Danilo Ercoli
@@ -33,6 +33,7 @@ EC_Rag_Options::register();
 EC_Rag_Widget::register();
 EC_Rag_Ingestion::register();
 EC_Rag_Ajax::register();
+EC_Rag_Ajax_Agents::register();
 EC_Rag_Health_Check::register();
 
 register_deactivation_hook(__FILE__, [EC_Rag_Health_Check::class, 'deactivate']);

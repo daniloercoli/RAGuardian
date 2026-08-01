@@ -153,8 +153,9 @@ final class EC_Rag_Api_Client_Tests extends TestCase {
         self::assertSame(1, $attempts);
     }
 
-    public function test_configured_knowledge_base_is_injected_server_side(): void {
+    public function test_query_and_ingestion_use_separate_server_side_targets(): void {
         $knowledge_base_id = 'kb_11111111111111111111111111111111';
+        $ingestion_id = 'kb_33333333333333333333333333333333';
         $requests = [];
         $GLOBALS['ec_rag_test_http_handler'] = function ($method, $url, $args) use (&$requests) {
             $requests[] = [$method, $url, $args];
@@ -164,10 +165,12 @@ final class EC_Rag_Api_Client_Tests extends TestCase {
                 'headers'  => [],
             ];
         };
-        $client = $this->client(['knowledge_base_id' => $knowledge_base_id]);
+        $client = $this->client([
+            'knowledge_base_id' => $knowledge_base_id,
+            'ingestion_knowledge_base_id' => $ingestion_id,
+        ]);
 
-        $client->post(
-            '/api/v1/query',
+        $client->query(
             [
                 'query' => 'hello',
                 'knowledge_base_id' => 'kb_22222222222222222222222222222222',
@@ -190,16 +193,78 @@ final class EC_Rag_Api_Client_Tests extends TestCase {
             json_decode($requests[0][2]['body'], true)['knowledge_base_id']
         );
         self::assertStringContainsString(
-            'name="knowledge_base_id"' . "\r\n\r\n" . $knowledge_base_id,
+            'name="knowledge_base_id"' . "\r\n\r\n" . $ingestion_id,
             $requests[1][2]['body']
         );
+        self::assertSame('https://rag.example.test/api/v1/health', $requests[2][1]);
         self::assertStringEndsWith(
-            '?knowledge_base_id=' . $knowledge_base_id,
-            $requests[2][1]
-        );
-        self::assertStringEndsWith(
-            '?knowledge_base_id=' . $knowledge_base_id,
+            '?knowledge_base_id=' . $ingestion_id,
             $requests[3][1]
         );
+    }
+
+    public function test_agent_query_sends_agent_id_without_knowledge_base(): void {
+        $agent_id = 'agent_' . str_repeat('a', 32);
+        $captured = [];
+        $GLOBALS['ec_rag_test_http_handler'] = function ($method, $url, $args) use (&$captured) {
+            $captured = json_decode($args['body'], true);
+            return ['response' => ['code' => 200], 'body' => '{}', 'headers' => []];
+        };
+        $client = $this->client([
+            'knowledge_base_id' => 'kb_' . str_repeat('1', 32),
+        ]);
+
+        $client->query(['query' => 'hello', 'knowledge_base_id' => 'default'], $agent_id);
+
+        self::assertSame($agent_id, $captured['agent_id']);
+        self::assertArrayNotHasKey('knowledge_base_id', $captured);
+        self::assertArrayNotHasKey('knowledge_base_ids', $captured);
+    }
+
+    public function test_agent_catalog_is_cached_and_uses_v1_endpoint(): void {
+        $attempts = 0;
+        $GLOBALS['ec_rag_test_http_handler'] = function ($method, $url) use (&$attempts) {
+            $attempts++;
+            self::assertSame('GET', $method);
+            self::assertSame('https://rag.example.test/api/v1/agents', $url);
+            return [
+                'response' => ['code' => 200],
+                'body' => '{"agents":[],"capabilities":{"can_manage":true}}',
+                'headers' => [],
+            ];
+        };
+        $client = $this->client();
+        self::assertSame([], $client->get_agent_catalog()['agents']);
+        self::assertSame([], $client->get_agent_catalog()['agents']);
+        self::assertSame(1, $attempts);
+    }
+
+    public function test_agent_crud_uses_v1_methods_and_invalidates_catalog(): void {
+        $agent_id = 'agent_' . str_repeat('b', 32);
+        $requests = [];
+        $GLOBALS['ec_rag_test_http_handler'] = function ($method, $url, $args) use (&$requests) {
+            $requests[] = [$method, $url, $args];
+            return ['response' => ['code' => 200], 'body' => '{"ok":true}', 'headers' => []];
+        };
+        $client = $this->client();
+        $client->create_agent(
+            'Support',
+            '',
+            'openai',
+            'gpt-4o',
+            ['default'],
+            ['id' => 'prompt-1', 'scope' => 'shared']
+        );
+        $client->update_agent($agent_id, ['description' => 'Updated']);
+        $client->delete_agent($agent_id);
+
+        self::assertSame(['POST', 'PATCH', 'DELETE'], array_column($requests, 0));
+        self::assertSame('https://rag.example.test/api/v1/agents', $requests[0][1]);
+        self::assertSame(
+            'https://rag.example.test/api/v1/agents/' . $agent_id,
+            $requests[1][1]
+        );
+        self::assertSame('PATCH', $requests[1][2]['method']);
+        self::assertSame('shared', json_decode($requests[0][2]['body'], true)['prompt_ref']['scope']);
     }
 }

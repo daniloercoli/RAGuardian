@@ -139,6 +139,23 @@ class PromptStore:
                 return self._redact(p)
         return None
 
+    def get_shared_any(self, prompt_id: str) -> Optional[dict]:
+        """Return a shared prompt regardless of is_active.
+
+        Mirrors ``get_user_prompt_any``: ``get_shared`` only sees active
+        prompts, so a caller cannot distinguish a missing prompt from an
+        inactive one. This helper reads the raw file and returns the prompt
+        (active or not) so the agent resolver can report the correct
+        availability issue.
+        """
+        if not prompt_id:
+            return None
+        with self._lock:
+            for prompt in self._read(self.shared_path):
+                if prompt.get("id") == prompt_id:
+                    return self._redact(prompt)
+        return None
+
     # ---------------------------------------------------------------
     # User (personal) prompts
     # ---------------------------------------------------------------
@@ -231,6 +248,24 @@ class PromptStore:
         for p in self.list_user_prompts(user_id):
             if p["id"] == prompt_id:
                 return self._redact(p)
+        return None
+
+    def get_user_prompt_any(
+        self, user_id: str, prompt_id: str
+    ) -> Optional[dict]:
+        """Return a personal prompt regardless of is_active.
+
+        ``get_user_prompt`` only sees active prompts, so a caller cannot
+        distinguish a missing prompt from an inactive one. This helper reads
+        the raw file and returns the prompt (active or not) so the agent
+        resolver can report the correct availability issue.
+        """
+        if not user_id or not prompt_id:
+            return None
+        with self._lock:
+            for prompt in self._read(self._user_file(user_id)):
+                if prompt.get("id") == prompt_id:
+                    return self._redact(prompt)
         return None
 
     # ---------------------------------------------------------------

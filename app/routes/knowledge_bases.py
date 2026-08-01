@@ -871,6 +871,7 @@ def workspace_from_config(config: dict):
         data_folder=data_folder,
         workspace_upload_folder=config["WORKSPACE_UPLOAD_FOLDER"],
         knowledge_bases_file=str(Path(data_folder) / "knowledge_bases.json"),
+        chat_agents_file=str(Path(data_folder) / "chat_agents.json"),
         secrets_file=config["SECRETS_FILE"],
         secret_key=config["SECRET_KEY"],
     )

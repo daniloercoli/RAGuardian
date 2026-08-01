@@ -84,3 +84,69 @@ def test_openapi_multi_kb_contract_is_valid_yaml_and_tracks_runtime_limit():
     assert plural_parameter["name"] == "knowledge_base_ids"
     assert plural_parameter["style"] == "form"
     assert plural_parameter["explode"] is True
+
+
+def test_public_api_documentation_lists_chat_agent_endpoints():
+    api_doc = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+    openapi_doc = (ROOT / "docs" / "openapi.yaml").read_text(encoding="utf-8")
+
+    for endpoint in [
+        "/api/v1/agents",
+        "/api/v1/agents/options",
+        "/api/v1/agents/{agent_id}",
+    ]:
+        assert endpoint in api_doc
+        assert endpoint in openapi_doc
+
+    assert "agent_manage" in api_doc
+    assert "ChatAgent" in openapi_doc
+    assert "AgentIdPath" in openapi_doc
+    assert "ChatAgentNotFound" in openapi_doc
+
+
+def test_openapi_chat_agent_contract_is_valid():
+    yaml = pytest.importorskip("yaml")
+    document = yaml.safe_load(
+        (ROOT / "docs" / "openapi.yaml").read_text(encoding="utf-8")
+    )
+
+    query_schema = document["components"]["schemas"]["QueryRequest"]
+    assert "agent_id" in query_schema["properties"]
+    query_response = document["components"]["schemas"]["QueryResponse"]
+    assert "agent_id" in query_response["properties"]
+    assert "agent_name" in query_response["properties"]
+
+    agent_path = document["paths"]["/api/v1/agents"]
+    assert {"get", "post"} <= set(agent_path)
+    assert {"401", "403"} <= set(agent_path["get"]["responses"])
+    assert {"401", "403", "404", "409"} <= set(agent_path["post"]["responses"])
+
+    item_path = document["paths"]["/api/v1/agents/{agent_id}"]
+    assert {"get", "patch", "delete"} <= set(item_path)
+    assert {"404"} <= set(item_path["get"]["responses"])
+    assert {"403", "404"} <= set(item_path["patch"]["responses"])
+    assert {"403", "404"} <= set(item_path["delete"]["responses"])
+
+    create_schema = document["components"]["schemas"]["ChatAgentCreateInput"]
+    assert create_schema["required"] == [
+        "name",
+        "provider_id",
+        "model_id",
+        "knowledge_base_ids",
+        "prompt_ref",
+    ]
+    assert create_schema["properties"]["description"]["maxLength"] == 500
+    update_schema = document["components"]["schemas"]["ChatAgentUpdateInput"]
+    assert update_schema["minProperties"] == 1
+    assert update_schema["properties"]["description"]["maxLength"] == 500
+
+    agent_schema = document["components"]["schemas"]["ChatAgent"]
+    for field in ["available", "issues", "created_at", "updated_at"]:
+        assert field in agent_schema["required"]
+    assert "capabilities" in document["components"]["schemas"]["ChatAgentsResponse"]["required"]
+    options_schema = document["components"]["schemas"]["ChatAgentOptionsResponse"]
+    assert "capabilities" in options_schema["required"]
+    assert options_schema["properties"]["prompts"]["items"]["properties"]["scope"]["enum"] == [
+        "personal",
+        "shared",
+    ]

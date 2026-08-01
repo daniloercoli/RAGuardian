@@ -24,6 +24,21 @@ class EC_Rag_Options {
     public static function register(): void {
         add_action('admin_init', [self::class, 'register_settings']);
         add_action('admin_menu', [self::class, 'admin_menu']);
+        add_action('admin_enqueue_scripts', [self::class, 'enqueue_admin_assets']);
+    }
+
+    /** Enqueue Agent CRUD behavior only on this plugin's settings page. */
+    public static function enqueue_admin_assets(string $hook): void {
+        if ($hook !== 'settings_page_ec-rag-client') {
+            return;
+        }
+        wp_enqueue_script(
+            'ec-rag-admin-agents',
+            plugins_url('assets/rag-admin-agents.js', EC_RAG_PLUGIN_FILE),
+            [],
+            EC_RAG_VERSION,
+            true
+        );
     }
 
     /**
@@ -59,8 +74,33 @@ class EC_Rag_Options {
         $defaults  = self::defaults();
         $saved     = get_option(self::OPTION_NAME, []);
         $merged    = is_array($saved) ? $saved : [];
+        $options   = wp_parse_args($merged, $defaults);
 
-        return wp_parse_args($merged, $defaults);
+        // Read-time migration keeps old installations working immediately;
+        // the normalized values are persisted the next time settings are saved.
+        $legacy_agent_id = self::sanitize_agent_id($options['agent_id'] ?? '');
+        if (empty($options['allowed_agent_ids']) && $legacy_agent_id !== '') {
+            $options['allowed_agent_ids'] = [$legacy_agent_id];
+        }
+        if (empty($options['default_agent_id']) && $legacy_agent_id !== '') {
+            $options['default_agent_id'] = $legacy_agent_id;
+        }
+        if (!array_key_exists('ingestion_knowledge_base_id', $merged)) {
+            $options['ingestion_knowledge_base_id'] = $options['knowledge_base_id'] ?? '';
+        }
+        $options['allowed_agent_ids'] = self::sanitize_agent_ids(
+            $options['allowed_agent_ids'] ?? []
+        );
+        $options['default_agent_id'] = self::sanitize_agent_id(
+            $options['default_agent_id'] ?? ''
+        );
+        if (!in_array($options['default_agent_id'], $options['allowed_agent_ids'], true)) {
+            $options['default_agent_id'] = '';
+        }
+        // Keep the legacy alias for third-party code until a later major version.
+        $options['agent_id'] = $options['default_agent_id'];
+
+        return $options;
     }
 
     /**
@@ -73,6 +113,10 @@ class EC_Rag_Options {
             'base_url'                => '',
             'api_key'                => '',
             'knowledge_base_id'      => '',
+            'agent_id'               => '',
+            'allowed_agent_ids'      => [],
+            'default_agent_id'       => '',
+            'ingestion_knowledge_base_id' => '',
             'response_language'       => 'auto',
             'request_timeout'        => '45',
             'show_sources'           => '1',
@@ -100,6 +144,7 @@ class EC_Rag_Options {
             'rate_limit_window'     => '60',
             'tts_rate_limit_requests' => '5',
             'audio_rate_limit_requests' => '2',
+            'enable_chat_agents_mode' => '0',
         ];
     }
 
@@ -149,6 +194,18 @@ class EC_Rag_Options {
         if ($knowledge_base_id === 'default') {
             $knowledge_base_id = '';
         }
+        $ingestion_knowledge_base_id = self::sanitize_knowledge_base_id(
+            $input['ingestion_knowledge_base_id'] ?? $knowledge_base_id
+        );
+        $allowed_agent_ids = self::sanitize_agent_ids(
+            $input['allowed_agent_ids'] ?? []
+        );
+        $default_agent_id = self::sanitize_agent_id(
+            $input['default_agent_id'] ?? ($input['agent_id'] ?? '')
+        );
+        if (!in_array($default_agent_id, $allowed_agent_ids, true)) {
+            $default_agent_id = '';
+        }
         if ($knowledge_base_id !== '' && !preg_match('/^kb_[0-9a-f]{32}$/', $knowledge_base_id)) {
             $knowledge_base_id = '';
         }
@@ -157,6 +214,7 @@ class EC_Rag_Options {
             'base_url'                => esc_url_raw(rtrim($input['base_url'] ?? '', '/')),
             'api_key'                => sanitize_text_field($input['api_key'] ?? ''),
             'knowledge_base_id'      => $knowledge_base_id,
+            'ingestion_knowledge_base_id' => $ingestion_knowledge_base_id,
             'response_language'       => EC_Rag_Utils::sanitize_response_language($input['response_language'] ?? 'auto'),
             'request_timeout'        => (string) $timeout,
             'show_sources'           => !empty($input['show_sources']) ? '1' : '0',
@@ -184,7 +242,47 @@ class EC_Rag_Options {
             'rate_limit_window'     => (string) $rate_window,
             'tts_rate_limit_requests' => (string) $tts_limit,
             'audio_rate_limit_requests' => (string) $audio_limit,
+            'enable_chat_agents_mode' => !empty($input['enable_chat_agents_mode']) ? '1' : '0',
+            'allowed_agent_ids'      => $allowed_agent_ids,
+            'default_agent_id'       => $default_agent_id,
+            'agent_id'               => $default_agent_id,
         ];
+    }
+
+    /**
+     * Sanitize one Agent identifier.
+     */
+    public static function sanitize_agent_id($value): string {
+        $value = sanitize_text_field((string) $value);
+        return preg_match('/^agent_[0-9a-f]{32}$/', $value) ? $value : '';
+    }
+
+    /**
+     * Sanitize and deduplicate an Agent allowlist without changing its order.
+     */
+    public static function sanitize_agent_ids($values): array {
+        if (!is_array($values)) {
+            return [];
+        }
+        $result = [];
+        foreach ($values as $value) {
+            $agent_id = self::sanitize_agent_id($value);
+            if ($agent_id !== '' && !in_array($agent_id, $result, true)) {
+                $result[] = $agent_id;
+            }
+        }
+        return $result;
+    }
+
+    /**
+     * Sanitize a KB target. Empty and "default" both mean the default KB.
+     */
+    public static function sanitize_knowledge_base_id($value): string {
+        $value = sanitize_text_field((string) $value);
+        if ($value === '' || $value === 'default') {
+            return '';
+        }
+        return preg_match('/^kb_[0-9a-f]{32}$/', $value) ? $value : '';
     }
 
     /**
@@ -193,8 +291,6 @@ class EC_Rag_Options {
      * @return void
      */
     public static function render_settings_page(): void {
-        // Delegate to the widget class for compact settings rendering.
-        // The form HTML is rendered by EC_Rag_Widget::render_settings_form().
         EC_Rag_Settings_Form::render();
     }
 }

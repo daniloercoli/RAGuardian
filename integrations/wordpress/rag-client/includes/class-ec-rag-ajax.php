@@ -74,8 +74,29 @@ class EC_Rag_Ajax {
             $payload['client_context'] = $client_context;
         }
 
-        $api      = new EC_Rag_Api_Client(fn() => $options);
-        $response = $api->post('/api/v1/query', $payload);
+        $api = new EC_Rag_Api_Client(fn() => $options);
+        $agent_id = '';
+        if (($options['enable_chat_agents_mode'] ?? '0') === '1') {
+            $posted_agent_id = EC_Rag_Options::sanitize_agent_id(
+                wp_unslash($_POST['agent_id'] ?? '')
+            );
+            $catalog = $api->get_agent_catalog();
+            if (is_wp_error($catalog)) {
+                wp_send_json_error(
+                    ['message' => __('The Agent catalog is temporarily unavailable', 'ec-rag')],
+                    503
+                );
+            }
+            $agent_id = self::validate_public_agent_selection(
+                $posted_agent_id,
+                $options,
+                $catalog['agents'] ?? []
+            );
+            if (is_wp_error($agent_id)) {
+                wp_send_json_error(['message' => $agent_id->get_error_message()], 400);
+            }
+        }
+        $response = $api->query($payload, $agent_id);
 
         if (is_wp_error($response)) {
             wp_send_json_error(['message' => $response->get_error_message()], 502);
@@ -247,5 +268,49 @@ class EC_Rag_Ajax {
         $conv = EC_Rag_Utils::conversation_id_from_request();
 
         return $conv !== '' ? $conv : 'wp-' . wp_generate_uuid4();
+    }
+
+    /**
+     * Validate a visitor selection against both the saved allowlist and the
+     * current API-key-scoped catalog. No client-supplied Agent is trusted.
+     *
+     * @param string $agent_id Posted Agent ID.
+     * @param array  $options Plugin options.
+     * @param array  $agents Current authorized Agent records.
+     * @return string|WP_Error
+     */
+    public static function validate_public_agent_selection(
+        string $agent_id,
+        array $options,
+        array $agents
+    ) {
+        if ($agent_id === '') {
+            return new WP_Error(
+                'ec_rag_agent_required',
+                __('Select an Agent before sending a message', 'ec-rag')
+            );
+        }
+        $allowed = EC_Rag_Options::sanitize_agent_ids(
+            $options['allowed_agent_ids'] ?? []
+        );
+        if (!in_array($agent_id, $allowed, true)) {
+            return new WP_Error(
+                'ec_rag_agent_not_allowed',
+                __('The selected Agent is not available', 'ec-rag')
+            );
+        }
+        foreach ($agents as $agent) {
+            if (
+                is_array($agent)
+                && ($agent['id'] ?? '') === $agent_id
+                && !empty($agent['available'])
+            ) {
+                return $agent_id;
+            }
+        }
+        return new WP_Error(
+            'ec_rag_agent_unavailable',
+            __('The selected Agent is not available', 'ec-rag')
+        );
     }
 }

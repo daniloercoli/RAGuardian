@@ -24,6 +24,7 @@ class WorkspaceContext:
     data_folder: str
     workspace_upload_folder: str
     knowledge_bases_file: str
+    chat_agents_file: str
     secrets_file: str
     secret_key: str
 
@@ -97,10 +98,12 @@ def workspace_for_user(user: dict, app=None) -> WorkspaceContext:
         data_folder=str(workspace_data),
         workspace_upload_folder=str(workspace_upload),
         knowledge_bases_file=str(workspace_data / "knowledge_bases.json"),
+        chat_agents_file=str(workspace_data / "chat_agents.json"),
         secrets_file=app.config.get("SECRETS_FILE", "app/data/secrets.json"),
         secret_key=app.config.get("RAG_SECRET_KEY") or app.config.get("SECRET_KEY", ""),
     )
     knowledge_base_store(context, app=app).ensure_default()
+    chat_agent_store(context, app=app).ensure_default()
     return context
 
 
@@ -157,6 +160,28 @@ def knowledge_base_store(workspace: WorkspaceContext, app=None) -> KnowledgeBase
     return KnowledgeBaseStore(
         workspace.knowledge_bases_file,
         max_additional=max_additional,
+    )
+
+
+def chat_agent_store(workspace: WorkspaceContext, app=None):
+    from utils.chat_agent_store import ChatAgentStore
+
+    if app is None:
+        from flask import has_app_context
+
+        max_additional = (
+            int(current_app.config.get("MAX_CHAT_AGENTS", 20))
+            if has_app_context()
+            else int(os.getenv("RAG_MAX_CHAT_AGENTS", "20"))
+        )
+        max_query = int(current_app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5))
+    else:
+        max_additional = int(app.config.get("MAX_CHAT_AGENTS", 20))
+        max_query = int(app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5))
+    return ChatAgentStore(
+        workspace.chat_agents_file,
+        max_additional=max_additional,
+        max_query_knowledge_bases=max_query,
     )
 
 

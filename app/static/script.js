@@ -24,6 +24,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const kbPickerCancel = document.getElementById("kbPickerCancel");
     const kbChips = document.getElementById("kbChips");
     const promptSelect = document.getElementById("promptSelect");
+    const agentSelect = document.getElementById("agentSelect");
     const clearChatButton = document.getElementById("clearChatButton");
     const streamStatus = document.getElementById("streamStatus");
     const emptyState = document.getElementById("emptyState");
@@ -40,18 +41,26 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const promptStorageKey = "ragSystemPromptId";
+    const promptRefStorageKey = "ragSystemPromptRef";
+    const agentStorageKey = "ragSelectedAgent";
     const knowledgeBaseStorageKey = "ragKnowledgeBaseIds";
     const legacyKnowledgeBaseStorageKey = "ragKnowledgeBaseId";
     let knowledgeBaseIds = loadKnowledgeBaseIds();
     let knowledgeBaseCatalog = [];
     let draftKnowledgeBaseIds = [...knowledgeBaseIds];
     let maxQueryKnowledgeBases = 5;
-    let systemPromptId = loadSystemPromptId();
+    const initialPromptRef = loadPromptRef();
+    let systemPromptId = initialPromptRef.id;
+    let systemPromptScope = initialPromptRef.scope;
     let codeInterpreterEnabled = false;
     const uploadedFiles = [];
     const askIdleTimeoutMs = 120000;
 
     let busy = false;
+    let agentActive = false;
+    let agentSelectionBlocked = false;
+    let agentsCatalog = [];
+    let selectedAgentId = "";
     const conversationStorageKey = "ragConversationId";
     let conversationId = loadOrCreateConversationId();
 
@@ -69,7 +78,10 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
     userInput.addEventListener("input", resizeInput);
-    modelSelect.addEventListener("change", () => updateChatStatus());
+    modelSelect.addEventListener("change", () => {
+        if (agentActive) switchToCustomChat();
+        updateChatStatus();
+    });
     if (kbPickerButton) kbPickerButton.addEventListener("click", toggleKnowledgeBasePicker);
     if (kbPickerApply) kbPickerApply.addEventListener("click", applyKnowledgeBaseDraft);
     if (kbPickerCancel) kbPickerCancel.addEventListener("click", closeKnowledgeBasePicker);
@@ -92,13 +104,38 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     if (promptSelect) {
         promptSelect.addEventListener("change", () => {
-            const selValue = promptSelect.value;
-            systemPromptId = selValue || "";
-            persistSystemPromptId(systemPromptId);
+            const ref = parsePromptValue(promptSelect.value);
+            systemPromptId = ref.id;
+            systemPromptScope = ref.scope;
+            persistPromptRef(systemPromptScope, systemPromptId);
+            if (agentActive) switchToCustomChat();
+        });
+    }
+    if (agentSelect) {
+        agentSelect.addEventListener("change", () => {
+            const id = agentSelect.value;
+            const previousKnowledgeBaseIds = [...knowledgeBaseIds];
+            selectedAgentId = id;
+            persistSelectedAgent(id);
+            if (id) {
+                const agent = agentsCatalog.find(a => a.id === id);
+                if (agent && agent.available) {
+                    agentSelectionBlocked = false;
+                    applyAgentConfig(agent);
+                    setAgentActive(true);
+                    startAgentConversation(previousKnowledgeBaseIds);
+                } else {
+                    handleAgentUnavailable(id, agent);
+                }
+            } else {
+                agentSelectionBlocked = false;
+                setAgentActive(false);
+                updateChatStatus();
+            }
         });
     }
     if (clearChatButton) {
-        clearChatButton.addEventListener("click", clearChat);
+        clearChatButton.addEventListener("click", newChat);
     }
     promptButtons.forEach((button) => {
         button.addEventListener("click", () => {
@@ -306,6 +343,13 @@ document.addEventListener("DOMContentLoaded", () => {
     async function sendMessage() {
         const query = userInput.value.trim();
         if (!query) return;
+        if (agentSelectionBlocked) {
+            appendMessage(
+                "**Select an available Agent or Custom chat before sending.**",
+                "bot-message"
+            );
+            return;
+        }
         if (!modelSelect.value) {
             appendMessage("**Error:** no model available.", "bot-message");
             return;
@@ -323,29 +367,28 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // Code interpreter mode
             if (codeInterpreterEnabled && uploadedFiles.length > 0) {
-                const ciBody = {
+                const ciBody = applyQueryConfiguration({
                     query,
-                    model: selected ? selected.dataset.model : undefined,
-                    provider: selected ? selected.dataset.provider : undefined,
                     conversation_id: conversationId,
                     stream: true,
                     stream_format: "ndjson",
-                    system_prompt_id: systemPromptId || undefined,
                     use_code_interpreter: true,
                     attached_files: uploadedFiles.map(f => ({
                         id: f.id,
                         file_id: f.id,
                         name: f.name,
                         type: f.type
-                    })),
-                    knowledge_base_ids: [...knowledgeBaseIds]
-                };
+                    }))
+                }, selected);
                 const response = await postAsk(ciBody, askTimeout);
                 if (!response.ok) {
                     const data = await readErrorPayload(response);
                     const messageDiv = appendBotMessage(
                         formatError(data, response.statusText)
                     );
+                    if (agentActive && selectedAgentId) {
+                        await revalidateActiveAgent();
+                    }
                     await handleUnavailableKnowledgeBase(data, messageDiv);
                 } else {
                     const messageDiv = appendBotMessage("Preparing analysis...");
@@ -357,17 +400,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            const body = {
+            const body = applyQueryConfiguration({
                 query,
-                model: selected ? selected.dataset.model : undefined,
-                provider: selected ? selected.dataset.provider : undefined,
                 conversation_id: conversationId,
                 stream: true,
                 stream_format: "ndjson",
-                system_prompt_id: systemPromptId || undefined,
-                use_code_interpreter: false,
-                knowledge_base_ids: [...knowledgeBaseIds]
-            };
+                use_code_interpreter: false
+            }, selected);
             if (uploadedFiles.length > 0) {
                 body.attached_files = uploadedFiles.map(f => ({
                     id: f.id,
@@ -384,6 +423,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 const messageDiv = appendBotMessage(
                     formatError(data, response.statusText)
                 );
+                if (agentActive && selectedAgentId) {
+                    await revalidateActiveAgent();
+                }
                 await handleUnavailableKnowledgeBase(data, messageDiv);
             } else {
                 const messageDiv = appendBotMessage("");
@@ -400,6 +442,19 @@ document.addEventListener("DOMContentLoaded", () => {
             setBusy(false);
             userInput.focus();
         }
+    }
+
+    function applyQueryConfiguration(body, selectedModel) {
+        if (agentActive && selectedAgentId) {
+            body.agent_id = selectedAgentId;
+            return body;
+        }
+        body.model = selectedModel ? selectedModel.dataset.model : undefined;
+        body.provider = selectedModel ? selectedModel.dataset.provider : undefined;
+        body.system_prompt_id = systemPromptId || undefined;
+        body.system_prompt_scope = systemPromptScope || undefined;
+        body.knowledge_base_ids = [...knowledgeBaseIds];
+        return body;
     }
 
     function renderCodeInterpreterResult(data) {
@@ -515,7 +570,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function setBusy(isBusy) {
         busy = isBusy;
-        sendButton.disabled = isBusy || !modelSelect.value;
+        sendButton.disabled = isBusy || agentSelectionBlocked || !modelSelect.value;
         userInput.disabled = isBusy;
         if (clearChatButton) clearChatButton.disabled = isBusy;
         if (kbPickerButton) kbPickerButton.disabled = isBusy || knowledgeBaseCatalog.length === 0;
@@ -836,7 +891,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function updateChatStatus() {
         if (!busy) {
-            sendButton.disabled = !modelSelect.value;
+            sendButton.disabled = agentSelectionBlocked || !modelSelect.value;
         }
     }
 
@@ -853,12 +908,12 @@ document.addEventListener("DOMContentLoaded", () => {
         return `**Connection error:** ${error.message}`;
     }
 
-    function clearChat() {
+    function clearChat(targetKnowledgeBaseIds = knowledgeBaseIds) {
         if (busy) return;
         const previousConversationId = conversationId;
         conversationId = createConversationId();
         persistConversationId(conversationId);
-        clearServerConversation(previousConversationId, knowledgeBaseIds);
+        clearServerConversation(previousConversationId, targetKnowledgeBaseIds);
         chatbox.replaceChildren();
         clearUploadedFiles();
         if (emptyState) {
@@ -993,7 +1048,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const personalGroup = document.createElement("optgroup");
             personalGroup.label = "My Prompts";
             personal.forEach(p => {
-                const opt = new Option(`[personal] ${p.name}`, p.id);
+                const opt = new Option(`[personal] ${p.name}`, `personal::${p.id}`);
                 personalGroup.appendChild(opt);
             });
             if (personal.length > 0) {
@@ -1006,7 +1061,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const sharedGroup = document.createElement("optgroup");
             sharedGroup.label = "Shared (admin)";
             shared.forEach(p => {
-                const opt = new Option(`[shared] ${p.name}`, p.id);
+                const opt = new Option(`[shared] ${p.name}`, `shared::${p.id}`);
                 sharedGroup.appendChild(opt);
             });
             if (shared.length > 0) {
@@ -1021,12 +1076,17 @@ document.addEventListener("DOMContentLoaded", () => {
                 promptSelect.appendChild(opt);
             }
 
-            const saved = loadSystemPromptId();
-            if (saved) {
+            const saved = loadPromptRef();
+            if (saved.id) {
+                const candidates = saved.scope
+                    ? [`${saved.scope}::${saved.id}`]
+                    : [`personal::${saved.id}`, `shared::${saved.id}`];
                 for (const opt of promptSelect.options) {
-                    if (opt.value === saved) {
+                    if (candidates.includes(opt.value)) {
                         opt.selected = true;
-                        systemPromptId = saved;
+                        const resolved = parsePromptValue(opt.value);
+                        systemPromptId = resolved.id;
+                        systemPromptScope = resolved.scope;
                         break;
                     }
                 }
@@ -1036,21 +1096,32 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    function loadSystemPromptId() {
+    function parsePromptValue(raw) {
+        const value = String(raw || "");
+        if (!value) return {scope: "", id: ""};
+        const sep = value.indexOf("::");
+        if (sep === -1) return {scope: "", id: value};
+        return {scope: value.slice(0, sep), id: value.slice(sep + 2)};
+    }
+
+    function loadPromptRef() {
         try {
-            return window.sessionStorage
-                ? (sessionStorage.getItem(promptStorageKey) || "")
-                : "";
+            if (!window.sessionStorage) return {scope: "", id: ""};
+            const composite = sessionStorage.getItem(promptRefStorageKey);
+            if (composite !== null) return parsePromptValue(composite);
+            const legacy = sessionStorage.getItem(promptStorageKey);
+            return legacy ? {scope: "", id: legacy} : {scope: "", id: ""};
         } catch (e) {
-            return "";
+            return {scope: "", id: ""};
         }
     }
 
-    function persistSystemPromptId(value) {
+    function persistPromptRef(scope, id) {
         try {
-            if (window.sessionStorage) {
-                sessionStorage.setItem(promptStorageKey, value);
-            }
+            if (!window.sessionStorage) return;
+            const value = scope && id ? `${scope}::${id}` : (id || "");
+            sessionStorage.setItem(promptRefStorageKey, value);
+            sessionStorage.removeItem(promptStorageKey);
         } catch (e) {/* noop */}
     }
 
@@ -1216,6 +1287,7 @@ document.addEventListener("DOMContentLoaded", () => {
         knowledgeBaseIds = normalized;
         draftKnowledgeBaseIds = [...normalized];
         persistKnowledgeBaseIds(knowledgeBaseIds);
+        if (agentActive) switchToCustomChat();
         renderKnowledgeBaseSelection();
         appendKnowledgeBaseNotice(
             `Knowledge base context updated: ${knowledgeBaseSelectionLabel(knowledgeBaseIds)}.`
@@ -1418,8 +1490,204 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    loadKnowledgeBases();
-    loadModels();
-    loadPrompts();
-    resizeInput();
+    async function loadAgents() {
+        if (!agentSelect) return;
+        const pending = readPendingAgent();
+        try {
+            const response = await fetch("/api/agents");
+            if (!response.ok) throw new Error("Agent catalog unavailable");
+            const data = await response.json();
+            agentsCatalog = data.agents || [];
+            agentSelect.innerHTML = '<option value="">Custom chat</option>';
+            agentsCatalog.forEach(agent => {
+                const opt = new Option(agent.name, agent.id);
+                if (!agent.available) {
+                    opt.disabled = true;
+                    opt.textContent = `${agent.name} (unavailable)`;
+                }
+                agentSelect.appendChild(opt);
+            });
+            if (pending) {
+                const agent = agentsCatalog.find(a => a.id === pending);
+                if (agent && agent.available) {
+                    const previousKnowledgeBaseIds = [...knowledgeBaseIds];
+                    agentSelect.value = pending;
+                    selectedAgentId = pending;
+                    agentSelectionBlocked = false;
+                    applyAgentConfig(agent);
+                    setAgentActive(true);
+                    startAgentConversation(previousKnowledgeBaseIds);
+                } else {
+                    handleAgentUnavailable(pending, agent);
+                }
+            }
+        } catch (error) {
+            console.warn("Agents not available:", error);
+            if (pending) {
+                handleAgentUnavailable(pending);
+            }
+        }
+    }
+
+    function applyAgentConfig(agent) {
+        if (!agent) return;
+        if (modelSelect) {
+            for (const opt of modelSelect.options) {
+                if (opt.dataset.provider === agent.provider_id
+                    && opt.dataset.model === agent.model_id) {
+                    opt.selected = true;
+                    break;
+                }
+            }
+        }
+        const kbIds = Array.isArray(agent.knowledge_base_ids)
+            ? agent.knowledge_base_ids
+            : [];
+        const availableIds = new Set(knowledgeBaseCatalog.map(item => item.id));
+        const reconciled = kbIds.filter(id => availableIds.has(id));
+        if (reconciled.length > 0) {
+            knowledgeBaseIds = reconciled.slice(0, maxQueryKnowledgeBases);
+            draftKnowledgeBaseIds = [...knowledgeBaseIds];
+            persistKnowledgeBaseIds(knowledgeBaseIds);
+        }
+        renderKnowledgeBaseSelection();
+        if (promptSelect) {
+            const ref = agent.prompt_ref || {};
+            const target = ref && ref.id && ref.scope
+                ? `${ref.scope}::${ref.id}`
+                : "";
+            let matched = false;
+            for (const opt of promptSelect.options) {
+                if (opt.value === target) {
+                    opt.selected = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched && promptSelect.options.length > 0) {
+                promptSelect.options[0].selected = true;
+            }
+            const resolved = parsePromptValue(promptSelect.value);
+            systemPromptId = resolved.id;
+            systemPromptScope = resolved.scope;
+            persistPromptRef(systemPromptScope, systemPromptId);
+        }
+        updateChatStatus();
+    }
+
+    function setAgentActive(active) {
+        agentActive = active;
+        renderKnowledgeBaseSelection();
+        updateChatStatus();
+    }
+
+    function switchToCustomChat() {
+        agentActive = false;
+        agentSelectionBlocked = false;
+        selectedAgentId = "";
+        persistSelectedAgent("");
+        if (agentSelect) agentSelect.value = "";
+        renderKnowledgeBaseSelection();
+    }
+
+    function startAgentConversation(previousKnowledgeBaseIds = knowledgeBaseIds) {
+        clearChat(previousKnowledgeBaseIds);
+    }
+
+    async function newChat() {
+        if (busy) return;
+        clearChat();
+        if (selectedAgentId) {
+            setBusy(true);
+            try {
+                await revalidateActiveAgent();
+            } finally {
+                setBusy(false);
+            }
+        }
+    }
+
+    async function revalidateActiveAgent() {
+        const agentId = selectedAgentId;
+        if (!agentId) return;
+        try {
+            const response = await fetch(
+                `/api/agents/${encodeURIComponent(agentId)}`
+            );
+            if (!response.ok) {
+                handleAgentUnavailable(agentId);
+                return;
+            }
+            const agent = await response.json();
+            if (!agent || !agent.available) {
+                handleAgentUnavailable(agentId, agent);
+                return;
+            }
+            applyAgentConfig(agent);
+        } catch (error) {
+            handleAgentUnavailable(agentId);
+        }
+    }
+
+    function handleAgentUnavailable(agentId, agent) {
+        agentActive = false;
+        agentSelectionBlocked = true;
+        selectedAgentId = agentId;
+        persistSelectedAgent(agentId);
+        if (agentSelect) {
+            let option = Array.from(agentSelect.options).find(
+                candidate => candidate.value === agentId
+            );
+            if (!option) {
+                option = new Option("Unavailable Agent", agentId);
+                agentSelect.appendChild(option);
+            }
+            option.disabled = true;
+            option.textContent = `${(agent && agent.name) || "Agent"} (unavailable)`;
+            agentSelect.value = agentId;
+        }
+        updateChatStatus();
+        const issues = agent && Array.isArray(agent.issues) ? agent.issues : [];
+        const detail = issues.length
+            ? issues.map(issue => issue.message).join(" ")
+            : "non più disponibile";
+        appendBotMessage(
+            `**Agent non più disponibile.**\n\nL'agent selezionato non è più disponibile (${detail}). ` +
+            "Seleziona esplicitamente un altro Agent o Custom chat per continuare."
+        );
+    }
+
+    function readPendingAgent() {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            const fromUrl = params.get("agent");
+            if (fromUrl) {
+                persistSelectedAgent(fromUrl);
+                const cleanUrl = window.location.pathname;
+                window.history.replaceState({}, "", cleanUrl);
+                return fromUrl;
+            }
+            if (window.sessionStorage) {
+                return sessionStorage.getItem(agentStorageKey) || "";
+            }
+        } catch (e) {/* noop */}
+        return "";
+    }
+
+    function persistSelectedAgent(id) {
+        try {
+            if (!window.sessionStorage) return;
+            if (id) {
+                sessionStorage.setItem(agentStorageKey, id);
+            } else {
+                sessionStorage.removeItem(agentStorageKey);
+            }
+        } catch (e) {/* noop */}
+    }
+
+    (async () => {
+        await Promise.all([loadKnowledgeBases(), loadModels(), loadPrompts()]);
+        await loadAgents();
+        resizeInput();
+    })();
 });

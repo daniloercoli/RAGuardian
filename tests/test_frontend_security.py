@@ -28,7 +28,7 @@ def test_chat_markdown_is_sanitized_before_dom_insert():
     assert "demo-readiness" not in template
     assert "data-prompt" in template
     assert "loadHealth()" not in script
-    assert "knowledge_base_ids: [...knowledgeBaseIds]" in script
+    assert "body.knowledge_base_ids = [...knowledgeBaseIds]" in script
     assert 'const knowledgeBaseStorageKey = "ragKnowledgeBaseIds"' in script
     assert "kbPickerPopover" in script
     assert "appendKnowledgeBaseNotice" in script
@@ -63,7 +63,8 @@ def test_multi_kb_chat_fails_closed_and_waits_for_recovery():
     ) == 2
     assert script.count("await waitForKnowledgeBaseRecovery(state)") >= 4
     assert "clearChatButton.disabled = isBusy" in script
-    assert "function clearChat() {\n        if (busy) return;" in script
+    assert "function clearChat(targetKnowledgeBaseIds = knowledgeBaseIds)" in script
+    assert "if (busy) return;" in script
     assert "function normalizeKnowledgeBaseIds(values)" in script
     assert "focusKnowledgeBaseControlAfterRemoval(index)" in script
 
@@ -85,6 +86,68 @@ def test_templates_include_browser_icons():
         assert "favicon.ico" in template
         assert "favicon.png" in template
         assert "apple-touch-icon.png" in template
+
+
+def test_chat_toolbar_includes_agent_selector():
+    template = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
+    assert 'id="agentSelect"' in template
+    assert "Custom chat" in template
+
+
+def test_script_applies_agent_config_and_supports_override():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+    assert "async function loadAgents()" in script
+    assert "function applyAgentConfig(agent)" in script
+    assert "function setAgentActive(active)" in script
+    assert "let agentActive = false" in script
+    assert "function switchToCustomChat()" in script
+    assert "async function newChat()" in script
+    assert "async function revalidateActiveAgent()" in script
+    assert "agentsCatalog = data.agents || []" in script
+    assert 'agentSelect.innerHTML = \'<option value="">Custom chat</option>\'' in script
+    assert "persistSelectedAgent" in script
+    assert "readPendingAgent" in script
+    assert "body.system_prompt_scope = systemPromptScope || undefined" in script
+    assert "body.agent_id = selectedAgentId" in script
+    assert "function applyQueryConfiguration(body, selectedModel)" in script
+    assert "agentActive" in script
+
+
+def test_script_overrides_switch_to_custom_chat_and_revalidates_on_new_chat():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+    # Override on model/prompt/KB switches silently to "Custom chat".
+    assert script.count("if (agentActive) switchToCustomChat()") == 3
+    # "New chat" revalidates and reapplies the active agent instead of just clearing.
+    assert 'clearChatButton.addEventListener("click", newChat)' in script
+    assert "async function newChat()" in script
+    assert "await revalidateActiveAgent()" in script
+    assert "function handleAgentUnavailable(agentId, agent)" in script
+    # Controls are never disabled by an active agent preset anymore.
+    assert "modelSelect.disabled = active" not in script
+    assert "promptSelect.disabled = active" not in script
+    # Page-load with a pending agent that became unavailable fails closed.
+    assert "if (agent && agent.available)" in script
+    assert "handleAgentUnavailable(pending, agent)" in script
+    assert "let agentSelectionBlocked = false" in script
+    assert "Seleziona esplicitamente un altro Agent o Custom chat" in script
+    assert "Sei passato alla chat personalizzata" not in script
+
+
+def test_agents_page_has_start_chat_navigation():
+    agents_js = (ROOT / "app/static/agents.js").read_text(encoding="utf-8")
+    assert 'data-action="start">Start chat' in agents_js
+    assert "window.location.href = `/?agent=${encodeURIComponent(item.id)}`" in agents_js
+    assert 'startButton.disabled = true' in agents_js
+    assert "renderCard(item, items.length)" in agents_js
+    assert "items.length || 0" not in agents_js
+    assert 'name="prompt_ref" data-prompt-select required' in agents_js
+
+
+def test_agents_description_maxlength_matches_limit():
+    template = (ROOT / "app/templates/agents.html").read_text(encoding="utf-8")
+    agents_js = (ROOT / "app/static/agents.js").read_text(encoding="utf-8")
+    assert 'maxlength="500"' in template
+    assert 'maxlength="500"' in agents_js
 
 
 def test_session_posts_require_csrf_token_and_login_redirect_stays_local(tmp_path, monkeypatch):

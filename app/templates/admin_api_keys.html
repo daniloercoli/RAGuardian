@@ -101,6 +101,10 @@
                             <input type="checkbox" name="scopes" value="kb_manage">
                             KB Manage
                         </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="scopes" value="agent_manage">
+                            Agent Manage
+                        </label>
                     </div>
                 </fieldset>
                 <fieldset class="scope-field">
@@ -205,7 +209,7 @@
                                             <input type="hidden" name="action" value="update_access">
                                             <input type="hidden" name="user_id" value="{{ key.user_id }}">
                                             <input type="hidden" name="key_name" value="{{ key.name }}">
-                                            {% for scope in ["query", "ingest", "speech", "kb_manage"] %}
+                                            {% for scope in ["query", "ingest", "speech", "kb_manage", "agent_manage"] %}
                                                 <label class="checkbox-label">
                                                     <input type="checkbox" name="scopes" value="{{ scope }}" {% if scope in key.scopes %}checked{% endif %}>
                                                     {{ scope }}

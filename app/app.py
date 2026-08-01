@@ -92,6 +92,7 @@ from utils.job_store import (
     queue_name,
 )
 from utils.knowledge_base_store import KnowledgeBaseValidationError
+from utils.chat_agent_store import ChatAgentCatalogError
 from utils.workspace import knowledge_base_from_request, workspace_from_request
 from utils.validators import (
     ValidationError,
@@ -150,6 +151,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["WORKSPACE_DATA_DIR"] = os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
     app.config["WORKSPACE_UPLOAD_DIR"] = os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces")
     app.config["MAX_KNOWLEDGE_BASES"] = int(os.getenv("RAG_MAX_KNOWLEDGE_BASES", "20"))
+    app.config["MAX_CHAT_AGENTS"] = int(os.getenv("RAG_MAX_CHAT_AGENTS", "20"))
     app.config["MAX_QUERY_KNOWLEDGE_BASES"] = max(
         1,
         int(os.getenv("RAG_MAX_QUERY_KNOWLEDGE_BASES", "5")),
@@ -230,6 +232,26 @@ def create_app(test_config: dict | None = None) -> Flask:
         return jsonify(
             error="Catalogo knowledge base non valido",
             status="knowledge_base_catalog_error",
+        ), 500
+
+    from utils.chat_agent_store import (
+        ChatAgentCatalogError,
+        ChatAgentValidationError,
+    )
+
+    @app.errorhandler(ChatAgentValidationError)
+    def _chat_agent_validation_error(error):
+        return jsonify(
+            error=error.message,
+            status=error.code,
+        ), error.status_code
+
+    @app.errorhandler(ChatAgentCatalogError)
+    def _chat_agent_catalog_error(error):
+        log.error("Chat agent catalog error: %s", error)
+        return jsonify(
+            error="Catalogo agent non valido",
+            status="chat_agent_catalog_error",
         ), 500
 
     # ── Start backup scheduler (background thread) ──
@@ -340,12 +362,13 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
     from routes.backups import register_backup_routes
     from routes.prompts import register_prompt_routes
     from routes.knowledge_bases import register_knowledge_base_routes
-
+    from routes.agents import register_agent_routes
     register_admin_account_routes(app)
     register_auth_routes(app)
     register_backup_routes(app)
     register_prompt_routes(app)
     register_knowledge_base_routes(app)
+    register_agent_routes(app)
 
     @app.route("/")
     @require_login
@@ -521,6 +544,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         except RequestTimeoutExceeded:
             raise
         except KnowledgeBaseValidationError:
+            raise
+        except ChatAgentCatalogError:
             raise
         except Exception as e:
             log.error(f"Errore ask: {e}")
@@ -974,6 +999,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             raise
         except KnowledgeBaseValidationError:
             raise
+        except ChatAgentCatalogError:
+            raise
         except Exception as e:
             log.error(f"Errore api query: {e}")
             return jsonify(error=str(e), status="server_error"), 500
@@ -1136,7 +1163,10 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             conversation_id,
             configs,
         )
-        custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+        custom_system = _resolve_system_prompt(
+            payload.get("system_prompt_id"),
+            payload.get("system_prompt_scope"),
+        )
         with lifecycle_read_locks(
             config["CHROMA_COLLECTION"] for config in configs
         ):
@@ -1181,6 +1211,9 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
                     result.get("context"),
                     primary["KNOWLEDGE_BASE_ID"],
                 )
+                if payload.get("agent_id"):
+                    result["agent_id"] = payload["agent_id"]
+                    result["agent_name"] = payload.get("agent_name")
             elif stream:
                 result = _guard_stream_for_knowledge_bases(result, configs)
             return result
@@ -1225,7 +1258,10 @@ def run_rag_query_events(payload: dict, public: bool = False):
         conversation_id,
         configs,
     )
-    custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+    custom_system = _resolve_system_prompt(
+        payload.get("system_prompt_id"),
+        payload.get("system_prompt_scope"),
+    )
 
     def encode_events():
         nonlocal status
@@ -1286,6 +1322,9 @@ def run_rag_query_events(payload: dict, public: bool = False):
                             **event,
                             **_query_knowledge_base_response_fields(configs),
                         }
+                        if payload.get("agent_id"):
+                            event["agent_id"] = payload["agent_id"]
+                            event["agent_name"] = payload.get("agent_name")
                         _add_knowledge_base_to_download_urls(
                             event.get("context"),
                             primary["KNOWLEDGE_BASE_ID"],
@@ -1719,7 +1758,10 @@ def _prepare_code_interpreter_run(
         conversation_id,
         configs,
     )
-    custom_system = _resolve_system_prompt(payload.get("system_prompt_id"))
+    custom_system = _resolve_system_prompt(
+        payload.get("system_prompt_id"),
+        payload.get("system_prompt_scope"),
+    )
     rag_error = ""
     try:
         rag_payload = prepare_rag_context(
@@ -2202,14 +2244,27 @@ def _validate_conversation_knowledge_bases(
     return snapshot
 
 
-def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
+def _resolve_system_prompt(
+    system_prompt_id: str | None,
+    system_prompt_scope: str | None = None,
+) -> str | None:
     """Resolve a system_prompt_id into its runtime template content.
 
     Looks up the prompt by ID (user personal first, then shared),
     resolves template variables, and returns the final text.
     Returns None when no prompt is selected or the ID is invalid.
+
+    When ``system_prompt_scope`` is provided (``"personal"`` or ``"shared"``),
+    the lookup is scoped and fail-closed: a missing or inactive prompt raises
+    ``ValidationError`` instead of silently returning ``None``. This is used by
+    chat-agent queries where the prompt is explicitly configured.
     """
     if not system_prompt_id:
+        if system_prompt_scope:
+            raise ValidationError(
+                "system_prompt_id richiesto quando system_prompt_scope è specificato",
+                "system_prompt_id",
+            )
         return None
     system_prompt_id = str(system_prompt_id).strip()
     if not system_prompt_id:
@@ -2223,13 +2278,28 @@ def _resolve_system_prompt(system_prompt_id: str | None) -> str | None:
 
             user = UserStore(current_app.config.get("USERS_FILE")).get(api_user_id)
     if not user:
+        if system_prompt_scope:
+            raise ValidationError("Utente non autenticato", "system_prompt_id")
         return None
     from utils.prompt_store import PromptStore
 
     ps = PromptStore(current_app.config.get("PROMPTS_DIR", "app/data"))
-    prompt = ps.resolve(user["id"], system_prompt_id)
+    if system_prompt_scope == "personal":
+        prompt = ps.get_user_prompt_any(user["id"], system_prompt_id)
+    elif system_prompt_scope == "shared":
+        prompt = ps.get_shared_any(system_prompt_id)
+    else:
+        prompt = ps.resolve(user["id"], system_prompt_id)
     if not prompt:
+        if system_prompt_scope:
+            raise ValidationError(
+                "System prompt non trovato", "system_prompt_id"
+            )
         return None
+    if system_prompt_scope and not prompt.get("is_active", True):
+        raise ValidationError(
+            "System prompt non attivo", "system_prompt_id"
+        )
     return PromptStore.resolve_template(prompt["content"], user)
 
 
@@ -4057,6 +4127,93 @@ def _index_rebuild_status(app: Flask, config: dict | None = None) -> dict:
     }
 
 
+def _resolve_agent_for_query(agent_id: str, data: dict) -> tuple[str, str | None]:
+    """Resolve a chat-agent by ID and inject its config into *data*.
+
+    When ``agent_id`` is supplied, the caller must not also send explicit
+    ``provider``, ``model``, ``knowledge_base_id``/``knowledge_base_ids``,
+    or ``system_prompt_id``/``system_prompt_scope`` parameters — the agent
+    config wins.
+
+    Returns ``(agent_id, agent_name)``.
+    """
+    from utils.chat_agent_store import ChatAgentValidationError, validate_chat_agent_id
+    from utils.workspace import chat_agent_store, workspace_from_request
+
+    try:
+        agent_id = validate_chat_agent_id(agent_id)
+    except ChatAgentValidationError as exc:
+        raise ValidationError(
+            exc.message,
+            "agent_id",
+            exc.code,
+        )
+
+    conflicting = sorted(
+        {
+            key
+            for key in (
+                "provider",
+                "model",
+                "knowledge_base_id",
+                "knowledge_base_ids",
+                "system_prompt_id",
+                "system_prompt_scope",
+            )
+            if key in data and data.get(key) not in (None, "", [])
+        }
+    )
+    if conflicting:
+        raise ValidationError(
+            "Non inviare parametri espliciti insieme ad agent_id: "
+            + ", ".join(conflicting),
+            "agent_id",
+            "agent_conflicting_params",
+        )
+
+    workspace = workspace_from_request(current_app._get_current_object())
+    store = chat_agent_store(workspace, app=current_app._get_current_object())
+    agent = store.get(agent_id)
+    if agent is None:
+        raise ValidationError(
+            "Agent non trovato",
+            "agent_id",
+            "chat_agent_not_found",
+        )
+
+    prompt_ref = agent.get("prompt_ref") or {}
+    if not isinstance(prompt_ref, dict) or not prompt_ref.get("id"):
+        raise ValidationError(
+            "L'Agent deve avere un prompt di sistema valido",
+            "agent_id",
+            "prompt_missing",
+        )
+
+    api_key = getattr(request, "api_key", None)
+    if api_key:
+        allowed_ids = set(
+            api_key.get("knowledge_base_ids")
+            if "knowledge_base_ids" in api_key
+            else ["default"]
+        )
+        agent_kb_ids = set(agent.get("knowledge_base_ids") or [])
+        if not agent_kb_ids <= allowed_ids:
+            raise ValidationError(
+                "Agent non trovato",
+                "agent_id",
+                "chat_agent_not_found",
+            )
+
+    data["provider"] = agent.get("provider_id")
+    data["model"] = agent.get("model_id")
+    data["knowledge_base_ids"] = list(agent.get("knowledge_base_ids") or [])
+    data.pop("knowledge_base_id", None)
+    data["system_prompt_id"] = prompt_ref.get("id") or None
+    data["system_prompt_scope"] = prompt_ref.get("scope") or None
+
+    return agent_id, agent.get("name")
+
+
 def _parse_query_payload(require_json: bool = True) -> dict:
     if require_json and not request.is_json:
         raise ValidationError("Content-Type deve essere application/json")
@@ -4064,6 +4221,11 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     data = request.get_json(silent=True)
     if data is None:
         raise ValidationError("Body vuoto")
+
+    agent_id = data.get("agent_id")
+    agent_name = None
+    if "agent_id" in data:
+        agent_id, agent_name = _resolve_agent_for_query(agent_id, data)
 
     query = validate_query(data.get("query"))
     stream = validate_boolean(data.get("stream", False), field_name="stream")
@@ -4090,6 +4252,17 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     client_context = _validate_client_context(data.get("client_context"))
     response_language = _validate_response_language(data.get("response_language"))
     system_prompt_id = data.get("system_prompt_id") or None
+    system_prompt_scope = str(data.get("system_prompt_scope") or "").strip().lower() or None
+    if system_prompt_scope is not None and system_prompt_scope not in {"personal", "shared"}:
+        raise ValidationError(
+            "system_prompt_scope deve essere 'personal' o 'shared'",
+            "system_prompt_scope",
+        )
+    if system_prompt_scope and not system_prompt_id:
+        raise ValidationError(
+            "system_prompt_id richiesto quando system_prompt_scope è specificato",
+            "system_prompt_id",
+        )
     use_code_interpreter = validate_boolean(
         data.get("use_code_interpreter", False), field_name="use_code_interpreter"
     )
@@ -4125,11 +4298,15 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "temperature": temperature,
         "k": k,
         "system_prompt_id": system_prompt_id,
+        "system_prompt_scope": system_prompt_scope,
         "use_code_interpreter": use_code_interpreter,
         "attached_files": attached_files,
         "knowledge_base_ids": knowledge_base_ids,
         "knowledge_base_ids_explicit": plural_selection,
     }
+    if agent_id:
+        payload["agent_id"] = agent_id
+        payload["agent_name"] = agent_name
     if len(knowledge_base_ids) == 1:
         payload["knowledge_base_id"] = knowledge_base_ids[0]
     return payload

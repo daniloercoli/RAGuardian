@@ -213,6 +213,10 @@ def _create_backup_locked(
             workspace_data_root=workspace_data_staging,
             workspace_uploads_root=workspace_upload_staging,
         )
+        chat_agent_summary = _chat_agent_manifest_summary(
+            data_staging,
+            workspace_data_root=workspace_data_staging,
+        )
 
         manifest = {
             "backup_id": backup_id,
@@ -257,6 +261,9 @@ def _create_backup_locked(
                 "collection_scan_available"
             ],
             "knowledge_bases": knowledge_base_summary["knowledge_bases"],
+            "chat_agent_catalog_schema_version": 1,
+            "chat_agent_count": chat_agent_summary["chat_agent_count"],
+            "chat_agents": chat_agent_summary["chat_agents"],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -519,6 +526,11 @@ def _restore_backup_locked(
             manifest=manifest,
             workspace_data_root=workspace_data_dir,
             workspace_uploads_root=workspace_upload_dir,
+        )
+        _validate_restored_chat_agents(
+            DATA_DIR,
+            manifest=manifest,
+            workspace_data_root=workspace_data_dir,
         )
         verify_ok = actual_docs == expected_docs
 
@@ -1514,6 +1526,86 @@ def _validate_restored_knowledge_bases(
                 raise BackupError(
                     f"Restored knowledge base collection does not match the manifest: {key}"
                 )
+
+
+def _chat_agent_manifest_summary(
+    data_root: Path,
+    *,
+    workspace_data_root: Path | None = None,
+) -> dict:
+    """Scan workspace dirs for chat_agents.json and return a manifest summary."""
+    from utils.chat_agent_store import ChatAgentStore
+
+    workspaces_root = workspace_data_root or data_root / "workspaces"
+    entries: list[dict] = []
+    if not workspaces_root.exists():
+        return {
+            "chat_agent_count": 0,
+            "chat_agents": [],
+        }
+    for workspace_dir in sorted(path for path in workspaces_root.iterdir() if path.is_dir()):
+        catalog_path = workspace_dir / "chat_agents.json"
+        if not catalog_path.exists():
+            continue
+        try:
+            agents = ChatAgentStore(catalog_path).list()
+        except Exception:
+            agents = []
+        for agent in agents:
+            entries.append(
+                {
+                    "workspace_id": workspace_dir.name,
+                    "agent_id": agent.get("id"),
+                    "name": agent.get("name"),
+                }
+            )
+    return {
+        "chat_agent_count": len(entries),
+        "chat_agents": entries,
+    }
+
+
+def _validate_restored_chat_agents(
+    data_root: Path,
+    *,
+    manifest: dict,
+    workspace_data_root: Path | None = None,
+) -> None:
+    """Validate restored chat_agents.json catalogs against the manifest."""
+    from utils.chat_agent_store import ChatAgentCatalogError, ChatAgentStore
+
+    workspaces_root = workspace_data_root or data_root / "workspaces"
+    if not workspaces_root.exists():
+        return
+    for workspace_dir in (path for path in workspaces_root.iterdir() if path.is_dir()):
+        catalog_path = workspace_dir / "chat_agents.json"
+        if not catalog_path.exists():
+            continue
+        try:
+            ChatAgentStore(catalog_path).list()
+        except ChatAgentCatalogError as exc:
+            raise BackupError(
+                f"Invalid restored chat agent catalog for {workspace_dir.name}"
+            ) from exc
+
+    expected_entries = manifest.get("chat_agents")
+    if not isinstance(expected_entries, list):
+        return
+    actual = _chat_agent_manifest_summary(
+        data_root,
+        workspace_data_root=workspaces_root,
+    )
+    expected_by_key = {
+        (item.get("workspace_id"), item.get("agent_id")): item
+        for item in expected_entries
+        if isinstance(item, dict)
+    }
+    actual_by_key = {
+        (item.get("workspace_id"), item.get("agent_id")): item
+        for item in actual["chat_agents"]
+    }
+    if set(expected_by_key) != set(actual_by_key):
+        raise BackupError("Restored chat agent catalog does not match the manifest")
 
 
 def _chroma_collection_counts(path: Path | None) -> tuple[dict[str, int], bool]:

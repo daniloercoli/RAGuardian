@@ -3,6 +3,32 @@ import {Buffer} from "node:buffer";
 
 const port = Number(process.env.FAKE_RAG_PORT || 5055);
 const requests = [];
+const agentOneId = "agent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const agentTwoId = "agent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const agents = [
+    {
+        id: agentOneId,
+        name: "Support Agent",
+        description: "Answers support questions",
+        provider_id: "openai",
+        model_id: "gpt-4o",
+        knowledge_base_ids: ["default"],
+        prompt_ref: {id: "prompt-shared", scope: "shared"},
+        available: true,
+        issues: [],
+    },
+    {
+        id: agentTwoId,
+        name: "Sales Agent",
+        description: "Answers sales questions",
+        provider_id: "openai",
+        model_id: "gpt-4o",
+        knowledge_base_ids: ["default"],
+        prompt_ref: {id: "prompt-shared", scope: "shared"},
+        available: true,
+        issues: [],
+    },
+];
 
 function json(response, status, payload) {
     const body = JSON.stringify(payload);
@@ -98,6 +124,45 @@ const server = http.createServer(async (request, response) => {
         return;
     }
 
+    if (url.pathname === "/api/v1/knowledge-bases" && request.method === "GET") {
+        record(request, {type: "knowledge_base_catalog"});
+        json(response, 200, {
+            knowledge_bases: [{id: "default", name: "Default", status: "active"}],
+        });
+        return;
+    }
+
+    if (url.pathname === "/api/v1/agents" && request.method === "GET") {
+        record(request, {type: "agent_catalog"});
+        json(response, 200, {
+            agents,
+            capabilities: {can_manage: true},
+            limits: {max_chat_agents: 20, max_query_knowledge_bases: 5},
+        });
+        return;
+    }
+
+    if (url.pathname === "/api/v1/agents/options" && request.method === "GET") {
+        record(request, {type: "agent_options"});
+        json(response, 200, {
+            models: [{
+                id: "gpt-4o",
+                name: "GPT-4o",
+                provider: "openai",
+                provider_name: "OpenAI",
+                value: "openai:gpt-4o",
+                is_default: true,
+            }],
+            default_provider: "openai",
+            default_model: "gpt-4o",
+            knowledge_bases: [{id: "default", name: "Default", status: "active"}],
+            prompts: [{id: "prompt-shared", name: "Shared", scope: "shared", is_active: true}],
+            capabilities: {can_manage: true},
+            limits: {max_chat_agents: 20, max_query_knowledge_bases: 5},
+        });
+        return;
+    }
+
     if (url.pathname === "/api/v1/query" && request.method === "POST") {
         const body = JSON.parse((await readBody(request)).toString("utf8") || "{}");
         record(request, {type: "query", body});
@@ -111,6 +176,7 @@ const server = http.createServer(async (request, response) => {
                     snippet: "Fixture public article",
                 },
             ],
+            agent_id: body.agent_id || undefined,
         });
         return;
     }

@@ -23,21 +23,37 @@
         }
     }
 
-    function conversationId() {
-        const stored = storageGet(CONVERSATION_KEY);
+    function conversationStorageKey(agentId) {
+        return CONVERSATION_KEY + (agentId ? ":" + agentId : ":legacy");
+    }
+
+    function createConversationId() {
+        return "wp-" + (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+    }
+
+    function setConversationId(agentId, id) {
+        storageSet(conversationStorageKey(agentId), id);
+        document.cookie = "ec_rag_conversation_id=" + encodeURIComponent(id) + "; path=/; max-age=86400; samesite=lax";
+        return id;
+    }
+
+    function conversationId(agentId) {
+        const key = conversationStorageKey(agentId);
+        const stored = storageGet(key);
         if (stored) return stored;
 
-        const match = document.cookie.match(/(?:^|;\s*)ec_rag_conversation_id=([^;]+)/);
-        if (match) {
+        const match = !agentId && document.cookie.match(/(?:^|;\s*)ec_rag_conversation_id=([^;]+)/);
+        if (match && match[1]) {
             const cookieValue = decodeURIComponent(match[1]);
-            storageSet(CONVERSATION_KEY, cookieValue);
+            storageSet(key, cookieValue);
             return cookieValue;
         }
 
-        const id = "wp-" + (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
-        storageSet(CONVERSATION_KEY, id);
-        document.cookie = "ec_rag_conversation_id=" + encodeURIComponent(id) + "; path=/; max-age=86400";
-        return id;
+        return setConversationId(agentId, createConversationId());
+    }
+
+    function rotateConversationId(agentId) {
+        return setConversationId(agentId, createConversationId());
     }
 
     function flag(value, fallback) {
@@ -48,6 +64,18 @@
 
     function configFor(chat) {
         const defaults = (window.ecRagClient && ecRagClient.defaults) || {};
+        let agentsCatalog = [];
+        try {
+            const parsed = JSON.parse(chat.dataset.ecRagAgentsCatalog || "[]");
+            agentsCatalog = Array.isArray(parsed) ? parsed : [];
+        } catch (_error) {
+            agentsCatalog = [];
+        }
+        const agentMode = flag(
+            chat.dataset.ecRagAgentMode,
+            Boolean(defaults.enableChatAgentsMode)
+        );
+        const configuredAgentId = chat.dataset.ecRagAgentId || defaults.agentId || "";
         return {
             showSources: flag(chat.dataset.ecRagShowSources, Boolean(defaults.showSources)),
             enableTts: flag(chat.dataset.ecRagEnableTts, Boolean(defaults.enableTts)),
@@ -58,7 +86,12 @@
             pageTitle: chat.dataset.ecRagPageTitle || document.title || "",
             pageUrl: chat.dataset.ecRagPageUrl || window.location.href,
             postType: chat.dataset.ecRagPostType || "",
-            locale: chat.dataset.ecRagLocale || document.documentElement.lang || "",
+            locale: chat.dataset.ecRagLocale || (window.navigator && window.navigator.language) || "en",
+            agentMode,
+            agentId: agentsCatalog.some((agent) => agent.id === configuredAgentId)
+                ? configuredAgentId
+                : "",
+            agentsCatalog,
         };
     }
 
@@ -206,6 +239,7 @@
             const download = chat.querySelector("[data-ec-rag-download]");
             const audioInput = chat.querySelector("[data-ec-rag-audio]");
             const audioButton = chat.querySelector("[data-ec-rag-audio-button]");
+            const agentSelect = chat.querySelector("[data-ec-rag-agent]");
             const transcript = [];
             if (!form || !input || !messages) return;
 
@@ -217,6 +251,23 @@
             }
             if (config.welcome) {
                 appendMessage(messages, "bot ec-rag-message--welcome", config.welcome);
+            }
+            if (agentSelect) {
+                agentSelect.value = config.agentId;
+                agentSelect.addEventListener("change", () => {
+                    const selected = agentSelect.value;
+                    config.agentId = config.agentsCatalog.some((agent) => agent.id === selected)
+                        ? selected
+                        : "";
+                    rotateConversationId(config.agentId);
+                    transcript.splice(0, transcript.length);
+                    messages.replaceChildren();
+                    if (config.welcome) {
+                        appendMessage(messages, "bot ec-rag-message--welcome", config.welcome);
+                    }
+                    input.value = "";
+                    input.focus();
+                });
             }
             if (download) {
                 download.addEventListener("click", () => downloadTranscript(config, transcript));
@@ -233,7 +284,7 @@
                     try {
                         const result = await postFormData("ec_rag_audio_upload", {
                             audio: file,
-                            conversation_id: conversationId(),
+                            conversation_id: conversationId(config.agentId),
                         });
                         pending.classList.remove("is-loading");
                         const label = result.job_id ? "Audio queued for transcription. Job: " + result.job_id : "Audio uploaded for transcription.";
@@ -254,6 +305,11 @@
                 event.preventDefault();
                 const query = input.value.trim();
                 if (query.length < 3) return;
+                if (config.agentMode && !config.agentId) {
+                    appendMessage(messages, "bot ec-rag-message--error", "Choose an assistant before sending a message.");
+                    if (agentSelect) agentSelect.focus();
+                    return;
+                }
 
                 input.value = "";
                 appendMessage(messages, "user", query);
@@ -263,16 +319,18 @@
                 if (submit) submit.disabled = true;
 
                 try {
-                    const result = await post("ec_rag_query", {
+                    const payload = {
                         query,
-                        conversation_id: conversationId(),
+                        conversation_id: conversationId(config.agentId),
                         response_language: config.responseLanguage,
                         context: config.context,
                         page_title: config.pageTitle,
                         page_url: config.pageUrl,
                         post_type: config.postType,
                         locale: config.locale,
-                    });
+                    };
+                    if (config.agentId) payload.agent_id = config.agentId;
+                    const result = await post("ec_rag_query", payload);
                     pending.classList.remove("is-loading");
                     pending.querySelector(".ec-rag-message__body").textContent = result.answer || "No answer returned.";
                     renderSources(pending, result.sources || [], config);

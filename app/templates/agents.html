@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <script src="{{ url_for('static', filename='csrf.js') }}"></script>
+    <title>Chat Agents - RAGuardian</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="any">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container wide">
+        {% set page_title = "Chat Agents" %}
+        {% set nav_mode = "admin" %}
+        {% include "_page_header.html" %}
+
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <h2>Chat agents</h2>
+                    <p class="muted">Pre-configured chat profiles with provider, model, knowledge bases, and system prompt.</p>
+                </div>
+                <button type="button" id="showCreateAgentButton">Create agent</button>
+            </div>
+            <form id="createAgentForm" class="form-grid compact" hidden>
+                <label>
+                    Name
+                    <input type="text" name="name" minlength="1" maxlength="120" required>
+                </label>
+                <label>
+                    Description
+                    <textarea name="description" maxlength="500" rows="3"></textarea>
+                </label>
+                <label>
+                    Provider
+                    <select name="provider_id" id="createAgentProvider" required></select>
+                </label>
+                <label>
+                    Model
+                    <select name="model_id" id="createAgentModel" required></select>
+                </label>
+                <fieldset class="scope-field">
+                    <legend>Knowledge bases <span class="muted" id="createAgentKbLimit"></span></legend>
+                    <div class="scope-options" id="createAgentKnowledgeBases"></div>
+                </fieldset>
+                <label>
+                    System prompt
+                    <select name="prompt_ref" id="createAgentPrompt" required>
+                        <option value="" disabled selected>Select a system prompt</option>
+                    </select>
+                </label>
+                <div class="modal-actions">
+                    <button type="submit">Create</button>
+                    <button type="button" class="secondary" id="cancelCreateAgentButton">Cancel</button>
+                </div>
+            </form>
+            <div id="agentNotice" class="notice" hidden></div>
+            <div id="agentList" aria-live="polite">
+                <p class="muted">Loading agents...</p>
+            </div>
+        </section>
+    </div>
+    <script src="{{ url_for('static', filename='agents.js') }}"></script>
+</body>
+</html>

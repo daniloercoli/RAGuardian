@@ -38,9 +38,11 @@ Supported scopes:
 | `ingest` | PDF upload, audio upload, file deletion |
 | `speech` | text-to-speech synthesis |
 | `kb_manage` | knowledge-base catalog creation, update, and deletion |
+| `agent_manage` | chat-agent create, update, and delete; read with `query` |
 
 Each user key also has a `knowledge_base_ids` allowlist. The legacy
-`RAG_API_KEY` environment key is default-only and has no `kb_manage` scope.
+`RAG_API_KEY` environment key is default-only and has no `kb_manage` or
+`agent_manage` scope.
 
 In multi-user deployments, create a dedicated user for each external integration when that integration needs its own knowledge boundary. For example, a WordPress public site can use a `website@example.com` RAGuardian user and one API key from that user's workspace. Grant that key `query` for chat, add `ingest` for article import/sync or audio upload, and add `speech` only for text-to-speech.
 
@@ -274,17 +276,27 @@ one global ranking. A failure or unauthorized KB fails the whole request.
 | Field | Type | Required | Default | Constraints |
 |---|---|---:|---|---|
 | `query` | string | yes | | 3-2000 characters |
-| `provider` | string | no | runtime configuration | Must exist in registry |
-| `model` | string | no | default model | Must belong to provider |
+| `agent_id` | string | no | | ID of a chat agent; resolves provider, model, KBs, and prompt server-side |
+| `provider` | string | no | runtime configuration | Must exist in registry; mutually exclusive with `agent_id` |
+| `model` | string | no | default model | Must belong to provider; mutually exclusive with `agent_id` |
 | `conversation_id` | string | no | stateless | 8-80 characters; if present enables conversational memory |
-| `knowledge_base_ids` | string[] | no | `["default"]` | 1 to `RAG_MAX_QUERY_KNOWLEDGE_BASES` unique, authorized active KB IDs; discover the runtime value from `GET /api/v1/knowledge-bases` |
-| `system_prompt_id` | string | no | active/default prompt | ID of a saved system prompt |
+| `knowledge_base_ids` | string[] | no | `["default"]` | 1 to `RAG_MAX_QUERY_KNOWLEDGE_BASES` unique, authorized active KB IDs; mutually exclusive with `agent_id` |
+| `system_prompt_id` | string | no | active/default prompt | ID of a saved system prompt; mutually exclusive with `agent_id` |
 | `client_context` | object | no | none | Safe site/page metadata used only in the prompt |
 | `response_language` | string | no | `auto` | `auto` answers in the question language; `it` forces Italian; `en` forces English |
 | `stream` | boolean | no | `false` | `true` enables streaming |
 | `stream_format` | string | no | `text` | `text` or `ndjson`; used only with `stream: true` |
 | `temperature` | number | no | runtime configuration | 0.0-1.0 |
 | `k` | integer | no | runtime configuration | 1-50 |
+
+When `agent_id` is present, the server resolves the agent's `provider_id`,
+`model_id`, `knowledge_base_ids`, and `prompt_ref`. Sending any explicit
+`provider`, `model`, `knowledge_base_ids`, `knowledge_base_id`,
+`system_prompt_id`, or `system_prompt_scope` together with `agent_id` returns
+`400` with `status: "agent_conflicting_params"`. The API key must have `query`
+scope and its KB allowlist must cover every knowledge base linked to the agent;
+otherwise the response is `400` with `status: "chat_agent_not_found"`. The
+response includes `agent_id` and `agent_name` when an agent was used.
 
 To maintain a conversation, reuse the same `conversation_id` in subsequent requests. The history is used both to contextualize retrieval and in the final prompt; when it exceeds a fixed server-side threshold, older turns are compressed into a summary and the latest exchanges remain explicit. If `conversation_id` is not present, the request remains stateless.
 
@@ -332,6 +344,8 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
   "model": "mistral-medium",
   "provider": "mistral",
   "provider_name": "Mistral AI",
+  "agent_id": "agent_abcdef1234567890abcdef1234567890",
+  "agent_name": "Support Agent",
   "conversation_id": "chat-20260616-demo",
   "knowledge_base_ids": [
     "default",
@@ -687,6 +701,269 @@ curl -X DELETE 'http://127.0.0.1:5000/api/v1/files/manuali/documento.pdf?knowled
 
 If the file is not registered in `files.json`, the response is `404` with `status: "not_found"`.
 
+## Chat Agents
+
+Chat agents are named presets that bundle a provider, model, knowledge bases,
+and a prompt reference. External clients can query by `agent_id` instead of
+specifying each parameter individually.
+
+### Scopes
+
+| Operation | Required scope |
+|---|---|
+| List, get, options | `query` or `agent_manage` |
+| Create, update, delete | `agent_manage` |
+
+### KB-grant filtering
+
+List, get, update, delete, and query-by-`agent_id` enforce the API key's
+`knowledge_base_ids` allowlist: only agents whose `knowledge_base_ids` are a
+subset of the key's allowed KBs are visible. An agent referencing a KB outside
+the key's allowlist is hidden with `404`.
+
+## GET /api/v1/agents
+
+Lists agents visible to the API key.
+
+### Request
+
+```bash
+curl http://127.0.0.1:5000/api/v1/agents \
+  -H "X-API-Key: $RAG_API_KEY"
+```
+
+### Response 200
+
+```json
+{
+  "agents": [
+    {
+      "id": "agent_abcdef1234567890abcdef1234567890",
+      "name": "Support Agent",
+      "description": "Customer support",
+      "provider_id": "regolo",
+      "model_id": "gpt-oss-120b",
+      "knowledge_base_ids": ["default"],
+      "prompt_ref": {
+        "id": "prompt-uuid",
+        "scope": "shared"
+      },
+      "created_at": "2026-08-01T10:00:00+00:00",
+      "updated_at": "2026-08-01T10:00:00+00:00",
+      "available": true,
+      "issues": []
+    }
+  ],
+  "limits": {
+    "max_chat_agents": 20,
+    "max_query_knowledge_bases": 5
+  },
+  "capabilities": {
+    "can_manage": false
+  }
+}
+```
+
+Each agent carries an `available` flag and an `issues` array describing why
+it cannot currently run (missing model, inactive/missing KB, missing/inactive
+prompt, or KB count above the limit).
+
+## GET /api/v1/agents/{agent_id}
+
+Returns a single agent by ID.
+
+### Response 200
+
+Same shape as one element of the `agents` array above.
+
+### Errors
+
+| HTTP | status | Meaning |
+|---:|---|---|
+| 404 | `chat_agent_not_found` | Agent does not exist or KB grant mismatch |
+
+## GET /api/v1/agents/options
+
+Returns the models, active knowledge bases, personal/shared prompt metadata,
+capabilities, and limits available to
+the API key. Useful for building agent creation/edit forms in external clients.
+
+### Request
+
+```bash
+curl http://127.0.0.1:5000/api/v1/agents/options \
+  -H "X-API-Key: $RAG_API_KEY"
+```
+
+### Response 200
+
+```json
+{
+  "models": [
+    {
+      "id": "gpt-oss-120b",
+      "name": "gpt-oss-120b (Regolo)",
+      "provider": "regolo",
+      "provider_name": "Regolo",
+      "value": "regolo:gpt-oss-120b",
+      "is_default": true
+    }
+  ],
+  "default_provider": "regolo",
+  "default_model": "gpt-oss-120b",
+  "knowledge_bases": [
+    {
+      "id": "default",
+      "name": "General",
+      "description": "",
+      "is_default": true,
+      "status": "active",
+      "created_at": "2026-08-01T10:00:00+00:00",
+      "updated_at": "2026-08-01T10:00:00+00:00",
+      "stats": {
+        "tracked_files": 0,
+        "indexed_files": 0,
+        "chunks": 0,
+        "data_sources": 0
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "id": "prompt-uuid",
+      "name": "Agent system prompt",
+      "scope": "shared",
+      "is_active": true
+    }
+  ],
+  "capabilities": {
+    "can_manage": false
+  },
+  "limits": {
+    "max_chat_agents": 20,
+    "max_query_knowledge_bases": 5
+  }
+}
+```
+
+## POST /api/v1/agents
+
+Creates a new agent. Requires `agent_manage` scope.
+
+### Request JSON
+
+| Field | Type | Required | Constraints |
+|---|---|---:|---|
+| `name` | string | yes | 1-120 characters |
+| `description` | string | no | Max 500 characters |
+| `provider_id` | string | yes | Must exist in registry |
+| `model_id` | string | yes | Must belong to provider |
+| `knowledge_base_ids` | string[] | yes | 1 to `max_query_knowledge_bases` authorized active KB IDs |
+| `prompt_ref` | object | yes | `{"id": "prompt-uuid", "scope": "shared"}` |
+
+### Request
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/v1/agents \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $RAG_API_KEY" \
+  -d '{
+    "name": "Support Agent",
+    "description": "Customer support",
+    "provider_id": "regolo",
+    "model_id": "gpt-oss-120b",
+    "knowledge_base_ids": ["default"],
+    "prompt_ref": {
+      "id": "prompt-uuid",
+      "scope": "shared"
+    }
+  }'
+```
+
+### Response 201
+
+```json
+{
+  "id": "agent_abcdef1234567890abcdef1234567890",
+  "name": "Support Agent",
+  "description": "Customer support",
+  "provider_id": "regolo",
+  "model_id": "gpt-oss-120b",
+  "knowledge_base_ids": ["default"],
+  "prompt_ref": {
+    "id": "prompt-uuid",
+    "scope": "shared"
+  },
+  "created_at": "2026-08-01T10:00:00+00:00",
+  "updated_at": "2026-08-01T10:00:00+00:00",
+  "available": true,
+  "issues": []
+}
+```
+
+### Errors
+
+| HTTP | status | Meaning |
+|---:|---|---|
+| 400 | `invalid_prompt_ref` | `prompt_ref` missing or malformed |
+| 400 | `invalid_chat_agent_name` | Name empty or too long |
+| 400 | `model_unavailable` / `knowledge_base_missing` / `knowledge_base_inactive` / `prompt_missing` / `prompt_inactive` | Referenced resource no longer usable |
+| 403 | `forbidden` | Key lacks `agent_manage` scope |
+| 404 | `knowledge_base_not_found` | Referenced KB not in key allowlist |
+| 409 | `knowledge_base_limit_exceeded` | Too many KBs |
+| 409 | `chat_agent_limit_reached` | Workspace reached `max_chat_agents` |
+| 409 | `duplicate_chat_agent_name` | Another agent already uses that name |
+
+## PATCH /api/v1/agents/{agent_id}
+
+Updates an agent. All fields are optional; only provided fields are changed.
+Requires `agent_manage` scope.
+
+### Request JSON
+
+| Field | Type | Notes |
+|---|---|---:|
+| `name` | string | 1-120 characters |
+| `description` | string | Max 500 characters |
+| `provider_id` | string | Must exist in registry |
+| `model_id` | string | Must belong to provider |
+| `knowledge_base_ids` | string[] | 1 to `max_query_knowledge_bases` authorized active KB IDs |
+| `prompt_ref` | object | `{"id": "prompt-uuid", "scope": "shared"}` |
+
+### Response 200
+
+Same shape as the create response.
+
+### Errors
+
+| HTTP | status | Meaning |
+|---:|---|---|
+| 400 | `model_unavailable` / `knowledge_base_missing` / `knowledge_base_inactive` / `prompt_missing` / `prompt_inactive` | Updated references no longer usable |
+| 403 | `forbidden` | Key lacks `agent_manage` scope |
+| 404 | `chat_agent_not_found` | Agent does not exist or KB grant mismatch |
+| 404 | `knowledge_base_not_found` | Referenced KB not in key allowlist |
+| 409 | `knowledge_base_limit_exceeded` | Too many KBs |
+| 409 | `duplicate_chat_agent_name` | Another agent already uses that name |
+
+## DELETE /api/v1/agents/{agent_id}
+
+Deletes an agent. Requires `agent_manage` scope.
+
+### Response 200
+
+```json
+{
+  "ok": true
+}
+```
+
+### Errors
+
+| HTTP | status | Meaning |
+|---:|---|---|
+| 404 | `chat_agent_not_found` | Agent does not exist or KB grant mismatch |
+| 403 | `forbidden` | Key lacks `agent_manage` scope |
+
 ## Provider Configuration
 
 Providers/models distributed with the project are defined in:
@@ -720,3 +997,4 @@ when you need alternatives.
 4. Upload at least one PDF via `/admin/files` or `POST /api/v1/files`; upload audio via `POST /api/v1/audio` when STT is configured.
 5. Set `REGOLO_API_KEY` or configure another OCR provider when scanned PDFs or image-to-text chat input are required.
 6. Query `POST /api/v1/query`.
+7. Optionally create chat agents with `POST /api/v1/agents` and query by `agent_id`.

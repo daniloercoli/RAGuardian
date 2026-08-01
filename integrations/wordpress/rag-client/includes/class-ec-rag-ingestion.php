@@ -263,7 +263,10 @@ class EC_Rag_Ingestion {
         $attempt = absint($attempt);
         if ($knowledge_base_id === null) {
             $options = EC_Rag_Options::get();
-            $knowledge_base_id = sanitize_text_field($options['knowledge_base_id'] ?? '');
+            $knowledge_base_id = sanitize_text_field(
+                $options['ingestion_knowledge_base_id']
+                    ?? ($options['knowledge_base_id'] ?? '')
+            );
         }
         $args = [$post_id, $attempt, $knowledge_base_id];
 
@@ -400,7 +403,7 @@ class EC_Rag_Ingestion {
             function () use ($knowledge_base_id) {
                 $options = EC_Rag_Options::get();
                 if ($knowledge_base_id !== null) {
-                    $options['knowledge_base_id'] = $knowledge_base_id;
+                    $options['ingestion_knowledge_base_id'] = $knowledge_base_id;
                 }
 
                 return $options;
@@ -432,7 +435,7 @@ class EC_Rag_Ingestion {
             function () use ($knowledge_base_id) {
                 $options = EC_Rag_Options::get();
                 if ($knowledge_base_id !== null) {
-                    $options['knowledge_base_id'] = $knowledge_base_id;
+                    $options['ingestion_knowledge_base_id'] = $knowledge_base_id;
                 }
 
                 return $options;
@@ -519,7 +522,7 @@ class EC_Rag_Ingestion {
             'failed'       => 0,
             'errors'       => [],
             'knowledge_base_id' => sanitize_text_field(
-                (EC_Rag_Options::get())['knowledge_base_id'] ?? ''
+                (EC_Rag_Options::get())['ingestion_knowledge_base_id'] ?? ''
             ),
         ];
 

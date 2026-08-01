@@ -361,3 +361,20 @@
         max-width: 190px;
     }
 }
+.ec-rag-agent-selector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 12px 8px;
+}
+
+.ec-rag-agent-selector label {
+    font-size: .9em;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.ec-rag-agent-selector select {
+    min-width: 0;
+    max-width: 100%;
+}

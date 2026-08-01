@@ -101,6 +101,8 @@ class EC_Rag_Widget {
                 'enableTts'          => $options['enable_tts'] === '1',
                 'enableAudioUpload'  => $options['enable_audio_upload'] === '1',
                 'responseLanguage'   => $options['response_language'],
+                'enableChatAgentsMode' => ($options['enable_chat_agents_mode'] ?? '0') === '1',
+                'agentId'            => EC_Rag_Options::sanitize_agent_id($options['default_agent_id'] ?? ''),
             ],
         ];
 
@@ -203,7 +205,19 @@ class EC_Rag_Widget {
         $options   = $args['options'];
         $mode      = ($args['mode'] === 'floating') ? 'floating' : 'inline';
         $position  = ($mode === 'floating') ? $options['position'] : 'inline-only';
+        $enable_agent_mode = ($options['enable_chat_agents_mode'] ?? '0') === '1';
+        $agents_catalog = $enable_agent_mode
+            ? self::public_agent_catalog($options)
+            : [];
+        $agent_ids = array_column($agents_catalog, 'id');
+        $agent_id = EC_Rag_Options::sanitize_agent_id(
+            $options['default_agent_id'] ?? ''
+        );
+        if (!in_array($agent_id, $agent_ids, true)) {
+            $agent_id = '';
+        }
         $id        = 'ec-rag-panel-' . wp_generate_uuid4();
+        $agent_select_id = $id . '-agent';
         $primary   = $options['primary_color'] ?: '#2563eb';
         $text_color = $options['text_color'] ?: '#ffffff';
         $widget_title = $args['title'] ?: $options['widget_title'];
@@ -229,6 +243,9 @@ class EC_Rag_Widget {
             style="<?php echo esc_attr($style); ?>"
             data-ec-rag-chat
             data-ec-rag-mode="<?php echo esc_attr($mode); ?>"
+            data-ec-rag-agent-mode="<?php echo $enable_agent_mode ? '1' : '0'; ?>"
+            data-ec-rag-agents-catalog="<?php echo esc_attr(wp_json_encode($agents_catalog)); ?>"
+            data-ec-rag-agent-id="<?php echo esc_attr($agent_id); ?>"
             data-ec-rag-title="<?php echo esc_attr($widget_title); ?>"
             data-ec-rag-welcome="<?php echo esc_attr($options['welcome_message']); ?>"
             data-ec-rag-context="<?php echo esc_attr($args['context']); ?>"
@@ -265,6 +282,17 @@ class EC_Rag_Widget {
                         <p class="ec-rag-privacy-note"><?php echo esc_html($options['privacy_note']); ?></p>
                     <?php endif; ?>
                     <div class="ec-rag-messages" data-ec-rag-messages aria-live="polite"></div>
+                    <?php if ($enable_agent_mode) : ?>
+                        <div class="ec-rag-agent-selector">
+                            <label for="<?php echo esc_attr($agent_select_id); ?>"><?php esc_html_e('Assistant', 'ec-rag'); ?></label>
+                            <select id="<?php echo esc_attr($agent_select_id); ?>" data-ec-rag-agent <?php if (!$agents_catalog) : ?>disabled<?php endif; ?>>
+                                <option value="" <?php selected($agent_id, ''); ?>><?php esc_html_e('Choose an assistant', 'ec-rag'); ?></option>
+                                <?php foreach ($agents_catalog as $agent) : ?>
+                                    <option value="<?php echo esc_attr($agent['id']); ?>" <?php selected($agent_id, $agent['id']); ?>><?php echo esc_html($agent['name']); ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                    <?php endif; ?>
                     <form class="ec-rag-form" data-ec-rag-form>
                         <?php if ($options['enable_audio_upload'] === '1') : ?>
                             <input class="ec-rag-audio-input" type="file" accept="audio/*" data-ec-rag-audio hidden>
@@ -278,6 +306,40 @@ class EC_Rag_Widget {
         <?php
 
         return ob_get_clean();
+    }
+
+    /**
+     * Return only allowlisted, currently available, presentation-safe records.
+     */
+    public static function public_agent_catalog(array $options): array {
+        $allowed = EC_Rag_Options::sanitize_agent_ids(
+            $options['allowed_agent_ids'] ?? []
+        );
+        if (!$allowed || empty($options['base_url']) || empty($options['api_key'])) {
+            return [];
+        }
+        $api = new EC_Rag_Api_Client(fn() => $options);
+        $response = $api->get_agent_catalog();
+        if (is_wp_error($response) || !is_array($response['agents'] ?? null)) {
+            return [];
+        }
+        $result = [];
+        foreach ($response['agents'] as $agent) {
+            $agent_id = EC_Rag_Options::sanitize_agent_id($agent['id'] ?? '');
+            if (
+                $agent_id === ''
+                || !in_array($agent_id, $allowed, true)
+                || empty($agent['available'])
+            ) {
+                continue;
+            }
+            $result[] = [
+                'id' => $agent_id,
+                'name' => sanitize_text_field($agent['name'] ?? ''),
+                'description' => sanitize_text_field($agent['description'] ?? ''),
+            ];
+        }
+        return $result;
     }
 
     /**

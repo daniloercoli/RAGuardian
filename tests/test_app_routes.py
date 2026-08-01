@@ -499,7 +499,7 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
     admin_home_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
     admin_files_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
     assert '<span class="nav-item active" aria-current="page">Chat</span>' in admin_home_nav
-    assert admin_home_links == [("/admin/files", "Configuration")]
+    assert admin_home_links == [("/agents", "Agents"), ("/admin/files", "Configuration")]
     assert 'href="/my-prompts"' not in admin_home_nav
     assert 'href="/admin/prompts"' not in admin_home_nav
     assert 'href="/admin/config"' not in admin_home_nav
