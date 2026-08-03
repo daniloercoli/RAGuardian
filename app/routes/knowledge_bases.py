@@ -147,6 +147,9 @@ def _list_response(app, *, public: bool) -> dict:
             "max_query_knowledge_bases": int(
                 app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5)
             ),
+            "max_knowledge_bases": int(
+                app.config.get("MAX_KNOWLEDGE_BASES", 20)
+            ) + 1,
         },
     }
 

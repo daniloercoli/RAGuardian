@@ -498,8 +498,9 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
     admin_files_nav = re.search(r"<nav class=\"top-nav[^\"]*\"[^>]*>(.*?)</nav>", admin_files, re.S).group(1)
     admin_home_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_home_nav)
     admin_files_links = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>', admin_files_nav)
-    assert '<span class="nav-item active" aria-current="page">Chat</span>' in admin_home_nav
-    assert admin_home_links == [("/agents", "Agents"), ("/admin/files", "Configuration")]
+    assert 'id="newChatLink" class="nav-item active" aria-current="page"' in admin_home_nav
+    assert 'id="configurationLink"' in admin_home_nav
+    assert admin_home_links == [("/", "New Chat"), ("/admin/files", "Configuration")]
     assert 'href="/my-prompts"' not in admin_home_nav
     assert 'href="/admin/prompts"' not in admin_home_nav
     assert 'href="/admin/config"' not in admin_home_nav
@@ -507,6 +508,9 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
     assert 'href="/admin/prompts"' in admin_files
     assert '<span class="nav-item active" aria-current="page">RAG Files</span>' in admin_files_nav
     assert 'href="/admin/files"' not in admin_files_nav
+    assert admin_files_nav.index("RAG Files") < admin_files_nav.index(
+        "Knowledge Bases"
+    ) < admin_files_nav.index("Chat Agents")
     assert ("/admin/config", "AI Settings") in admin_files_links
     assert admin_files_links[-3:] == [
         ("/my-prompts", "System Prompts"),

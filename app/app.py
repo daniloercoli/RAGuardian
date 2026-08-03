@@ -4182,12 +4182,6 @@ def _resolve_agent_for_query(agent_id: str, data: dict) -> tuple[str, str | None
         )
 
     prompt_ref = agent.get("prompt_ref") or {}
-    if not isinstance(prompt_ref, dict) or not prompt_ref.get("id"):
-        raise ValidationError(
-            "L'Agent deve avere un prompt di sistema valido",
-            "agent_id",
-            "prompt_missing",
-        )
 
     api_key = getattr(request, "api_key", None)
     if api_key:

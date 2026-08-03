@@ -296,11 +296,15 @@ paths:
                       $ref: "#/components/schemas/KnowledgeBase"
                   limits:
                     type: object
-                    required: [max_query_knowledge_bases]
+                    required: [max_query_knowledge_bases, max_knowledge_bases]
                     properties:
                       max_query_knowledge_bases:
                         type: integer
                         minimum: 1
+                      max_knowledge_bases:
+                        type: integer
+                        minimum: 1
+                        description: Total workspace capacity, including the default knowledge base.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1107,7 +1111,9 @@ components:
       pattern: "^agent_[0-9a-f]{32}$"
     ChatAgentPromptRef:
       type: object
-      required: [id, scope]
+      oneOf:
+        - maxProperties: 0
+        - required: [id, scope]
       properties:
         id:
           type: string
@@ -1117,6 +1123,16 @@ components:
           type: string
           enum: [personal, shared]
       additionalProperties: false
+      description: >
+        System prompt reference. An empty object means the agent has no system
+        prompt; otherwise both id and scope are required.
+    ChatAgentPromptRefInput:
+      oneOf:
+        - $ref: "#/components/schemas/ChatAgentPromptRef"
+        - type: "null"
+      description: >
+        Optional system prompt reference. Omit the field on create, or send
+        null or an empty object to create or update an agent without a prompt.
     ChatAgentAvailabilityIssue:
       type: object
       required: [code, field, message]
@@ -1211,7 +1227,6 @@ components:
         - provider_id
         - model_id
         - knowledge_base_ids
-        - prompt_ref
       properties:
         name:
           type: string
@@ -1235,7 +1250,7 @@ components:
           items:
             $ref: "#/components/schemas/KnowledgeBaseId"
         prompt_ref:
-          $ref: "#/components/schemas/ChatAgentPromptRef"
+          $ref: "#/components/schemas/ChatAgentPromptRefInput"
       additionalProperties: false
     ChatAgentUpdateInput:
       type: object
@@ -1263,7 +1278,7 @@ components:
           items:
             $ref: "#/components/schemas/KnowledgeBaseId"
         prompt_ref:
-          $ref: "#/components/schemas/ChatAgentPromptRef"
+          $ref: "#/components/schemas/ChatAgentPromptRefInput"
       additionalProperties: false
     ChatAgentDeleteResponse:
       type: object

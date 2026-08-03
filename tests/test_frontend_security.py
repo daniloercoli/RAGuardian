@@ -23,7 +23,7 @@ def test_chat_markdown_is_sanitized_before_dom_insert():
     assert "renderSourceCard" in script
     assert "sourceSnippet" in script
     assert "<textarea" in template
-    assert "clearChatButton" in template
+    assert "clearChatButton" not in template
     assert "chatStatus" not in template
     assert "demo-readiness" not in template
     assert "data-prompt" in template
@@ -62,7 +62,7 @@ def test_multi_kb_chat_fails_closed_and_waits_for_recovery():
         "state.recoveryPromise = handleUnavailableKnowledgeBase("
     ) == 2
     assert script.count("await waitForKnowledgeBaseRecovery(state)") >= 4
-    assert "clearChatButton.disabled = isBusy" in script
+    assert "clearChatButton" not in script
     assert "function clearChat(targetKnowledgeBaseIds = knowledgeBaseIds)" in script
     assert "if (busy) return;" in script
     assert "function normalizeKnowledgeBaseIds(values)" in script
@@ -91,7 +91,7 @@ def test_templates_include_browser_icons():
 def test_chat_toolbar_includes_agent_selector():
     template = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
     assert 'id="agentSelect"' in template
-    assert "Custom chat" in template
+    assert '<option value="">None</option>' in template
 
 
 def test_script_applies_agent_config_and_supports_override():
@@ -104,7 +104,7 @@ def test_script_applies_agent_config_and_supports_override():
     assert "async function newChat()" in script
     assert "async function revalidateActiveAgent()" in script
     assert "agentsCatalog = data.agents || []" in script
-    assert 'agentSelect.innerHTML = \'<option value="">Custom chat</option>\'' in script
+    assert 'agentSelect.innerHTML = \'<option value="">None</option>\'' in script
     assert "persistSelectedAgent" in script
     assert "readPendingAgent" in script
     assert "body.system_prompt_scope = systemPromptScope || undefined" in script
@@ -115,10 +115,12 @@ def test_script_applies_agent_config_and_supports_override():
 
 def test_script_overrides_switch_to_custom_chat_and_revalidates_on_new_chat():
     script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
-    # Override on model/prompt/KB switches silently to "Custom chat".
+    # Override on model/prompt/KB switches silently to no selected Agent ("None").
     assert script.count("if (agentActive) switchToCustomChat()") == 3
     # "New chat" revalidates and reapplies the active agent instead of just clearing.
-    assert 'clearChatButton.addEventListener("click", newChat)' in script
+    assert 'const newChatLink = document.getElementById("newChatLink")' in script
+    assert 'newChatLink.addEventListener("click", (event)' in script
+    assert "requestConversationReset(newChat, newChatLink)" in script
     assert "async function newChat()" in script
     assert "await revalidateActiveAgent()" in script
     assert "function handleAgentUnavailable(agentId, agent)" in script
@@ -129,8 +131,44 @@ def test_script_overrides_switch_to_custom_chat_and_revalidates_on_new_chat():
     assert "if (agent && agent.available)" in script
     assert "handleAgentUnavailable(pending, agent)" in script
     assert "let agentSelectionBlocked = false" in script
-    assert "Seleziona esplicitamente un altro Agent o Custom chat" in script
+    assert "Seleziona esplicitamente un altro Agent o None" in script
     assert "Sei passato alla chat personalizzata" not in script
+
+
+def test_new_chat_confirmation_modal_guards_started_conversations():
+    template = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert 'id="newChatModal"' in template
+    assert 'role="dialog"' in template
+    assert 'aria-modal="true"' in template
+    assert 'aria-labelledby="newChatModalTitle"' in template
+    assert 'aria-describedby="newChatModalDescription"' in template
+    assert "This conversation is not saved" in template
+    assert 'id="keepConversationButton"' in template
+    assert 'id="confirmNewChatButton"' in template
+    assert 'chatbox.querySelector(".user-message")' in script
+    assert "function requestConversationReset(action, trigger, options = {})" in script
+    assert "function closeConversationResetModal()" in script
+    assert "function confirmConversationReset()" in script
+    assert "function handleConversationResetModalKeydown(event)" in script
+    assert 'event.key === "Escape"' in script
+    assert 'newChatLink.setAttribute("aria-disabled", String(isBusy))' in script
+    assert "requestConversationReset(" in script
+    assert "applyAgentSelection" in script
+
+
+def test_configuration_link_warns_before_leaving_a_started_conversation():
+    navigation = (ROOT / "app/templates/_top_nav.html").read_text(encoding="utf-8")
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert 'id="configurationLink"' in navigation
+    assert 'const configurationLink = document.getElementById("configurationLink")' in script
+    assert 'configurationLink.addEventListener("click", (event)' in script
+    assert 'title: "Open configuration?"' in script
+    assert 'confirmLabel: "Open configuration"' in script
+    assert "window.location.assign(configurationLink.href)" in script
+    assert 'configurationLink.setAttribute("aria-disabled", String(isBusy))' in script
 
 
 def test_agents_page_has_start_chat_navigation():
@@ -140,7 +178,33 @@ def test_agents_page_has_start_chat_navigation():
     assert 'startButton.disabled = true' in agents_js
     assert "renderCard(item, items.length)" in agents_js
     assert "items.length || 0" not in agents_js
-    assert 'name="prompt_ref" data-prompt-select required' in agents_js
+    assert 'name="prompt_ref" data-prompt-select' in agents_js
+    assert 'name="prompt_ref" data-prompt-select required' not in agents_js
+
+
+def test_agent_and_knowledge_base_cancel_restore_original_values():
+    agents_js = (ROOT / "app/static/agents.js").read_text(encoding="utf-8")
+    knowledge_bases_js = (
+        ROOT / "app/static/knowledge_bases.js"
+    ).read_text(encoding="utf-8")
+    stylesheet = (ROOT / "app/static/style.css").read_text(encoding="utf-8")
+
+    assert "function resetCreateForm()" in agents_js
+    assert "function resetEditor()" in agents_js
+    assert "resetEditor();\n            editor.hidden = true;" in agents_js
+    assert "editor.reset();\n            editor.hidden = true;" in knowledge_bases_js
+    assert ".form-grid[hidden]" in stylesheet
+
+
+def test_default_knowledge_base_uses_a_dedicated_tag_style():
+    knowledge_bases_js = (
+        ROOT / "app/static/knowledge_bases.js"
+    ).read_text(encoding="utf-8")
+    stylesheet = (ROOT / "app/static/style.css").read_text(encoding="utf-8")
+
+    assert 'class="default-kb-tag"' in knowledge_bases_js
+    assert ".default-kb-tag {" in stylesheet
+    assert ".default-kb-tag::before" in stylesheet
 
 
 def test_agents_description_maxlength_matches_limit():

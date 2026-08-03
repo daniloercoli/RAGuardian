@@ -140,7 +140,7 @@ body {
 .nav-track {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 6px;
     max-width: 100%;
     padding: 2px;
@@ -186,6 +186,16 @@ body {
     background: var(--primary-soft);
     border-color: #b9c8ff;
     cursor: default;
+}
+
+#newChatLink {
+    cursor: pointer;
+}
+
+#newChatLink[aria-disabled="true"],
+#configurationLink[aria-disabled="true"] {
+    cursor: not-allowed;
+    opacity: 0.55;
 }
 
 .top-nav .nav-close {
@@ -267,6 +277,10 @@ textarea:focus-visible {
     margin-top: 18px;
 }
 
+.list-spacing {
+    margin-top: 18px;
+}
+
 .knowledge-base-card {
     margin: 0;
 }
@@ -277,6 +291,33 @@ textarea:focus-visible {
     flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 5px;
+}
+
+.default-kb-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid #c6d3ff;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #f4f7ff, #e6edff);
+    box-shadow: 0 1px 2px rgba(49, 89, 232, 0.1);
+    color: var(--primary-dark);
+    font-size: 10px;
+    font-weight: 850;
+    letter-spacing: 0.06em;
+    line-height: 1.4;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.default-kb-tag::before {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--primary);
+    box-shadow: 0 0 0 3px rgba(49, 89, 232, 0.12);
+    content: "";
 }
 
 .kb-stats {
@@ -1214,9 +1255,16 @@ button:disabled {
     margin: 0;
 }
 
+.new-chat-modal-panel {
+    width: min(460px, 100%);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+}
+
 .modal-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 10px;
 }
 
 .error-detail-text {
@@ -1513,12 +1561,6 @@ button.secondary:hover:not(:disabled) {
     color: #64748b;
     font-size: 11px;
     text-align: center;
-}
-
-#clearChatButton {
-    min-height: 60px;
-    padding-inline: 18px;
-    white-space: nowrap;
 }
 
 .chat-control:focus-within {
@@ -2003,6 +2045,10 @@ button.secondary:hover:not(:disabled) {
     align-items: end;
 }
 
+.form-grid[hidden] {
+    display: none;
+}
+
 .container.narrow .form-grid {
     grid-template-columns: 1fr;
 }
@@ -2113,6 +2159,10 @@ button.secondary:hover:not(:disabled) {
 
 .form-grid .span-2 {
     grid-column: span 2;
+}
+
+.form-grid .span-full {
+    grid-column: 1 / -1;
 }
 
 .checkbox-label {
@@ -2765,7 +2815,7 @@ tbody tr:hover td {
     }
 
     .chat-toolbar {
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 7px;
     }
 
@@ -2779,12 +2829,6 @@ tbody tr:hover td {
     }
 
     .chat-control select {
-        font-size: 12px;
-    }
-
-    #clearChatButton {
-        min-height: 56px;
-        padding-inline: 11px;
         font-size: 12px;
     }
 

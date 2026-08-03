@@ -16,13 +16,46 @@ final class EC_Rag_Agents_Tests extends TestCase {
         $GLOBALS['ec_rag_test_options'] = [];
     }
 
-    public function test_admin_payload_requires_exactly_one_prompt_reference(): void {
+    public function test_admin_payload_allows_missing_prompt_reference(): void {
         $payload = \EC_Rag_Ajax_Agents::sanitize_payload([
             'name' => 'Support',
             'provider_id' => 'openai',
             'model_id' => 'gpt-4o',
             'knowledge_base_ids' => ['default'],
-            'prompt_ref' => [],
+        ], true);
+
+        self::assertIsArray($payload);
+        self::assertArrayNotHasKey('prompt_ref', $payload);
+    }
+
+    public function test_admin_payload_normalizes_empty_prompt_reference(): void {
+        foreach ([null, []] as $prompt_ref) {
+            $payload = \EC_Rag_Ajax_Agents::sanitize_payload([
+                'name' => 'Support',
+                'provider_id' => 'openai',
+                'model_id' => 'gpt-4o',
+                'knowledge_base_ids' => ['default'],
+                'prompt_ref' => $prompt_ref,
+            ], true);
+
+            self::assertIsArray($payload);
+            self::assertNull($payload['prompt_ref']);
+        }
+
+        $update = \EC_Rag_Ajax_Agents::sanitize_payload([
+            'prompt_ref' => null,
+        ], false);
+        self::assertIsArray($update);
+        self::assertNull($update['prompt_ref']);
+    }
+
+    public function test_admin_payload_rejects_partial_prompt_reference(): void {
+        $payload = \EC_Rag_Ajax_Agents::sanitize_payload([
+            'name' => 'Support',
+            'provider_id' => 'openai',
+            'model_id' => 'gpt-4o',
+            'knowledge_base_ids' => ['default'],
+            'prompt_ref' => ['id' => 'prompt-1'],
         ], true);
 
         self::assertInstanceOf(\WP_Error::class, $payload);

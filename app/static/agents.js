@@ -12,12 +12,35 @@ document.addEventListener("DOMContentLoaded", () => {
     let sharedPrompts = [];
     let agentsData = [];
 
+    function resetCreateForm() {
+        createForm.elements.name.value = "";
+        createForm.elements.description.value = "";
+        const providerSelect = createForm.elements.provider_id;
+        const modelSelect = createForm.elements.model_id;
+        const kbList = document.getElementById("createAgentKnowledgeBases");
+        const promptSelect = createForm.elements.prompt_ref;
+        populateProviderSelect(
+            providerSelect,
+            createForm.dataset.initialProviderId || null
+        );
+        populateModelSelect(
+            modelSelect,
+            providerSelect.value,
+            createForm.dataset.initialModelId || null
+        );
+        populateKbCheckboxes(kbList, []);
+        populatePromptSelect(promptSelect, null);
+    }
+
     showCreate.addEventListener("click", () => {
         createForm.hidden = false;
         createForm.elements.name.focus();
     });
     cancelCreate.addEventListener("click", () => {
-        createForm.reset();
+        if (hasUnsavedChanges(createForm)) {
+            if (!window.confirm("Annullare la creazione? Le modifiche andranno perse.")) return;
+        }
+        resetCreateForm();
         createForm.hidden = true;
     });
     createForm.addEventListener("submit", async (event) => {
@@ -28,7 +51,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 method: "POST",
                 body: JSON.stringify(payload)
             });
-            createForm.reset();
+            resetCreateForm();
             createForm.hidden = true;
             showNotice("Agent created.", "success");
             await loadAgents();
@@ -54,7 +77,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (items.length === 0) {
             const empty = document.createElement("p");
             empty.className = "muted";
-            empty.textContent = "No chat agents yet. Create one to pre-configure a provider, model, knowledge bases, and system prompt.";
+            empty.textContent = "No chat agents yet. Create one to pre-configure a provider, model, knowledge bases, and an optional system prompt.";
             list.appendChild(empty);
             return;
         }
@@ -98,17 +121,17 @@ document.addEventListener("DOMContentLoaded", () => {
             </div>
             <form class="form-grid compact" data-editor hidden>
                 <label>Name<input name="name" value="${escapeAttribute(item.name)}" maxlength="120" required></label>
-                <label>Description<textarea name="description" maxlength="500" rows="3">${escapeHtml(item.description || "")}</textarea></label>
                 <label>Provider<select name="provider_id" data-provider-select required></select></label>
                 <label>Model<select name="model_id" data-model-select required></select></label>
-                <fieldset class="scope-field">
+                <label class="span-full">Description<textarea name="description" maxlength="500" rows="3">${escapeHtml(item.description || "")}</textarea></label>
+                <fieldset class="scope-field span-full">
                     <legend>Knowledge bases</legend>
                     <div class="scope-options" data-kb-list></div>
                 </fieldset>
-                <label>System prompt<select name="prompt_ref" data-prompt-select required></select></label>
-                <div class="modal-actions">
-                    <button type="submit">Save</button>
+                <label class="span-full">System prompt<select name="prompt_ref" data-prompt-select></select></label>
+                <div class="modal-actions span-full">
                     <button type="button" class="secondary" data-action="cancel-edit">Cancel</button>
+                    <button type="submit">Save</button>
                 </div>
             </form>
         `;
@@ -117,13 +140,19 @@ document.addEventListener("DOMContentLoaded", () => {
         const modelSelect = editor.querySelector("[data-model-select]");
         const kbList = editor.querySelector("[data-kb-list]");
         const promptSelect = editor.querySelector("[data-prompt-select]");
-        populateProviderSelect(providerSelect, item.provider_id);
-        populateModelSelect(modelSelect, providerSelect.value, item.model_id);
+        function resetEditor() {
+            editor.elements.name.value = item.name || "";
+            editor.elements.description.value = item.description || "";
+            populateProviderSelect(providerSelect, item.provider_id);
+            populateModelSelect(modelSelect, providerSelect.value, item.model_id);
+            populateKbCheckboxes(kbList, item.knowledge_base_ids || []);
+            populatePromptSelect(promptSelect, item.prompt_ref);
+        }
+
         providerSelect.addEventListener("change", () => {
             populateModelSelect(modelSelect, providerSelect.value, null);
         });
-        populateKbCheckboxes(kbList, item.knowledge_base_ids || []);
-        populatePromptSelect(promptSelect, item.prompt_ref);
+        resetEditor();
         card.querySelector('[data-action="edit"]').addEventListener("click", () => {
             editor.hidden = false;
             editor.elements.name.focus();
@@ -136,6 +165,10 @@ document.addEventListener("DOMContentLoaded", () => {
             window.location.href = `/?agent=${encodeURIComponent(item.id)}`;
         });
         card.querySelector('[data-action="cancel-edit"]').addEventListener("click", () => {
+            if (hasUnsavedChanges(editor, item)) {
+                if (!window.confirm("Annullare le modifiche? Le modifiche andranno perse.")) return;
+            }
+            resetEditor();
             editor.hidden = true;
         });
         editor.addEventListener("submit", async (event) => {
@@ -174,11 +207,11 @@ document.addEventListener("DOMContentLoaded", () => {
             form.querySelectorAll("[data-kb-list] input:checked, #createAgentKnowledgeBases input:checked")
         ).map(cb => cb.value);
         const promptValue = form.elements.prompt_ref.value;
-        if (!promptValue) {
-            throw new Error("Select one system prompt.");
+        let promptRef = null;
+        if (promptValue) {
+            const [scope, id] = promptValue.split("::", 2);
+            promptRef = {id, scope};
         }
-        const [scope, id] = promptValue.split("::", 2);
-        const promptRef = {id, scope};
         if (knowledgeBaseIds.length === 0) {
             throw new Error("Select at least one knowledge base.");
         }
@@ -193,6 +226,36 @@ document.addEventListener("DOMContentLoaded", () => {
             knowledge_base_ids: knowledgeBaseIds,
             prompt_ref: promptRef
         };
+    }
+
+    function hasUnsavedChanges(form, original) {
+        const name = form.elements.name.value.trim();
+        const description = form.elements.description.value.trim();
+        const promptValue = form.elements.prompt_ref.value;
+        const checkedKbs = Array.from(
+            form.querySelectorAll("[data-kb-list] input:checked, #createAgentKnowledgeBases input:checked")
+        ).map(cb => cb.value).slice().sort();
+        if (original) {
+            if (name !== (original.name || "").trim()) return true;
+            if (description !== (original.description || "").trim()) return true;
+            if (form.elements.provider_id.value !== (original.provider_id || "")) return true;
+            if (form.elements.model_id.value !== (original.model_id || "")) return true;
+            const origKbs = (original.knowledge_base_ids || []).slice().sort();
+            if (JSON.stringify(origKbs) !== JSON.stringify(checkedKbs)) return true;
+            const origPrompt = original.prompt_ref && original.prompt_ref.id
+                ? `${original.prompt_ref.scope}::${original.prompt_ref.id}`
+                : "";
+            if (promptValue !== origPrompt) return true;
+            return false;
+        }
+        const initialProviderId = form.dataset.initialProviderId || "";
+        const initialModelId = form.dataset.initialModelId || "";
+        return name !== ""
+            || description !== ""
+            || checkedKbs.length > 0
+            || promptValue !== ""
+            || form.elements.provider_id.value !== initialProviderId
+            || form.elements.model_id.value !== initialModelId;
     }
 
     function populateProviderSelect(select, selectedValue) {
@@ -272,7 +335,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function populatePromptSelect(select, promptRef) {
-        select.innerHTML = '<option value="" disabled>Select a system prompt</option>';
+        select.innerHTML = '<option value="">None</option>';
         if (personalPrompts.length > 0) {
             const group = document.createElement("optgroup");
             group.label = "My Prompts";
@@ -292,11 +355,6 @@ document.addEventListener("DOMContentLoaded", () => {
                 group.appendChild(opt);
             });
             select.appendChild(group);
-        }
-        if (personalPrompts.length === 0 && sharedPrompts.length === 0) {
-            const opt = new Option("No prompts available", "");
-            opt.disabled = true;
-            select.appendChild(opt);
         }
         const target = promptRef && promptRef.id && promptRef.scope
             ? `${promptRef.scope}::${promptRef.id}`
@@ -334,6 +392,8 @@ document.addEventListener("DOMContentLoaded", () => {
             }
             populateProviderSelect(createProvider, null);
             populateModelSelect(createModel, createProvider.value, null);
+            createForm.dataset.initialProviderId = createProvider.value;
+            createForm.dataset.initialModelId = createModel.value;
             createProvider.addEventListener("change", () => {
                 populateModelSelect(createModel, createProvider.value, null);
             });
@@ -343,11 +403,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 createProvider.value
                 && createModel.value
                 && knowledgeBases.length
-                && (personalPrompts.length || sharedPrompts.length)
             );
             showCreate.disabled = !hasCreationOptions;
             if (!hasCreationOptions) {
-                showCreate.title = "Configure at least one model, knowledge base, and system prompt first.";
+                showCreate.title = "Configure at least one model and knowledge base first.";
             }
         } catch (error) {
             showNotice("Failed to load form data: " + error.message, "error");

@@ -48,7 +48,7 @@ are created, so later settings changes cannot redirect in-progress work.
 
 Agent mode lets visitors choose from an administrator-maintained allowlist of
 RAGuardian Agents. An Agent bundles one provider/model, one or more knowledge
-bases, and exactly one personal or shared system prompt. The browser receives
+bases, and an optional personal or shared system prompt. The browser receives
 only each public Agent's ID, name, and description; the API key and Agent
 configuration remain server-side.
 

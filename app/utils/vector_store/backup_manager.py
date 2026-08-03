@@ -1352,7 +1352,10 @@ def _knowledge_base_manifest_summary(
     workspace_data_root: Path | None = None,
     workspace_uploads_root: Path | None = None,
 ) -> dict:
-    from utils.knowledge_base_store import KnowledgeBaseStore
+    from utils.knowledge_base_store import (
+        DEFAULT_KNOWLEDGE_BASE_NAME,
+        KnowledgeBaseStore,
+    )
     from utils.workspace import collection_for_knowledge_base
 
     workspaces_root = workspace_data_root or data_root / "workspaces"
@@ -1379,7 +1382,13 @@ def _knowledge_base_manifest_summary(
         if catalog_path.exists():
             records = KnowledgeBaseStore(catalog_path).list()
         else:
-            records = [{"id": "default", "name": "Default", "status": "active"}]
+            records = [
+                {
+                    "id": "default",
+                    "name": DEFAULT_KNOWLEDGE_BASE_NAME,
+                    "status": "active",
+                }
+            ]
         for record in records:
             knowledge_base_id = record["id"]
             if knowledge_base_id == "default":

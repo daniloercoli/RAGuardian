@@ -25,7 +25,13 @@ document.addEventListener("DOMContentLoaded", () => {
     const kbChips = document.getElementById("kbChips");
     const promptSelect = document.getElementById("promptSelect");
     const agentSelect = document.getElementById("agentSelect");
-    const clearChatButton = document.getElementById("clearChatButton");
+    const newChatLink = document.getElementById("newChatLink");
+    const configurationLink = document.getElementById("configurationLink");
+    const newChatModal = document.getElementById("newChatModal");
+    const newChatModalTitle = document.getElementById("newChatModalTitle");
+    const newChatModalDescription = document.getElementById("newChatModalDescription");
+    const keepConversationButton = document.getElementById("keepConversationButton");
+    const confirmNewChatButton = document.getElementById("confirmNewChatButton");
     const streamStatus = document.getElementById("streamStatus");
     const emptyState = document.getElementById("emptyState");
     const promptButtons = document.querySelectorAll("[data-prompt]");
@@ -61,6 +67,8 @@ document.addEventListener("DOMContentLoaded", () => {
     let agentSelectionBlocked = false;
     let agentsCatalog = [];
     let selectedAgentId = "";
+    let pendingConversationReset = null;
+    let conversationResetTrigger = null;
     const conversationStorageKey = "ragConversationId";
     let conversationId = loadOrCreateConversationId();
 
@@ -115,27 +123,50 @@ document.addEventListener("DOMContentLoaded", () => {
         agentSelect.addEventListener("change", () => {
             const id = agentSelect.value;
             const previousKnowledgeBaseIds = [...knowledgeBaseIds];
-            selectedAgentId = id;
-            persistSelectedAgent(id);
-            if (id) {
-                const agent = agentsCatalog.find(a => a.id === id);
-                if (agent && agent.available) {
-                    agentSelectionBlocked = false;
-                    applyAgentConfig(agent);
-                    setAgentActive(true);
-                    startAgentConversation(previousKnowledgeBaseIds);
-                } else {
-                    handleAgentUnavailable(id, agent);
-                }
-            } else {
-                agentSelectionBlocked = false;
-                setAgentActive(false);
-                updateChatStatus();
+            const agent = id ? agentsCatalog.find(item => item.id === id) : null;
+            if (id && agent && agent.available) {
+                const previousAgentId = selectedAgentId;
+                agentSelect.value = previousAgentId;
+                requestConversationReset(
+                    () => applyAgentSelection(id, agent, previousKnowledgeBaseIds),
+                    agentSelect
+                );
+                return;
             }
+            applyAgentSelection(id, agent, previousKnowledgeBaseIds);
         });
     }
-    if (clearChatButton) {
-        clearChatButton.addEventListener("click", newChat);
+    if (newChatLink) {
+        newChatLink.addEventListener("click", (event) => {
+            event.preventDefault();
+            requestConversationReset(newChat, newChatLink);
+        });
+    }
+    if (configurationLink) {
+        configurationLink.addEventListener("click", (event) => {
+            event.preventDefault();
+            requestConversationReset(
+                () => window.location.assign(configurationLink.href),
+                configurationLink,
+                {
+                    title: "Open configuration?",
+                    description: "This conversation is not saved. If you open Configuration, you won’t be able to return to it.",
+                    confirmLabel: "Open configuration"
+                }
+            );
+        });
+    }
+    if (keepConversationButton) {
+        keepConversationButton.addEventListener("click", closeConversationResetModal);
+    }
+    if (confirmNewChatButton) {
+        confirmNewChatButton.addEventListener("click", confirmConversationReset);
+    }
+    if (newChatModal) {
+        newChatModal.addEventListener("click", (event) => {
+            if (event.target === newChatModal) closeConversationResetModal();
+        });
+        newChatModal.addEventListener("keydown", handleConversationResetModalKeydown);
     }
     promptButtons.forEach((button) => {
         button.addEventListener("click", () => {
@@ -327,6 +358,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 option.dataset.model = model.id;
                 if (model.is_default || option.value === data.default_value) {
                     option.selected = true;
+                    option.dataset.default = "true";
                 }
                 modelSelect.appendChild(option);
             }
@@ -345,7 +377,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!query) return;
         if (agentSelectionBlocked) {
             appendMessage(
-                "**Select an available Agent or Custom chat before sending.**",
+                "**Select an available Agent or None before sending.**",
                 "bot-message"
             );
             return;
@@ -572,7 +604,12 @@ document.addEventListener("DOMContentLoaded", () => {
         busy = isBusy;
         sendButton.disabled = isBusy || agentSelectionBlocked || !modelSelect.value;
         userInput.disabled = isBusy;
-        if (clearChatButton) clearChatButton.disabled = isBusy;
+        if (newChatLink) {
+            newChatLink.setAttribute("aria-disabled", String(isBusy));
+        }
+        if (configurationLink) {
+            configurationLink.setAttribute("aria-disabled", String(isBusy));
+        }
         if (kbPickerButton) kbPickerButton.disabled = isBusy || knowledgeBaseCatalog.length === 0;
         if (kbPickerApply) kbPickerApply.disabled = isBusy;
         if (isBusy) closeKnowledgeBasePicker();
@@ -921,6 +958,73 @@ document.addEventListener("DOMContentLoaded", () => {
             chatbox.appendChild(emptyState);
         }
         userInput.focus();
+    }
+
+    function hasStartedConversation() {
+        return Boolean(chatbox.querySelector(".user-message"));
+    }
+
+    function requestConversationReset(action, trigger, options = {}) {
+        if (busy || typeof action !== "function") return;
+        if (!hasStartedConversation() || !newChatModal) {
+            action();
+            return;
+        }
+        if (newChatModalTitle) {
+            newChatModalTitle.textContent = options.title || "Start a new chat?";
+        }
+        if (newChatModalDescription) {
+            newChatModalDescription.textContent = options.description
+                || "This conversation is not saved. If you start a new chat, you won’t be able to return to it.";
+        }
+        if (confirmNewChatButton) {
+            confirmNewChatButton.textContent = options.confirmLabel || "Start new chat";
+        }
+        pendingConversationReset = action;
+        conversationResetTrigger = trigger || document.activeElement;
+        newChatModal.hidden = false;
+        if (keepConversationButton) keepConversationButton.focus();
+    }
+
+    function closeConversationResetModal() {
+        if (!newChatModal || newChatModal.hidden) return;
+        newChatModal.hidden = true;
+        pendingConversationReset = null;
+        const trigger = conversationResetTrigger;
+        conversationResetTrigger = null;
+        if (trigger && typeof trigger.focus === "function") trigger.focus();
+    }
+
+    function confirmConversationReset() {
+        if (!pendingConversationReset || !newChatModal || newChatModal.hidden) return;
+        const action = pendingConversationReset;
+        pendingConversationReset = null;
+        conversationResetTrigger = null;
+        newChatModal.hidden = true;
+        action();
+    }
+
+    function handleConversationResetModalKeydown(event) {
+        if (!newChatModal || newChatModal.hidden) return;
+        if (event.key === "Escape") {
+            event.preventDefault();
+            closeConversationResetModal();
+            return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = [keepConversationButton, confirmNewChatButton].filter(
+            element => element && !element.disabled
+        );
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
     }
 
     function loadOrCreateConversationId() {
@@ -1498,7 +1602,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!response.ok) throw new Error("Agent catalog unavailable");
             const data = await response.json();
             agentsCatalog = data.agents || [];
-            agentSelect.innerHTML = '<option value="">Custom chat</option>';
+            agentSelect.innerHTML = '<option value="">None</option>';
             agentsCatalog.forEach(agent => {
                 const opt = new Option(agent.name, agent.id);
                 if (!agent.available) {
@@ -1581,6 +1685,25 @@ document.addEventListener("DOMContentLoaded", () => {
         updateChatStatus();
     }
 
+    function applyAgentSelection(id, agent, previousKnowledgeBaseIds) {
+        selectedAgentId = id;
+        persistSelectedAgent(id);
+        if (agentSelect) agentSelect.value = id;
+        if (id) {
+            if (agent && agent.available) {
+                agentSelectionBlocked = false;
+                applyAgentConfig(agent);
+                setAgentActive(true);
+                startAgentConversation(previousKnowledgeBaseIds);
+            } else {
+                handleAgentUnavailable(id, agent);
+            }
+            return;
+        }
+        switchToCustomChat();
+        resetConfigToDefaults();
+    }
+
     function switchToCustomChat() {
         agentActive = false;
         agentSelectionBlocked = false;
@@ -1588,6 +1711,34 @@ document.addEventListener("DOMContentLoaded", () => {
         persistSelectedAgent("");
         if (agentSelect) agentSelect.value = "";
         renderKnowledgeBaseSelection();
+    }
+
+    function resetConfigToDefaults() {
+        if (modelSelect && modelSelect.options.length > 0) {
+            const defaultOpt = Array.from(modelSelect.options).find(
+                opt => opt.dataset.default === "true"
+            );
+            if (defaultOpt) {
+                defaultOpt.selected = true;
+            } else {
+                modelSelect.options[0].selected = true;
+            }
+        }
+        const availableIds = knowledgeBaseCatalog.map(item => item.id);
+        const defaultKbId = availableIds.includes("default")
+            ? "default"
+            : (availableIds[0] || "default");
+        knowledgeBaseIds = [defaultKbId];
+        draftKnowledgeBaseIds = [...knowledgeBaseIds];
+        persistKnowledgeBaseIds(knowledgeBaseIds);
+        if (promptSelect) {
+            promptSelect.value = "";
+            systemPromptId = "";
+            systemPromptScope = "";
+            persistPromptRef("", "");
+        }
+        renderKnowledgeBaseSelection();
+        updateChatStatus();
     }
 
     function startAgentConversation(previousKnowledgeBaseIds = knowledgeBaseIds) {
@@ -1653,7 +1804,7 @@ document.addEventListener("DOMContentLoaded", () => {
             : "non più disponibile";
         appendBotMessage(
             `**Agent non più disponibile.**\n\nL'agent selezionato non è più disponibile (${detail}). ` +
-            "Seleziona esplicitamente un altro Agent o Custom chat per continuare."
+            "Seleziona esplicitamente un altro Agent o None per continuare."
         );
     }
 

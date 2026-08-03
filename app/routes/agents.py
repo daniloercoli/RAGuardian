@@ -11,7 +11,6 @@ from utils.chat_agent_store import (
     validate_knowledge_base_ids,
     validate_model_id,
     validate_prompt_ref,
-    validate_prompt_ref_required,
     validate_provider_id,
 )
 from utils.index_lock import lifecycle_read_lock
@@ -144,11 +143,6 @@ def _create_response(app, *, public: bool = False):
             "prompt_ref",
         },
     )
-    if not data.get("prompt_ref"):
-        raise ChatAgentValidationError(
-            "prompt_ref è obbligatorio",
-            code="invalid_prompt_ref",
-        )
     validate_chat_agent_name(data.get("name"))
     validate_chat_agent_description(data.get("description", ""))
     validate_provider_id(data.get("provider_id"))
@@ -157,7 +151,7 @@ def _create_response(app, *, public: bool = False):
         data.get("knowledge_base_ids"),
         limit=int(app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5)),
     )
-    validate_prompt_ref_required(data.get("prompt_ref"))
+    validate_prompt_ref(data.get("prompt_ref"))
     if public:
         _ensure_api_key_allowed_kb_ids(data.get("knowledge_base_ids") or [])
     with lifecycle_read_lock():
@@ -213,11 +207,6 @@ def _update_response(app, agent_id: str, *, public: bool = False):
             limit=int(app.config.get("MAX_QUERY_KNOWLEDGE_BASES", 5)),
         )
     if "prompt_ref" in data:
-        if not data.get("prompt_ref"):
-            raise ChatAgentValidationError(
-                "prompt_ref è obbligatorio",
-                code="invalid_prompt_ref",
-            )
         validate_prompt_ref(data["prompt_ref"])
     agent_id = validate_chat_agent_id(agent_id)
     with lifecycle_read_lock():
@@ -245,25 +234,19 @@ def _update_response(app, agent_id: str, *, public: bool = False):
                 virtual_agent.get("knowledge_base_ids") or []
             )
         _reject_availability_issues(virtual_agent, inputs)
-        agent = store.update(
-            agent_id,
-            name=data.get("name") if "name" in data else None,
-            description=(
-                data.get("description") if "description" in data else None
-            ),
-            provider_id=(
-                data.get("provider_id") if "provider_id" in data else None
-            ),
-            model_id=data.get("model_id") if "model_id" in data else None,
-            knowledge_base_ids=(
-                data.get("knowledge_base_ids")
-                if "knowledge_base_ids" in data
-                else None
-            ),
-            prompt_ref=(
-                data.get("prompt_ref") if "prompt_ref" in data else None
-            ),
-        )
+        updates = {
+            field: data[field]
+            for field in (
+                "name",
+                "description",
+                "provider_id",
+                "model_id",
+                "knowledge_base_ids",
+                "prompt_ref",
+            )
+            if field in data
+        }
+        agent = store.update(agent_id, **updates)
         return jsonify(with_availability(agent, **inputs))
 
 

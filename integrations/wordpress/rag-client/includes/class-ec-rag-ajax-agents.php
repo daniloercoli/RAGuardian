@@ -45,7 +45,7 @@ class EC_Rag_Ajax_Agents {
             $payload['provider_id'],
             $payload['model_id'],
             $payload['knowledge_base_ids'],
-            $payload['prompt_ref']
+            $payload['prompt_ref'] ?? null
         ));
     }
 
@@ -94,7 +94,7 @@ class EC_Rag_Ajax_Agents {
             }
         }
         if ($require_all) {
-            foreach (['name', 'provider_id', 'model_id', 'knowledge_base_ids', 'prompt_ref'] as $field) {
+            foreach (['name', 'provider_id', 'model_id', 'knowledge_base_ids'] as $field) {
                 if (!array_key_exists($field, $payload)) {
                     return new WP_Error('ec_rag_invalid_agent_payload', __('Missing Agent fields', 'ec-rag'));
                 }
@@ -137,13 +137,19 @@ class EC_Rag_Ajax_Agents {
             $payload['knowledge_base_ids'] = $ids;
         }
         if (array_key_exists('prompt_ref', $payload)) {
-            $prompt_ref = is_array($payload['prompt_ref']) ? $payload['prompt_ref'] : [];
-            $prompt_id = sanitize_text_field((string) ($prompt_ref['id'] ?? ''));
-            $scope = sanitize_key($prompt_ref['scope'] ?? '');
-            if ($prompt_id === '' || !in_array($scope, ['personal', 'shared'], true)) {
-                return new WP_Error('ec_rag_invalid_agent_payload', __('Select a system prompt', 'ec-rag'));
+            if ($payload['prompt_ref'] === null || $payload['prompt_ref'] === []) {
+                $payload['prompt_ref'] = null;
+            } elseif (!is_array($payload['prompt_ref'])) {
+                return new WP_Error('ec_rag_invalid_agent_payload', __('Invalid system prompt', 'ec-rag'));
+            } else {
+                $prompt_ref = $payload['prompt_ref'];
+                $prompt_id = sanitize_text_field((string) ($prompt_ref['id'] ?? ''));
+                $scope = sanitize_key($prompt_ref['scope'] ?? '');
+                if ($prompt_id === '' || !in_array($scope, ['personal', 'shared'], true)) {
+                    return new WP_Error('ec_rag_invalid_agent_payload', __('Invalid system prompt', 'ec-rag'));
+                }
+                $payload['prompt_ref'] = ['id' => $prompt_id, 'scope' => $scope];
             }
-            $payload['prompt_ref'] = ['id' => $prompt_id, 'scope' => $scope];
         }
         if (!array_key_exists('description', $payload) && $require_all) {
             $payload['description'] = '';

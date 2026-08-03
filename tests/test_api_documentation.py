@@ -85,6 +85,15 @@ def test_openapi_multi_kb_contract_is_valid_yaml_and_tracks_runtime_limit():
     assert plural_parameter["style"] == "form"
     assert plural_parameter["explode"] is True
 
+    kb_list_schema = document["paths"]["/api/v1/knowledge-bases"]["get"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+    kb_limits = kb_list_schema["properties"]["limits"]
+    assert "max_knowledge_bases" in kb_limits["required"]
+    assert "including the default" in kb_limits["properties"][
+        "max_knowledge_bases"
+    ]["description"]
+
 
 def test_public_api_documentation_lists_chat_agent_endpoints():
     api_doc = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
@@ -133,15 +142,40 @@ def test_openapi_chat_agent_contract_is_valid():
         "provider_id",
         "model_id",
         "knowledge_base_ids",
-        "prompt_ref",
     ]
+    assert "prompt_ref" in create_schema["properties"]
     assert create_schema["properties"]["description"]["maxLength"] == 500
     update_schema = document["components"]["schemas"]["ChatAgentUpdateInput"]
     assert update_schema["minProperties"] == 1
     assert update_schema["properties"]["description"]["maxLength"] == 500
 
+    prompt_ref_schema = document["components"]["schemas"]["ChatAgentPromptRef"]
+    assert {"maxProperties": 0} in prompt_ref_schema["oneOf"]
+    assert {"required": ["id", "scope"]} in prompt_ref_schema["oneOf"]
+    prompt_ref_input = document["components"]["schemas"][
+        "ChatAgentPromptRefInput"
+    ]
+    assert {"type": "null"} in prompt_ref_input["oneOf"]
+    assert create_schema["properties"]["prompt_ref"]["$ref"] == (
+        "#/components/schemas/ChatAgentPromptRefInput"
+    )
+    assert update_schema["properties"]["prompt_ref"]["$ref"] == (
+        "#/components/schemas/ChatAgentPromptRefInput"
+    )
+
+    jsonschema = pytest.importorskip("jsonschema")
+    prompt_validator = jsonschema.Draft202012Validator(prompt_ref_schema)
+    prompt_validator.validate({})
+    prompt_validator.validate({"id": "prompt-1", "scope": "shared"})
+    with pytest.raises(jsonschema.ValidationError):
+        prompt_validator.validate({"id": "prompt-1"})
+    input_validator = jsonschema.Draft202012Validator(
+        {"oneOf": [prompt_ref_schema, {"type": "null"}]}
+    )
+    input_validator.validate(None)
+
     agent_schema = document["components"]["schemas"]["ChatAgent"]
-    for field in ["available", "issues", "created_at", "updated_at"]:
+    for field in ["prompt_ref", "available", "issues", "created_at", "updated_at"]:
         assert field in agent_schema["required"]
     assert "capabilities" in document["components"]["schemas"]["ChatAgentsResponse"]["required"]
     options_schema = document["components"]["schemas"]["ChatAgentOptionsResponse"]

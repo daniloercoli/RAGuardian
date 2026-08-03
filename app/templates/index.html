@@ -23,7 +23,7 @@
                 <label class="chat-control" for="agentSelect">
                     <span>Agent</span>
                     <select id="agentSelect">
-                        <option value="">Custom chat</option>
+                        <option value="">None</option>
                     </select>
                 </label>
                 <div class="chat-control kb-picker" id="kbPicker">
@@ -72,7 +72,6 @@
                         <option value="">No system prompt</option>
                     </select>
                 </label>
-                <button type="button" id="clearChatButton" class="secondary">New chat</button>
             </div>
             <div id="kbChips" class="kb-chip-list" aria-live="polite"></div>
 
@@ -109,6 +108,25 @@
             <input type="file" id="ocrFileInput" class="audio-file-input" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.pdf">
             <input type="file" id="dataFileInput" class="audio-file-input" accept=".csv,.xlsx,.xls,.json,.parquet,.tsv,.zip,.png,.jpg,.jpeg,.gif,.pdf,.txt,.md" multiple>
         </section>
+
+        <div id="newChatModal" class="modal-backdrop" hidden>
+            <section
+                class="modal-panel new-chat-modal-panel"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="newChatModalTitle"
+                aria-describedby="newChatModalDescription"
+            >
+                <h2 id="newChatModalTitle">Start a new chat?</h2>
+                <p id="newChatModalDescription" class="muted">
+                    This conversation is not saved. If you start a new chat, you won’t be able to return to it.
+                </p>
+                <div class="modal-actions">
+                    <button type="button" id="keepConversationButton" class="secondary">Keep conversation</button>
+                    <button type="button" id="confirmNewChatButton" class="danger">Start new chat</button>
+                </div>
+            </section>
+        </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>

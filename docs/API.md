@@ -704,8 +704,8 @@ If the file is not registered in `files.json`, the response is `404` with `statu
 ## Chat Agents
 
 Chat agents are named presets that bundle a provider, model, knowledge bases,
-and a prompt reference. External clients can query by `agent_id` instead of
-specifying each parameter individually.
+and an optional prompt reference. External clients can query by `agent_id`
+instead of specifying each parameter individually.
 
 ### Scopes
 
@@ -765,8 +765,8 @@ curl http://127.0.0.1:5000/api/v1/agents \
 ```
 
 Each agent carries an `available` flag and an `issues` array describing why
-it cannot currently run (missing model, inactive/missing KB, missing/inactive
-prompt, or KB count above the limit).
+it cannot currently run (missing model, inactive/missing KB, a selected prompt
+that is missing or inactive, or KB count above the limit).
 
 ## GET /api/v1/agents/{agent_id}
 
@@ -859,7 +859,10 @@ Creates a new agent. Requires `agent_manage` scope.
 | `provider_id` | string | yes | Must exist in registry |
 | `model_id` | string | yes | Must belong to provider |
 | `knowledge_base_ids` | string[] | yes | 1 to `max_query_knowledge_bases` authorized active KB IDs |
-| `prompt_ref` | object | yes | `{"id": "prompt-uuid", "scope": "shared"}` |
+| `prompt_ref` | object or null | no | `{"id": "prompt-uuid", "scope": "shared"}`; omit, use `null`, or `{}` for no prompt |
+
+When no prompt is selected, the response always normalizes `prompt_ref` to an
+empty object.
 
 ### Request
 
@@ -905,7 +908,7 @@ curl -X POST http://127.0.0.1:5000/api/v1/agents \
 
 | HTTP | status | Meaning |
 |---:|---|---|
-| 400 | `invalid_prompt_ref` | `prompt_ref` missing or malformed |
+| 400 | `invalid_prompt_ref` | `prompt_ref` was provided but is malformed or incomplete |
 | 400 | `invalid_chat_agent_name` | Name empty or too long |
 | 400 | `model_unavailable` / `knowledge_base_missing` / `knowledge_base_inactive` / `prompt_missing` / `prompt_inactive` | Referenced resource no longer usable |
 | 403 | `forbidden` | Key lacks `agent_manage` scope |
@@ -928,7 +931,7 @@ Requires `agent_manage` scope.
 | `provider_id` | string | Must exist in registry |
 | `model_id` | string | Must belong to provider |
 | `knowledge_base_ids` | string[] | 1 to `max_query_knowledge_bases` authorized active KB IDs |
-| `prompt_ref` | object | `{"id": "prompt-uuid", "scope": "shared"}` |
+| `prompt_ref` | object or null | `{"id": "prompt-uuid", "scope": "shared"}`; send `null` or `{}` to clear it |
 
 ### Response 200
 

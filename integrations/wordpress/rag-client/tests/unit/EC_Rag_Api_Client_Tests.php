@@ -267,4 +267,25 @@ final class EC_Rag_Api_Client_Tests extends TestCase {
         self::assertSame('PATCH', $requests[1][2]['method']);
         self::assertSame('shared', json_decode($requests[0][2]['body'], true)['prompt_ref']['scope']);
     }
+
+    public function test_agent_create_allows_null_prompt_reference(): void {
+        $requests = [];
+        $GLOBALS['ec_rag_test_http_handler'] = function ($method, $url, $args) use (&$requests) {
+            $requests[] = [$method, $url, $args];
+            return ['response' => ['code' => 201], 'body' => '{"id":"agent-created"}', 'headers' => []];
+        };
+
+        $this->client()->create_agent(
+            'Promptless',
+            '',
+            'openai',
+            'gpt-4o',
+            ['default'],
+            null
+        );
+
+        $payload = json_decode($requests[0][2]['body'], true);
+        self::assertArrayHasKey('prompt_ref', $payload);
+        self::assertNull($payload['prompt_ref']);
+    }
 }

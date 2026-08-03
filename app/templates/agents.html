@@ -19,18 +19,14 @@
             <div class="panel-heading">
                 <div>
                     <h2>Chat agents</h2>
-                    <p class="muted">Pre-configured chat profiles with provider, model, knowledge bases, and system prompt.</p>
+                    <p class="muted">Pre-configured chat profiles with provider, model, knowledge bases, and an optional system prompt.</p>
                 </div>
                 <button type="button" id="showCreateAgentButton">Create agent</button>
             </div>
-            <form id="createAgentForm" class="form-grid compact" hidden>
+            <form id="createAgentForm" class="form-grid compact kb-editor" hidden>
                 <label>
                     Name
                     <input type="text" name="name" minlength="1" maxlength="120" required>
-                </label>
-                <label>
-                    Description
-                    <textarea name="description" maxlength="500" rows="3"></textarea>
                 </label>
                 <label>
                     Provider
@@ -40,23 +36,27 @@
                     Model
                     <select name="model_id" id="createAgentModel" required></select>
                 </label>
-                <fieldset class="scope-field">
+                <label class="span-full">
+                    Description
+                    <textarea name="description" maxlength="500" rows="3"></textarea>
+                </label>
+                <fieldset class="scope-field span-full">
                     <legend>Knowledge bases <span class="muted" id="createAgentKbLimit"></span></legend>
                     <div class="scope-options" id="createAgentKnowledgeBases"></div>
                 </fieldset>
-                <label>
+                <label class="span-full">
                     System prompt
-                    <select name="prompt_ref" id="createAgentPrompt" required>
-                        <option value="" disabled selected>Select a system prompt</option>
+                    <select name="prompt_ref" id="createAgentPrompt">
+                        <option value="" selected>None</option>
                     </select>
                 </label>
-                <div class="modal-actions">
-                    <button type="submit">Create</button>
+                <div class="modal-actions span-full">
                     <button type="button" class="secondary" id="cancelCreateAgentButton">Cancel</button>
+                    <button type="submit">Create</button>
                 </div>
             </form>
             <div id="agentNotice" class="notice" hidden></div>
-            <div id="agentList" aria-live="polite">
+            <div id="agentList" class="list-spacing" aria-live="polite">
                 <p class="muted">Loading agents...</p>
             </div>
         </section>

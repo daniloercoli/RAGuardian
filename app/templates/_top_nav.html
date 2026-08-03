@@ -9,9 +9,9 @@
 {% if nav_mode == "admin" %}
     <nav class="top-nav admin-nav" aria-label="Administration">
         <div class="nav-track">
+            {{ nav_link("admin_files", "RAG Files") }}
             {{ nav_link("knowledge_bases_page", "Knowledge Bases") }}
             {{ nav_link("agents_page", "Chat Agents") }}
-            {{ nav_link("admin_files", "RAG Files") }}
             {{ nav_link("admin_data_sources", "Data Sources") }}
             {% if current_user and current_user.role == "admin" %}
                 {{ nav_link("admin_config", "AI Settings") }}
@@ -34,9 +34,8 @@
 {% else %}
     <nav class="top-nav" aria-label="Primary navigation">
         <div class="nav-track">
-            <span class="nav-item active" aria-current="page">Chat</span>
-            <a href="{{ url_for('agents_page') }}">Agents</a>
-            <a href="{{ url_for('admin_files') }}">Configuration</a>
+            <a id="newChatLink" class="nav-item active" aria-current="page" href="{{ url_for('index') }}">New Chat</a>
+            <a id="configurationLink" href="{{ url_for('admin_files') }}">Configuration</a>
             <form method="post" action="{{ url_for('admin_logout') }}">
                 <button type="submit" class="link-button">Logout</button>
             </form>

@@ -20,6 +20,8 @@ sys.modules.setdefault("app.utils.knowledge_base_store", sys.modules[__name__])
 
 KNOWLEDGE_BASE_SCHEMA_VERSION = 1
 DEFAULT_KNOWLEDGE_BASE_ID = "default"
+DEFAULT_KNOWLEDGE_BASE_NAME = "General"
+LEGACY_DEFAULT_KNOWLEDGE_BASE_NAME = "Default"
 KNOWLEDGE_BASE_STATUSES = {"active", "deleting", "delete_failed"}
 KNOWLEDGE_BASE_ID_PATTERN = re.compile(r"^kb_[0-9a-f]{32}$")
 
@@ -62,7 +64,10 @@ class KnowledgeBaseStore:
                 }
                 self._write_unlocked(catalog)
                 return self._public_catalog(catalog)
-            return self._public_catalog(self._load_unlocked())
+            catalog = self._load_unlocked()
+            if self._migrate_legacy_default_name(catalog):
+                self._write_unlocked(catalog)
+            return self._public_catalog(catalog)
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -289,6 +294,25 @@ class KnowledgeBaseStore:
                 status_code=409,
             )
 
+    @staticmethod
+    def _migrate_legacy_default_name(catalog: dict) -> bool:
+        records = catalog["knowledge_bases"]
+        default_record = _find_record(records, DEFAULT_KNOWLEDGE_BASE_ID)
+        if (
+            default_record is None
+            or default_record["name"] != LEGACY_DEFAULT_KNOWLEDGE_BASE_NAME
+        ):
+            return False
+        if any(
+            record["id"] != DEFAULT_KNOWLEDGE_BASE_ID
+            and record["name"].casefold() == DEFAULT_KNOWLEDGE_BASE_NAME.casefold()
+            for record in records
+        ):
+            return False
+        default_record["name"] = DEFAULT_KNOWLEDGE_BASE_NAME
+        default_record["updated_at"] = _now()
+        return True
+
     def _load_unlocked(self) -> dict:
         if not self.path.exists():
             raise KnowledgeBaseCatalogError(f"Catalogo knowledge base mancante: {self.path}")
@@ -454,7 +478,7 @@ def _default_record() -> dict:
     now = _now()
     return {
         "id": DEFAULT_KNOWLEDGE_BASE_ID,
-        "name": "Default",
+        "name": DEFAULT_KNOWLEDGE_BASE_NAME,
         "description": "",
         "status": "active",
         "created_at": now,

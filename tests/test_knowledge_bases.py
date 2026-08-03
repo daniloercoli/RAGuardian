@@ -79,6 +79,7 @@ def test_catalog_bootstraps_default_and_enforces_names_limit_and_corruption(tmp_
 
     catalog = store.ensure_default()
     assert [item["id"] for item in catalog["knowledge_bases"]] == ["default"]
+    assert catalog["knowledge_bases"][0]["name"] == "General"
 
     created = store.create(name="Legal", description="Contratti")
     assert created["id"].startswith("kb_")
@@ -99,6 +100,39 @@ def test_catalog_bootstraps_default_and_enforces_names_limit_and_corruption(tmp_
     catalog_path.write_text("{invalid", encoding="utf-8")
     with pytest.raises(KnowledgeBaseCatalogError):
         store.list()
+
+
+def test_ensure_default_migrates_only_the_legacy_default_name(tmp_path):
+    catalog_path = tmp_path / "knowledge_bases.json"
+    store = KnowledgeBaseStore(catalog_path)
+    store.ensure_default()
+
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["knowledge_bases"][0]["name"] = "Default"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    migrated = store.ensure_default()
+    assert migrated["knowledge_bases"][0]["name"] == "General"
+    assert json.loads(catalog_path.read_text(encoding="utf-8"))["knowledge_bases"][0][
+        "name"
+    ] == "General"
+
+    store.update("default", name="Custom")
+    assert store.ensure_default()["knowledge_bases"][0]["name"] == "Custom"
+
+
+def test_legacy_default_name_migration_preserves_an_existing_general_name(tmp_path):
+    catalog_path = tmp_path / "knowledge_bases.json"
+    store = KnowledgeBaseStore(catalog_path)
+    store.ensure_default()
+
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["knowledge_bases"][0]["name"] = "Default"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    store.create(name="General")
+
+    records = store.ensure_default()["knowledge_bases"]
+    assert [record["name"] for record in records] == ["Default", "General"]
 
 
 def test_catalog_rejects_invalid_timestamps_and_explicit_empty_ids(tmp_path):
@@ -171,7 +205,9 @@ def test_secondary_context_isolates_files_uploads_and_collection(flask_app):
 def test_session_crud_keeps_default_and_returns_stats(client):
     initial = client.get("/api/knowledge-bases")
     assert initial.status_code == 200
-    assert initial.get_json()["knowledge_bases"][0]["id"] == "default"
+    initial_payload = initial.get_json()
+    assert initial_payload["knowledge_bases"][0]["id"] == "default"
+    assert initial_payload["limits"]["max_knowledge_bases"] == 3
 
     created_response = client.post(
         "/api/knowledge-bases",

@@ -363,10 +363,10 @@ class EC_Rag_Api_Client {
      * @param string $provider_id Provider ID.
      * @param string $model_id Model ID.
      * @param array  $knowledge_base_ids Knowledge base IDs.
-     * @param array  $prompt_ref Prompt reference (id, scope).
+     * @param array|null $prompt_ref Optional prompt reference (id, scope).
      * @return array|WP_Error
      */
-    public function create_agent(string $name, string $description, string $provider_id, string $model_id, array $knowledge_base_ids, array $prompt_ref) {
+    public function create_agent(string $name, string $description, string $provider_id, string $model_id, array $knowledge_base_ids, ?array $prompt_ref = null) {
         $result = $this->ensure_configured();
         if (is_wp_error($result)) {
             return $result;

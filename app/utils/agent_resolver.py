@@ -74,17 +74,7 @@ def compute_availability(
             )
 
     prompt_ref = agent.get("prompt_ref") or {}
-    if not isinstance(prompt_ref, dict) or not prompt_ref.get("id"):
-        # Older catalogs could contain an empty prompt_ref. Keep those records
-        # editable, but never report them as runnable Agents.
-        issues.append(
-            {
-                "code": "prompt_missing",
-                "field": "prompt_ref",
-                "message": "L'Agent deve avere un prompt di sistema",
-            }
-        )
-    else:
+    if isinstance(prompt_ref, dict) and prompt_ref.get("id"):
         scope = str(prompt_ref.get("scope") or "").strip()
         prompt_id = str(prompt_ref.get("id") or "").strip()
         if scope not in PROMPT_SCOPES or not prompt_id:

@@ -22,6 +22,7 @@ sys.modules.setdefault("app.utils.chat_agent_store", sys.modules[__name__])
 CHAT_AGENT_SCHEMA_VERSION = 1
 CHAT_AGENT_ID_PATTERN = re.compile(r"^agent_[0-9a-f]{32}$")
 PROMPT_SCOPES = {"personal", "shared"}
+_PROMPT_REF_UNSET = object()
 
 KNOWN_RECORD_FIELDS = frozenset(
     {
@@ -120,7 +121,7 @@ class ChatAgentStore:
             knowledge_base_ids,
             limit=self.max_query_knowledge_bases,
         )
-        normalized_prompt_ref = validate_prompt_ref_required(prompt_ref)
+        normalized_prompt_ref = validate_prompt_ref(prompt_ref)
         with self._lock:
             catalog = self._load_unlocked()
             records = catalog["agents"]
@@ -156,7 +157,7 @@ class ChatAgentStore:
         provider_id: str | None = None,
         model_id: str | None = None,
         knowledge_base_ids: list[str] | None = None,
-        prompt_ref: dict | None = None,
+        prompt_ref: dict | None | object = _PROMPT_REF_UNSET,
     ) -> dict:
         with self._lock:
             catalog = self._load_unlocked()
@@ -186,8 +187,8 @@ class ChatAgentStore:
                     knowledge_base_ids,
                     limit=self.max_query_knowledge_bases,
                 )
-            if prompt_ref is not None:
-                record["prompt_ref"] = validate_prompt_ref_required(prompt_ref)
+            if prompt_ref is not _PROMPT_REF_UNSET:
+                record["prompt_ref"] = validate_prompt_ref(prompt_ref)
             record["updated_at"] = _now()
             self._write_unlocked(catalog)
             return self._public_record(record)

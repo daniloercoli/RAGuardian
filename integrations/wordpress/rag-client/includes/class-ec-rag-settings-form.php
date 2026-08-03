@@ -371,7 +371,7 @@ class EC_Rag_Settings_Form {
                         value="1" <?php checked($options['enable_chat_agents_mode'] ?? '0', '1'); ?>>
                         <?php esc_html_e('Require visitors to use one of the selected Agents', 'ec-rag'); ?>
                     </label>
-                    <p class="description"><?php esc_html_e('Each Agent fixes the model, one or more knowledge bases, and exactly one system prompt.', 'ec-rag'); ?></p>
+                    <p class="description"><?php esc_html_e('Each Agent fixes the model and one or more knowledge bases, with an optional system prompt.', 'ec-rag'); ?></p>
                 </td>
             </tr>
             <tr>

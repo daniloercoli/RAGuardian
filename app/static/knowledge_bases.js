@@ -6,11 +6,16 @@ document.addEventListener("DOMContentLoaded", () => {
     const cancelCreate = document.getElementById("cancelCreateKbButton");
     const terminalStatuses = new Set(["completed", "completed_with_errors", "failed"]);
 
+    let limits = {max_knowledge_bases: 20, max_query_knowledge_bases: 5};
+
     showCreate.addEventListener("click", () => {
         createForm.hidden = false;
         createForm.elements.name.focus();
     });
     cancelCreate.addEventListener("click", () => {
+        if (hasUnsavedChanges(createForm)) {
+            if (!window.confirm("Annullare la creazione? Le modifiche andranno perse.")) return;
+        }
         createForm.reset();
         createForm.hidden = true;
     });
@@ -37,6 +42,7 @@ document.addEventListener("DOMContentLoaded", () => {
     async function loadKnowledgeBases() {
         try {
             const payload = await jsonRequest("/api/knowledge-bases");
+            limits = payload.limits || limits;
             render(payload.knowledge_bases || []);
         } catch (error) {
             list.innerHTML = `<p class="notice error">${escapeHtml(error.message)}</p>`;
@@ -45,14 +51,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function render(items) {
         list.replaceChildren();
-        items.forEach(item => list.appendChild(renderCard(item)));
+        if (items.length === 0) {
+            const empty = document.createElement("p");
+            empty.className = "muted";
+            empty.textContent = "No knowledge bases yet. Create one to isolate documents, vector indexes, and data sources.";
+            list.appendChild(empty);
+            return;
+        }
+        items.forEach(item => list.appendChild(renderCard(item, items.length)));
     }
 
-    function renderCard(item) {
+    function renderCard(item, total) {
         const card = document.createElement("article");
         card.className = "panel knowledge-base-card";
         const badge = item.is_default
-            ? '<span class="badge">Default</span>'
+            ? '<span class="default-kb-tag" title="Default knowledge base">Default</span>'
             : `<span class="status-pill ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span>`;
         card.innerHTML = `
             <div class="panel-heading">
@@ -60,6 +73,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     <h3>${escapeHtml(item.name)} ${badge}</h3>
                     <p>${escapeHtml(item.description || "No description")}</p>
                 </div>
+                <span class="count-badge">${total} / ${limits.max_knowledge_bases}</span>
             </div>
             <dl class="kb-stats">
                 <div><dt>Files</dt><dd>${Number(item.stats.tracked_files || 0)}</dd></div>
@@ -78,10 +92,10 @@ document.addEventListener("DOMContentLoaded", () => {
             </div>
             <form class="form-grid compact kb-editor" data-editor hidden>
                 <label>Name<input name="name" value="${escapeAttribute(item.name)}" maxlength="120" required></label>
-                <label>Description<textarea name="description" maxlength="1000" rows="3">${escapeHtml(item.description || "")}</textarea></label>
-                <div class="modal-actions">
-                    <button type="submit">Save</button>
+                <label class="span-full">Description<textarea name="description" maxlength="1000" rows="3">${escapeHtml(item.description || "")}</textarea></label>
+                <div class="modal-actions span-full">
                     <button type="button" class="secondary" data-action="cancel-edit">Cancel</button>
+                    <button type="submit">Save</button>
                 </div>
             </form>
             <p class="muted" data-delete-progress hidden></p>
@@ -92,6 +106,10 @@ document.addEventListener("DOMContentLoaded", () => {
             editor.elements.name.focus();
         });
         card.querySelector('[data-action="cancel-edit"]').addEventListener("click", () => {
+            if (hasUnsavedChanges(editor, item)) {
+                if (!window.confirm("Annullare le modifiche? Le modifiche andranno perse.")) return;
+            }
+            editor.reset();
             editor.hidden = true;
         });
         editor.addEventListener("submit", async (event) => {
@@ -133,6 +151,17 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
         return card;
+    }
+
+    function hasUnsavedChanges(form, original) {
+        const name = form.elements.name.value.trim();
+        const description = form.elements.description.value.trim();
+        if (original) {
+            if (name !== (original.name || "").trim()) return true;
+            if (description !== (original.description || "").trim()) return true;
+            return false;
+        }
+        return name !== "" || description !== "";
     }
 
     async function pollDeleteJob(jobId, progress) {

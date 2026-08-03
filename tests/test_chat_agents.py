@@ -362,34 +362,33 @@ def test_store_prompt_ref_valid(tmp_path):
     assert agent["prompt_ref"] == {"id": "abc123", "scope": "personal"}
 
 
-def test_store_create_rejects_missing_prompt_ref(tmp_path):
+def test_store_create_accepts_missing_prompt_ref(tmp_path):
     store = ChatAgentStore(tmp_path / "chat_agents.json")
     store.ensure_default()
-    with pytest.raises(ChatAgentValidationError) as exc:
-        store.create(
-            name="Legal Bot",
-            provider_id="openai",
-            model_id="gpt-4o",
-            knowledge_base_ids=["default"],
-            prompt_ref=None,
-        )
-    assert exc.value.code == "invalid_prompt_ref"
+    agent = store.create(
+        name="Legal Bot",
+        provider_id="openai",
+        model_id="gpt-4o",
+        knowledge_base_ids=["default"],
+        prompt_ref=None,
+    )
+    assert agent["prompt_ref"] == {}
 
 
-def test_store_create_rejects_empty_prompt_ref(tmp_path):
+def test_store_create_accepts_empty_prompt_ref(tmp_path):
     store = ChatAgentStore(tmp_path / "chat_agents.json")
     store.ensure_default()
-    with pytest.raises(ChatAgentValidationError):
-        store.create(
-            name="Legal Bot",
-            provider_id="openai",
-            model_id="gpt-4o",
-            knowledge_base_ids=["default"],
-            prompt_ref={},
-        )
+    agent = store.create(
+        name="Legal Bot",
+        provider_id="openai",
+        model_id="gpt-4o",
+        knowledge_base_ids=["default"],
+        prompt_ref={},
+    )
+    assert agent["prompt_ref"] == {}
 
 
-def test_store_update_rejects_empty_prompt_ref(tmp_path):
+def test_store_update_accepts_empty_prompt_ref(tmp_path):
     store = ChatAgentStore(tmp_path / "chat_agents.json")
     store.ensure_default()
     agent = store.create(
@@ -399,9 +398,22 @@ def test_store_update_rejects_empty_prompt_ref(tmp_path):
         knowledge_base_ids=["default"],
         prompt_ref={"id": "abc123", "scope": "shared"},
     )
-    with pytest.raises(ChatAgentValidationError) as exc:
-        store.update(agent["id"], prompt_ref={})
-    assert exc.value.code == "invalid_prompt_ref"
+    updated = store.update(agent["id"], prompt_ref={})
+    assert updated["prompt_ref"] == {}
+
+
+def test_store_update_accepts_null_prompt_ref(tmp_path):
+    store = ChatAgentStore(tmp_path / "chat_agents.json")
+    store.ensure_default()
+    agent = store.create(
+        name="Legal Bot",
+        provider_id="openai",
+        model_id="gpt-4o",
+        knowledge_base_ids=["default"],
+        prompt_ref={"id": "abc123", "scope": "shared"},
+    )
+    updated = store.update(agent["id"], prompt_ref=None)
+    assert updated["prompt_ref"] == {}
 
 
 def test_store_update_prompt_ref_to_valid(tmp_path):
@@ -686,7 +698,7 @@ def test_resolver_prompt_missing():
     assert "prompt_missing" in codes
 
 
-def test_resolver_empty_prompt_ref_is_unavailable():
+def test_resolver_empty_prompt_ref_is_available():
     agent = _make_agent(prompt_ref={})
     result = compute_availability(
         agent,
@@ -695,8 +707,8 @@ def test_resolver_empty_prompt_ref_is_unavailable():
         is_model_available=lambda p, m: True,
         max_query_knowledge_bases=5,
     )
-    assert result["available"] is False
-    assert [issue["code"] for issue in result["issues"]] == ["prompt_missing"]
+    assert result["available"] is True
+    assert result["issues"] == []
 
 
 def test_resolver_prompt_inactive():
@@ -739,6 +751,7 @@ def test_agents_page_renders(client):
     response = client.get("/agents")
     assert response.status_code == 200
     assert b"Chat Agents" in response.data or b"chat agents" in response.data.lower()
+    assert b'<h1 class="sr-only">Chat Agents</h1>' in response.data
 
 
 def test_api_agents_list_empty(client):
@@ -762,6 +775,14 @@ def test_api_agents_create(client, agent_payload):
     assert data["knowledge_base_ids"] == ["default"]
     assert "available" in data
     assert "issues" in data
+
+
+def test_api_agents_create_without_prompt_ref(client, agent_payload):
+    payload = agent_payload(name="Promptless Agent")
+    payload.pop("prompt_ref")
+    response = client.post("/api/agents", json=payload)
+    assert response.status_code == 201
+    assert response.get_json()["prompt_ref"] == {}
 
 
 def test_api_agents_create_duplicate_name(client, agent_payload):
@@ -823,7 +844,8 @@ def test_api_agents_get_invalid_id(client):
 
 
 def test_api_agents_update(client, agent_payload):
-    create_resp = client.post("/api/agents", json=agent_payload())
+    payload = agent_payload()
+    create_resp = client.post("/api/agents", json=payload)
     agent_id = create_resp.get_json()["id"]
     response = client.patch(
         f"/api/agents/{agent_id}",
@@ -833,6 +855,18 @@ def test_api_agents_update(client, agent_payload):
     data = response.get_json()
     assert data["name"] == "Updated Name"
     assert data["description"] == "New desc"
+    assert data["prompt_ref"] == payload["prompt_ref"]
+
+
+def test_api_agents_update_clears_prompt_with_null(client, agent_payload):
+    create_resp = client.post("/api/agents", json=agent_payload())
+    agent_id = create_resp.get_json()["id"]
+    response = client.patch(
+        f"/api/agents/{agent_id}",
+        json={"prompt_ref": None},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["prompt_ref"] == {}
 
 
 def test_api_agents_update_not_found(client):
@@ -1403,14 +1437,14 @@ def test_query_agent_catalog_error_does_not_leak_path(
     assert workspace.chat_agents_file not in response.get_json()["error"]
 
 
-def test_legacy_agent_without_prompt_is_preserved_but_cannot_run(
-    client, flask_app, agent_payload
+def test_agent_without_prompt_is_available_and_runs(
+    client, flask_app, agent_payload, monkeypatch
 ):
     from app.utils.workspace import workspace_for_user
 
     created = client.post(
         "/api/agents",
-        json=agent_payload(name="Legacy Promptless Agent"),
+        json=agent_payload(name="Promptless Agent"),
     ).get_json()
     user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
     workspace = workspace_for_user(user, app=flask_app)
@@ -1421,15 +1455,28 @@ def test_legacy_agent_without_prompt_is_preserved_but_cannot_run(
 
     listed = client.get("/api/agents").get_json()["agents"]
     assert listed[0]["id"] == created["id"]
-    assert listed[0]["available"] is False
-    assert listed[0]["issues"][0]["code"] == "prompt_missing"
+    assert listed[0]["available"] is True
+    assert listed[0]["issues"] == []
+
+    import sys
+    app_module = sys.modules["app.app"]
+    rag_engine_mod = sys.modules["utils.rag_engine"]
+
+    captured = {}
+
+    def fake_query_rag(*args, **kwargs):
+        captured.update(kwargs)
+        return {"answer": "ok", "context": [], "sources": [], "usage": None}
+
+    monkeypatch.setattr(app_module, "_validate_model_selection", lambda *a, **kw: None)
+    monkeypatch.setattr(rag_engine_mod, "query_rag", fake_query_rag)
 
     response = client.post(
         "/ask",
         json={"query": "test", "agent_id": created["id"]},
     )
-    assert response.status_code == 400
-    assert response.get_json()["status"] == "prompt_missing"
+    assert response.status_code == 200
+    assert captured.get("system_prompt_id") in (None, "", "null")
 
 
 def test_v1_query_with_agent_id_resolves_config(client, flask_app, agent_payload, monkeypatch):

@@ -127,7 +127,7 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname === "/api/v1/knowledge-bases" && request.method === "GET") {
         record(request, {type: "knowledge_base_catalog"});
         json(response, 200, {
-            knowledge_bases: [{id: "default", name: "Default", status: "active"}],
+            knowledge_bases: [{id: "default", name: "General", status: "active"}],
         });
         return;
     }
@@ -155,7 +155,7 @@ const server = http.createServer(async (request, response) => {
             }],
             default_provider: "openai",
             default_model: "gpt-4o",
-            knowledge_bases: [{id: "default", name: "Default", status: "active"}],
+            knowledge_bases: [{id: "default", name: "General", status: "active"}],
             prompts: [{id: "prompt-shared", name: "Shared", scope: "shared", is_active: true}],
             capabilities: {can_manage: true},
             limits: {max_chat_agents: 20, max_query_knowledge_bases: 5},

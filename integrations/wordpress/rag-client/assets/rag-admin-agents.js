@@ -140,7 +140,7 @@
         const promptLabel = document.createElement("label");
         promptLabel.appendChild(document.createTextNode("System prompt "));
         const prompt = document.createElement("select");
-        addOption(prompt, "Select a system prompt", "", false);
+        addOption(prompt, "None", "", true);
         (Array.isArray(options.prompts) ? options.prompts : []).forEach((item) => {
             const value = item.scope + "::" + item.id;
             const selected = agent && agent.prompt_ref
@@ -174,10 +174,17 @@
         save.addEventListener("click", async () => {
             const knowledgeBaseIds = Array.from(kbGroup.querySelectorAll("input:checked"))
                 .map((item) => item.value);
-            const parts = prompt.value.split("::");
-            if (!name.value.trim() || !provider.value || !model.value || !knowledgeBaseIds.length || parts.length !== 2) {
+            if (!name.value.trim() || !provider.value || !model.value || !knowledgeBaseIds.length) {
                 throwNotice(root, "Complete all required Agent fields.");
                 return;
+            }
+            const promptValue = prompt.value;
+            let promptRef = null;
+            if (promptValue) {
+                const parts = promptValue.split("::");
+                if (parts.length === 2) {
+                    promptRef = {scope: parts[0], id: parts[1]};
+                }
             }
             const payload = {
                 name: name.value.trim(),
@@ -185,7 +192,7 @@
                 provider_id: provider.value,
                 model_id: model.value,
                 knowledge_base_ids: knowledgeBaseIds,
-                prompt_ref: {scope: parts[0], id: parts[1]},
+                prompt_ref: promptRef,
             };
             save.disabled = true;
             try {
