@@ -124,7 +124,14 @@ test("multi-KB UI normalizes storage and protects in-flight conversation state",
         normalize(["default", " default ", "", "kb_123", "kb_123", null]),
         ["default", "kb_123"]
     );
-    assert.match(busyHandler, /clearChatButton\.disabled = isBusy/);
+    assert.match(
+        busyHandler,
+        /newChatLink\.setAttribute\("aria-disabled", String\(isBusy\)\)/
+    );
+    assert.match(
+        busyHandler,
+        /configurationLink\.setAttribute\("aria-disabled", String\(isBusy\)\)/
+    );
     assert.match(clearHandler, /if \(busy\) return/);
     assert.match(chipRenderer, /focusKnowledgeBaseControlAfterRemoval\(index\)/);
 });
