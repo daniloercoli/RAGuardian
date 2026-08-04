@@ -1,7 +1,6 @@
 import functools
 import hmac
 import os
-from datetime import datetime, time, timezone
 from typing import Optional
 
 from flask import current_app, jsonify, redirect, request, session, url_for
@@ -9,7 +8,7 @@ from werkzeug.security import check_password_hash
 
 
 from utils.settings_store import API_SCOPES
-from utils.user_store import UserStore, api_key_matches, normalize_email
+from utils.user_store import UserStore, normalize_email
 from utils.workspace import safe_workspace_id
 
 
@@ -98,38 +97,10 @@ def find_api_key(value: Optional[str]) -> Optional[dict]:
             "workspace_id": safe_workspace_id(admin["id"]),
         }
 
-    store = _user_store()
-    with store._lock:
-        users = store._list_unlocked()
-    for user in users:
-        if not user.get("enabled", True):
-            continue
-        for key_item in (user.get("api_keys") or []):
-            if not key_item.get("enabled", True) or not api_key_matches(key_item, value):
-                continue
-            if _api_key_is_expired(key_item.get("expires_at")):
-                continue
-            scopes = key_item.get("scopes", ["query"])
-            knowledge_base_ids = (
-                key_item.get("knowledge_base_ids")
-                if "knowledge_base_ids" in key_item
-                else ["default"]
-            )
-            return {
-                "name": key_item.get("name", "custom"),
-                "key": value,
-                "enabled": True,
-                "scopes": scopes,
-                "knowledge_base_ids": list(knowledge_base_ids or []),
-                "can_upload": "ingest" in scopes,
-                "user_id": user["id"],
-                "workspace_id": safe_workspace_id(user["id"]),
-                "api_key_id": key_item.get("id") or key_item.get("name"),
-                "_user_key_name": key_item.get("name"),
-                "_user_id_for_logging": user["id"],
-            }
-
-    return None
+    found = _user_store().find_api_key_by_value(value)
+    if found is not None:
+        found["workspace_id"] = safe_workspace_id(found["user_id"])
+    return found
 
 
 def api_key_has_scope(key: Optional[dict], scope: str) -> bool:
@@ -271,7 +242,7 @@ def require_admin_or_upload_api_key(view):
 
 
 def _user_store() -> UserStore:
-    return UserStore(current_app.config.get("USERS_FILE"))
+    return UserStore(current_app.config.get("USERS_DB"))
 
 
 def _first_admin_user() -> Optional[dict]:
@@ -279,29 +250,3 @@ def _first_admin_user() -> Optional[dict]:
         if user.get("role") == "admin" and user.get("enabled", True):
             return user
     return None
-
-
-def _api_key_is_expired(expires_at: str | None) -> bool:
-    if not expires_at:
-        return False
-    parsed = _parse_expiration(expires_at)
-    if parsed is None:
-        return False
-    return parsed <= datetime.now(timezone.utc)
-
-
-def _parse_expiration(value: str) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
-            day = datetime.fromisoformat(raw).date()
-            return datetime.combine(day, time.max, tzinfo=timezone.utc)
-        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)

@@ -103,14 +103,14 @@ def due_data_sources(sources: Iterable[dict], *, now: datetime | None = None) ->
 
 
 def workspace_configs(app) -> Iterable[dict]:
-    users = UserStore(app.config["USERS_FILE"]).list()
+    users = UserStore(app.config["USERS_DB"]).list()
     for user in users:
         if not user.get("enabled", True):
             continue
         from utils.index_lock import lifecycle_read_lock
 
         with lifecycle_read_lock():
-            current = UserStore(app.config["USERS_FILE"]).get(user["id"])
+            current = UserStore(app.config["USERS_DB"]).get(user["id"])
             if not current or not current.get("enabled", True):
                 continue
             workspace = workspace_for_user(current, app=app)
@@ -128,7 +128,7 @@ def workspace_configs(app) -> Iterable[dict]:
                     record["id"],
                     create_dirs=True,
                 ).as_config()
-                config["USERS_FILE"] = app.config["USERS_FILE"]
+                config["USERS_DB"] = app.config["USERS_DB"]
                 configs.append(config)
         yield from configs
 
@@ -190,7 +190,7 @@ def runtime_app_from_env():
         "UPLOAD_FOLDER": Config.paths.upload_folder,
         "SETTINGS_FILE": Config.paths.settings_file,
         "FILE_INDEX": Config.paths.file_index,
-        "USERS_FILE": os.getenv("RAG_USERS_FILE", "app/data/users.json"),
+        "USERS_DB": os.getenv("RAG_USERS_DB", "app/data/users.db"),
         "SECRETS_FILE": os.getenv("RAG_SECRETS_FILE", "app/data/secrets.json"),
         "WORKSPACE_DATA_DIR": os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces"),
         "WORKSPACE_UPLOAD_DIR": os.getenv("RAG_WORKSPACE_UPLOAD_DIR", "app/uploads/workspaces"),

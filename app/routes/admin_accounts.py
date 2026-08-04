@@ -5,6 +5,7 @@ from flask import flash, redirect, render_template, request, send_file, url_for
 
 from utils.api_key_logger import ApiKeyLogger
 from utils.auth import current_user, require_admin
+from utils.settings_store import API_SCOPES, API_SCOPES_REQUIRING_KB
 from utils.index_lock import lifecycle_read_lock
 from utils.job_store import get_job_store
 from utils.user_store import UserStore
@@ -20,7 +21,7 @@ def register_admin_account_routes(app) -> None:
     @app.route("/admin/users", methods=["GET", "POST"])
     @require_admin
     def admin_users():
-        store = UserStore(app.config["USERS_FILE"])
+        store = UserStore(app.config["USERS_DB"])
         if request.method == "POST":
             try:
                 action = request.form.get("action", "create")
@@ -92,7 +93,7 @@ def register_admin_account_routes(app) -> None:
     @app.route("/admin/api-keys", methods=["GET", "POST"])
     @require_admin
     def admin_api_keys():
-        store = UserStore(app.config["USERS_FILE"])
+        store = UserStore(app.config["USERS_DB"])
 
         def render_api_keys(revealed_key: dict | None = None):
             with lifecycle_read_lock():
@@ -160,10 +161,10 @@ def register_admin_account_routes(app) -> None:
                     effective_scopes = [
                         scope
                         for scope in scopes
-                        if scope in {"query", "ingest", "speech", "kb_manage", "agent_manage"}
+                        if scope in API_SCOPES
                     ] or ["query"]
                     if (
-                        {"query", "ingest", "agent_manage"} & set(effective_scopes)
+                        API_SCOPES_REQUIRING_KB & set(effective_scopes)
                         and not knowledge_base_ids
                     ):
                         knowledge_base_ids = ["default"]
@@ -222,10 +223,10 @@ def register_admin_account_routes(app) -> None:
                     effective_scopes = [
                         scope
                         for scope in scopes
-                        if scope in {"query", "ingest", "speech", "kb_manage", "agent_manage"}
+                        if scope in API_SCOPES
                     ] or ["query"]
                     if (
-                        {"query", "ingest", "agent_manage"} & set(effective_scopes)
+                        API_SCOPES_REQUIRING_KB & set(effective_scopes)
                         and not knowledge_base_ids
                     ):
                         raise ValueError(

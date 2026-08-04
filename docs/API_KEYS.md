@@ -46,7 +46,7 @@ Rotation replaces the raw key value while preserving its name, scopes, expiratio
 ```python
 from utils.user_store import UserStore
 
-store = UserStore("app/data/users.json")
+store = UserStore("app/data/users.db")
 new_key = store.rotate_api_key(user_id="user-123", key_name="production")
 # new_key contains the new raw value
 ```

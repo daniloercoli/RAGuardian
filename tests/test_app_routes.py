@@ -37,7 +37,7 @@ def flask_app(tmp_path):
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
@@ -48,7 +48,7 @@ def flask_app(tmp_path):
             "RATE_LIMIT_WINDOW": 60,
         }
     )
-    store = UserStore(app.config["USERS_FILE"])
+    store = UserStore(app.config["USERS_DB"])
     user = store.create_user(
         email="admin@example.local",
         password="admin",
@@ -81,7 +81,7 @@ def _login_email(client, email, password="admin"):
 def _workspace_context(flask_app):
     from utils.workspace import workspace_for_user
 
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     users = store.list()
     if users:
         user = users[0]
@@ -222,7 +222,7 @@ def test_admin_restore_backup_uses_configured_workspace_roots(
 
 
 def test_user_api_key_expiration_uses_full_timestamp(flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user = store.create_user(email="api-user@example.com", password="secret-pass")
     store.create_api_key(
         user_id=user["id"],
@@ -247,7 +247,7 @@ def test_user_api_key_expiration_uses_full_timestamp(flask_app):
 
 
 def test_disabled_user_api_keys_are_revoked(flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user = store.create_user(
         email="disabled-api-user@example.com",
         password="secret-pass",
@@ -270,7 +270,7 @@ def test_api_key_lookup_does_not_provision_its_owner_workspace(flask_app):
     from utils.auth import find_api_key
     from utils.workspace import safe_workspace_id
 
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user = store.create_user(
         email="lookup-only@example.com",
         password="secret-pass",
@@ -301,14 +301,13 @@ def test_api_key_lookup_does_not_bootstrap_an_empty_user_store(
 ):
     from utils.auth import find_api_key
 
-    empty_users_file = tmp_path / "empty-users.json"
-    flask_app.config["USERS_FILE"] = str(empty_users_file)
+    empty_users_file = tmp_path / "empty-users.db"
+    flask_app.config["USERS_DB"] = str(empty_users_file)
 
     with flask_app.app_context():
         assert find_api_key("unknown-key") is None
 
     assert UserStore(empty_users_file).list() == []
-    assert not empty_users_file.exists()
 
 
 def test_session_request_does_not_log_an_unselected_api_key(
@@ -319,7 +318,7 @@ def test_session_request_does_not_log_an_unselected_api_key(
     from utils.job_store import get_job_store
     from utils.workspace import workspace_for_user
 
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     session_user = store.list()[0]
     workspace = workspace_for_user(session_user, app=flask_app)
     foreign_user = store.create_user(
@@ -358,7 +357,7 @@ def test_session_request_does_not_log_an_unselected_api_key(
 
 def test_admin_cannot_reveal_api_key_after_creation(client, flask_app):
     _login(client)
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user = store.list()[0]
     store.create_api_key(
         user_id=user["id"],
@@ -377,7 +376,7 @@ def test_admin_cannot_reveal_api_key_after_creation(client, flask_app):
     )
 
     assert response.status_code == 302
-    assert "raw-admin-secret" not in Path(flask_app.config["USERS_FILE"]).read_text(encoding="utf-8")
+    assert b"raw-admin-secret" not in Path(flask_app.config["USERS_DB"]).read_bytes()
     assert "raw-admin-secret" not in response.headers.get("Set-Cookie", "")
     with client.session_transaction() as sess:
         assert "show_key_raw" not in sess
@@ -472,7 +471,7 @@ def test_prompt_templates_render_literal_variables(client):
 
 
 def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
-    UserStore(flask_app.config["USERS_FILE"]).create_user(
+    UserStore(flask_app.config["USERS_DB"]).create_user(
         email="user@example.local",
         password="secret",
         display_name="User",
@@ -520,7 +519,7 @@ def test_system_prompt_links_are_visible_without_admin_leaks(client, flask_app):
 
 
 def test_shared_prompt_list_hides_inactive_from_non_admin(client, flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     store.create_user(
         email="user@example.local",
         password="secret",
@@ -551,7 +550,7 @@ def test_shared_prompt_list_hides_inactive_from_non_admin(client, flask_app):
 def test_api_key_query_applies_user_system_prompt(client, flask_app, monkeypatch):
     app_module = importlib.import_module("app.app")
     rag_engine = importlib.import_module("utils.rag_engine")
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     prompt = PromptStore(flask_app.config["PROMPTS_DIR"]).create_user_prompt(
         user["id"],
         "API persona",
@@ -1020,8 +1019,8 @@ def test_api_v1_query_accepts_valid_api_key(client, monkeypatch):
 
 
 def test_api_scope_denies_missing_query_scope(client, flask_app):
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
-    UserStore(flask_app.config["USERS_FILE"]).create_api_key(
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
+    UserStore(flask_app.config["USERS_DB"]).create_api_key(
         user_id=user["id"],
         name="speech",
         scopes=["speech"],
@@ -1079,8 +1078,8 @@ def test_api_tts_requires_speech_scope(client):
 def test_api_tts_returns_audio_with_speech_scope(client, flask_app, monkeypatch):
     import utils.voice_provider as voice_provider
 
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
-    UserStore(flask_app.config["USERS_FILE"]).create_api_key(
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
+    UserStore(flask_app.config["USERS_DB"]).create_api_key(
         user_id=user["id"],
         name="speech",
         scopes=["speech"],
@@ -3216,7 +3215,7 @@ def test_missing_default_provider_file_is_visible_on_app_load(tmp_path, monkeypa
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
             "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace_uploads"),

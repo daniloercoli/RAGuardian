@@ -28,7 +28,7 @@ def flask_app(tmp_path, monkeypatch):
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
@@ -49,12 +49,12 @@ def test_first_login_bootstraps_admin_and_user_role_is_not_admin(client, flask_a
     response = client.post("/admin/login", data={"password": "admin"})
 
     assert response.status_code == 302
-    users = UserStore(flask_app.config["USERS_FILE"]).list()
+    users = UserStore(flask_app.config["USERS_DB"]).list()
     assert len(users) == 1
     assert users[0]["role"] == "admin"
     assert users[0]["email"] == "admin@example.local"
 
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_user(
         email="person@example.com",
         password="secret-pass",
@@ -73,7 +73,7 @@ def test_first_login_bootstraps_admin_and_user_role_is_not_admin(client, flask_a
 
 
 def test_workspace_context_isolates_settings_file_index_uploads_and_collection(flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     alice = store.create_user(email="alice@example.com", password="alice-pass")
     bob = store.create_user(email="bob@example.com", password="bob-pass")
 
@@ -96,7 +96,7 @@ def test_workspace_context_isolates_settings_file_index_uploads_and_collection(f
 
 
 def test_admin_api_keys_are_saved_in_user_store(client, flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     admin = store.create_user(
         email="admin@example.local",
         password="admin",
@@ -117,7 +117,7 @@ def test_admin_api_keys_are_saved_in_user_store(client, flask_app):
     )
 
     global_settings = SettingsStore(flask_app.config["SETTINGS_FILE"]).load()
-    keys = UserStore(flask_app.config["USERS_FILE"]).get_api_keys(admin["id"])
+    keys = UserStore(flask_app.config["USERS_DB"]).get_api_keys(admin["id"])
 
     assert response.status_code == 200
     assert b"Copy it now" in response.data
@@ -131,7 +131,7 @@ def test_api_key_resolves_to_owning_user_workspace(client, flask_app, monkeypatc
     app_module = importlib.import_module("app.app")
     from flask import request
 
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     alice = store.create_user(email="alice@example.com", password="alice-pass")
     bob = store.create_user(email="bob@example.com", password="bob-pass")
     alice_workspace = workspace_for_user(alice, app=flask_app)
@@ -176,7 +176,7 @@ def test_api_key_resolves_to_owning_user_workspace(client, flask_app, monkeypatc
 
 def test_api_query_model_validation_uses_api_key_workspace_settings(client, flask_app, monkeypatch):
     app_module = importlib.import_module("app.app")
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     alice = store.create_user(email="alice@example.com", password="alice-pass")
     alice_workspace = workspace_for_user(alice, app=flask_app)
     store.create_api_key(
@@ -299,7 +299,7 @@ def test_data_source_password_is_saved_as_user_secret(
         },
     )
 
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     workspace = workspace_for_user(user, app=flask_app)
     settings = SettingsStore(workspace.settings_file).load()
     source = settings["data_sources"][0]
@@ -418,7 +418,7 @@ def test_data_source_password_is_saved_as_user_secret(
 
 
 def test_job_status_is_hidden_across_workspaces(client, flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     alice = store.create_user(email="alice@example.com", password="alice-pass")
     bob = store.create_user(email="bob@example.com", password="bob-pass")
     alice_workspace = workspace_for_user(alice, app=flask_app)
@@ -452,7 +452,7 @@ def test_job_status_is_hidden_across_workspaces(client, flask_app):
 
 
 def test_authenticated_non_admin_can_poll_own_upload_job(flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user = store.create_user(
         email="person@example.com",
         password="person-pass",
@@ -524,7 +524,7 @@ def test_admin_deletes_user_and_all_scoped_data(client, flask_app, monkeypatch):
         lambda collection_name: deleted_collections.append(collection_name) or True,
     )
 
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     admin = store.create_user(
         email="admin@example.local",
         password="admin",
@@ -613,7 +613,7 @@ def test_admin_cannot_delete_self_or_user_with_active_jobs(client, flask_app, mo
         "_delete_chroma_collection",
         lambda _collection_name: pytest.fail("Chroma cleanup should not run"),
     )
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     admin = store.create_user(
         email="admin@example.local",
         password="admin",
@@ -664,7 +664,7 @@ def test_admin_cannot_delete_self_or_user_with_active_jobs(client, flask_app, mo
 
 def test_cleanup_failure_keeps_user_account(client, flask_app, monkeypatch):
     workspace_module = importlib.import_module("utils.workspace")
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     admin = store.create_user(
         email="admin@example.local",
         password="admin",
@@ -707,14 +707,14 @@ def test_cleanup_failure_keeps_user_account(client, flask_app, monkeypatch):
         },
         follow_redirects=True,
     )
-    assert b"cancellazione incompleta non pu" in reenabled.data
+    assert b"incomplete deletion cannot be re-enabled" in reenabled.data
     assert store.get(target["id"])["enabled"] is False
 
 
 def test_user_delete_preflight_failure_restores_original_account(tmp_path):
     from app.utils.user_store import UserDeletionPreflightError
 
-    store = UserStore(tmp_path / "users.json")
+    store = UserStore(tmp_path / "users.db")
     target = store.create_user(
         email="busy-direct@example.com",
         password="person-pass",
@@ -737,7 +737,7 @@ def test_user_delete_preflight_failure_restores_original_account(tmp_path):
 
 
 def test_admin_update_protects_current_account_and_reports_missing_user(client, flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     admin = store.create_user(
         email="admin@example.local",
         password="admin",

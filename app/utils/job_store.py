@@ -90,7 +90,7 @@ def ensure_knowledge_base_target_active(config: dict) -> None:
     from utils.knowledge_base_store import KnowledgeBaseStore
     from utils.user_store import UserStore
 
-    users_file = config.get("USERS_FILE")
+    users_file = config.get("USERS_DB")
     user_id = str(config.get("USER_ID") or "")
     if users_file and user_id:
         owner = UserStore(users_file).get(user_id)

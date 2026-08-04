@@ -4,7 +4,7 @@ RAGuardian is designed for personal RAG in a shared deployment. A company can ru
 
 ## Auth Model
 
-Local users live in `app/data/users.json` through `UserStore`.
+Local users live in `app/data/users.db` through `UserStore`.
 
 User fields:
 
@@ -155,9 +155,9 @@ python3 scripts/migrate_knowledge_bases.py --dry-run
 python3 scripts/migrate_knowledge_bases.py --apply
 ```
 
-Use `--workspace-root`, `--users-file`, and `--max-additional` when the
+Use `--workspace-root` and `--max-additional` when the
 deployment uses non-default paths. The script creates only the `default`
-catalog record, marks legacy data sources and API-key allowlists as default,
+catalog record, marks legacy data sources as default,
 and never moves files, copies collections, or regenerates embeddings. A
 corrupt catalog is reported and left untouched.
 

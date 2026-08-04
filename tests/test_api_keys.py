@@ -4,7 +4,7 @@ from app.utils.user_store import UserStore
 
 @pytest.fixture
 def user_store(tmp_path):
-    users_file = tmp_path / "users.json"
+    users_file = tmp_path / "users.db"
     store = UserStore(users_file)
     return store
 

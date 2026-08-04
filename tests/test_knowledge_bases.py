@@ -41,7 +41,7 @@ def flask_app(tmp_path, monkeypatch):
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
@@ -52,7 +52,7 @@ def flask_app(tmp_path, monkeypatch):
             "RATE_LIMIT_WINDOW": 60,
         }
     )
-    user = UserStore(app.config["USERS_FILE"]).create_user(
+    user = UserStore(app.config["USERS_DB"]).create_user(
         email="admin@example.local",
         password="admin",
         display_name="Admin",
@@ -163,7 +163,7 @@ def test_default_cors_methods_include_public_kb_patch(flask_app):
 
 
 def test_secondary_context_isolates_files_uploads_and_collection(flask_app):
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -245,7 +245,7 @@ def test_knowledge_base_rename_invalidates_cache_inside_scoped_writer(
         "/api/knowledge-bases",
         json={"name": "Cached name"},
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -310,7 +310,7 @@ def test_list_skips_a_knowledge_base_deleted_after_catalog_snapshot(
         "/api/knowledge-bases",
         json={"name": "Transient"},
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -415,7 +415,7 @@ def test_api_key_allowlist_is_fail_closed_and_manage_key_authorizes_created_kb(
     flask_app,
 ):
     existing = client.post("/api/knowledge-bases", json={"name": "Private"}).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     user_store.create_api_key(
         user_id=user_id,
@@ -508,7 +508,7 @@ def test_api_key_principal_wins_over_an_unrelated_browser_session(
     client,
     flask_app,
 ):
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     session_user = user_store.get(flask_app.config["TEST_USER_ID"])
     key_owner = user_store.create_user(
         email="key-owner@example.local",
@@ -562,7 +562,7 @@ def test_public_create_preserves_grants_added_after_authentication(
         json={"name": "Existing target"},
     ).get_json()
     user_id = flask_app.config["TEST_USER_ID"]
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=user_id,
         name="concurrent-manager",
@@ -609,7 +609,7 @@ def test_public_create_never_grants_a_replacement_key_with_the_same_name(
     monkeypatch,
 ):
     user_id = flask_app.config["TEST_USER_ID"]
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     original_key = user_store.create_api_key(
         user_id=user_id,
         name="replaceable-manager",
@@ -669,7 +669,7 @@ def test_public_create_rolls_back_catalog_when_api_key_grant_fails(
     monkeypatch,
 ):
     user_id = flask_app.config["TEST_USER_ID"]
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=user_id,
         name="broken-manager",
@@ -706,7 +706,7 @@ def test_public_create_rollback_preserves_an_inactive_tombstone(
     monkeypatch,
 ):
     user_id = flask_app.config["TEST_USER_ID"]
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=user_id,
         name="tombstone-manager",
@@ -761,7 +761,7 @@ def test_unauthorized_public_default_delete_is_hidden_before_default_conflict(
         json={"name": "Only target"},
     ).get_json()
     user_id = flask_app.config["TEST_USER_ID"]
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=user_id,
         name="secondary-manager",
@@ -811,7 +811,7 @@ def test_admin_can_create_a_manage_only_key_without_query_targets(
     )
 
     assert response.status_code == 200
-    key = UserStore(flask_app.config["USERS_FILE"]).get_api_key(
+    key = UserStore(flask_app.config["USERS_DB"]).get_api_key(
         user_id,
         "catalog-manager",
     )
@@ -985,7 +985,7 @@ def test_plural_query_uses_an_authorized_atomic_conversation_snapshot(
         "/api/knowledge-bases",
         json={"name": "Secret concurrent memory"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=flask_app.config["TEST_USER_ID"],
         name="snapshot-reader",
@@ -1050,7 +1050,7 @@ def test_unauthorized_remembered_kb_clears_an_unchanged_conversation(
         "/api/knowledge-bases",
         json={"name": "Revoked conversation KB"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=flask_app.config["TEST_USER_ID"],
         name="revoked-memory-reader",
@@ -1105,7 +1105,7 @@ def test_unauthorized_remembered_kb_does_not_clear_a_concurrent_append(
         "/api/knowledge-bases",
         json={"name": "Revoked concurrent KB"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_store.create_api_key(
         user_id=flask_app.config["TEST_USER_ID"],
         name="concurrent-memory-reader",
@@ -1191,7 +1191,7 @@ def test_plural_conversation_clear_rejects_invalid_selection(
 def test_public_plural_conversation_clear_rejects_invalid_selection(
     flask_app,
 ):
-    UserStore(flask_app.config["USERS_FILE"]).create_api_key(
+    UserStore(flask_app.config["USERS_DB"]).create_api_key(
         user_id=flask_app.config["TEST_USER_ID"],
         name="clear-reader",
         scopes=["query"],
@@ -1435,7 +1435,7 @@ def test_late_upload_worker_stops_before_writing_an_inactive_kb(
     monkeypatch,
 ):
     app_module = importlib.import_module("app.app")
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1485,7 +1485,7 @@ def test_late_rebuild_worker_stops_before_resetting_an_inactive_kb(
 ):
     app_module = importlib.import_module("app.app")
     chroma_manager = importlib.import_module("utils.chroma_manager")
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1584,7 +1584,7 @@ def test_text_stream_normalizes_collection_removal_before_headers(
     monkeypatch,
 ):
     rag_engine = importlib.import_module("utils.rag_engine")
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1622,7 +1622,7 @@ def test_ndjson_stream_normalizes_collection_removal_in_error_event(
     monkeypatch,
 ):
     rag_engine = importlib.import_module("utils.rag_engine")
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1713,7 +1713,7 @@ def test_session_job_status_is_derived_from_the_job_target(
     client,
     flask_app,
 ):
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1814,7 +1814,7 @@ def test_collection_cache_invalidation_clears_federated_sets_only_when_used(
 
 
 def test_catalog_json_has_no_secrets(flask_app):
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1885,7 +1885,7 @@ def test_delete_job_cascades_secondary_files_and_disables_empty_keys(
         lambda _collection: True,
     )
     created = client.post("/api/knowledge-bases", json={"name": "Temporary"}).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user = user_store.get(flask_app.config["TEST_USER_ID"])
     workspace = workspace_for_user(user, app=flask_app)
     context = knowledge_base_context(
@@ -1964,7 +1964,7 @@ def test_double_delete_reuses_one_admitted_job(
     assert first.status_code == second.status_code == 202
     assert first.get_json()["job_id"] == second.get_json()["job_id"]
     assert len(starts) == 1
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -1986,7 +1986,7 @@ def test_delete_worker_stops_live_mutations_after_lease_loss(
         "/api/knowledge-bases",
         json={"name": "Lease fenced delete"},
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -2060,7 +2060,7 @@ def test_api_key_cleanup_does_not_rollback_after_lease_loss(
     tmp_path,
 ):
     locks = importlib.import_module("utils.index_lock")
-    store = UserStore(str(tmp_path / "users.json"))
+    store = UserStore(str(tmp_path / "users.db"))
     user = store.create_user(
         email="lease@example.local",
         password="secret",
@@ -2142,7 +2142,7 @@ def test_inline_delete_retry_restarts_a_persisted_job_without_a_worker(
     with pytest.raises(SimulatedProcessCrash):
         client.delete(f"/api/knowledge-bases/{created['id']}")
 
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -2177,7 +2177,7 @@ def test_delete_removes_all_kb_owned_secrets_including_orphans(
         "/api/knowledge-bases",
         json={"name": "Secrets cleanup"},
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -2244,7 +2244,7 @@ def test_delete_uses_rq_when_the_queue_backend_is_redis(
     assert response.get_json()["status"] == "queued"
     assert enqueued[0][0] == response.get_json()["job_id"]
     assert enqueued[0][1]["KNOWLEDGE_BASE_ID"] == created["id"]
-    assert enqueued[0][1]["USERS_FILE"]
+    assert enqueued[0][1]["USERS_DB"]
 
 
 def test_duplicate_redis_delete_reconciles_a_job_crashed_before_enqueue(
@@ -2277,7 +2277,7 @@ def test_duplicate_redis_delete_reconciles_a_job_crashed_before_enqueue(
     with pytest.raises(SimulatedProcessCrash):
         client.delete(f"/api/knowledge-bases/{created['id']}")
 
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -2320,7 +2320,7 @@ def test_delete_reconciles_a_crash_after_catalog_and_api_key_cleanup(
         "/api/knowledge-bases",
         json={"name": "Finish cleanup"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     user_store.create_api_key(
         user_id=user_id,
@@ -2424,7 +2424,7 @@ def test_public_delete_recovers_a_tombstone_after_key_cleanup_and_job_loss(
         "/api/knowledge-bases",
         json={"name": "Recover lost job"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     user = user_store.get(user_id)
     workspace = workspace_for_user(user, app=flask_app)
@@ -2620,7 +2620,7 @@ def test_public_delete_job_remains_pollable_by_target_only_manager(
         "/api/knowledge-bases",
         json={"name": "API managed"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     initiating_key = user_store.create_api_key(
         user_id=user_id,
@@ -2689,7 +2689,7 @@ def test_late_delete_failure_keeps_public_manager_authorized_for_retry(
         "/api/knowledge-bases",
         json={"name": "Retry late failure"},
     ).get_json()
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     user_store.create_api_key(
         user_id=user_id,
@@ -2773,7 +2773,7 @@ def test_api_key_cleanup_failure_keeps_delete_tombstone_retryable(
     )
 
     failed = client.delete(f"/api/knowledge-bases/{created['id']}")
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)
@@ -2811,7 +2811,7 @@ def test_delete_job_creation_failure_leaves_an_active_kb_available(
     with pytest.raises(RuntimeError, match="job backend unavailable"):
         client.delete(f"/api/knowledge-bases/{created['id']}")
 
-    user = UserStore(flask_app.config["USERS_FILE"]).get(
+    user = UserStore(flask_app.config["USERS_DB"]).get(
         flask_app.config["TEST_USER_ID"]
     )
     workspace = workspace_for_user(user, app=flask_app)

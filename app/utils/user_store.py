@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import re
 import secrets
-import tempfile
-import threading
+import sqlite3
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from utils.file_lock import ProcessSafeFileLock
+from db.connection import get_connection
+from db.migrations import init_schema
+from utils.settings_store import API_SCOPES, API_SCOPES_REQUIRING_KB
 
 
 USER_ROLES = {"admin", "user"}
@@ -28,41 +29,80 @@ class UserDeletionPreflightError(RuntimeError):
 
 
 class UserStore:
-    """JSON-backed local user store for personal RAG accounts."""
+    """SQLite-backed local user store for personal RAG accounts.
 
-    _locks: dict[str, ProcessSafeFileLock] = {}
-    _locks_guard = threading.Lock()
+    Each UserStore instance points to a single ``.db`` file. The schema is
+    created automatically on first use via ``init_schema``.
+
+    The store manages two kinds of records:
+      * **Users**   - email/password accounts with a role (admin/user).
+      * **API keys** - per-user tokens with scopes and knowledge-base access.
+
+    Connections are short-lived: every method opens a connection, does its
+    work, commits, and closes. This keeps the code simple and avoids locking
+    issues in a multi-threaded web server (gunicorn).
+    """
 
     def __init__(self, path: Optional[str] = None):
-        configured = path or os.getenv("RAG_USERS_FILE", "app/data/users.json")
+        configured = path or os.getenv("RAG_USERS_DB", "app/data/users.db")
         self.path = Path(configured)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._locks_guard:
-            lock_key = str(self.path.resolve())
-            self._lock = self._locks.setdefault(
-                lock_key,
-                ProcessSafeFileLock(self.path.with_suffix(self.path.suffix + ".lock")),
-            )
+        init_schema(self.path)
+
+    @contextmanager
+    def _connect(self):
+        """Open a connection, yield it, and always close it when done."""
+        conn = get_connection(self.path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # User CRUD
+    # ------------------------------------------------------------------
 
     def list(self) -> list[dict]:
-        with self._lock:
-            return self._public_list_unlocked()
+        """Return all users (without password hashes), newest last."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY created_at"
+            ).fetchall()
+            result = []
+            for row in rows:
+                user = _row_to_user(row)
+                user["api_keys"] = self._load_api_keys(conn, user["id"])
+                result.append(_public_user(user))
+            return result
 
     def get(self, user_id: str) -> Optional[dict]:
-        for user in self.list():
-            if user.get("id") == user_id:
-                return user
-        return None
+        """Return a single user by id, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            user = _row_to_user(row)
+            user["api_keys"] = self._load_api_keys(conn, user_id)
+            return _public_user(user)
 
     def get_by_email(self, email: str) -> Optional[dict]:
         normalized = normalize_email(email)
-        for user in self.list():
-            if user.get("email") == normalized:
-                return user
-        return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE email = ?", (normalized,)
+            ).fetchone()
+            if row is None:
+                return None
+            user = _row_to_user(row)
+            user["api_keys"] = self._load_api_keys(conn, user["id"])
+            return _public_user(user)
 
     def has_users(self) -> bool:
-        return bool(self.list())
+        with self._connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            return count > 0
 
     def create_user(
         self,
@@ -79,66 +119,122 @@ class UserStore:
             raise ValueError("email is required")
         if not password:
             raise ValueError("password is required")
-        with self._lock:
-            users = self._list_unlocked()
-            if any(user.get("email") == email for user in users):
-                raise ValueError("email already exists")
-            user = _user_record(
-                email=email,
-                password=password,
-                display_name=display_name,
-                role=role,
-                enabled=enabled,
-            )
-            users.append(user)
-            self._save_unlocked(users)
-            return _public_user(user)
+        user = _user_record(
+            email=email,
+            password=password,
+            display_name=display_name,
+            role=role,
+            enabled=enabled,
+        )
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users
+                        (id, email, display_name, password_hash, role,
+                         enabled, created_at, updated_at, deletion_status,
+                         deletion_error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')
+                    """,
+                    (
+                        user["id"],
+                        user["email"],
+                        user["display_name"],
+                        user["password_hash"],
+                        user["role"],
+                        1 if user["enabled"] else 0,
+                        user["created_at"],
+                        user["updated_at"],
+                    ),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError as exc:
+                if "email" in str(exc).lower():
+                    raise ValueError("email already exists") from exc
+                raise
+        return _public_user(user)
 
     def update_user(self, user_id: str, **patch) -> Optional[dict]:
-        with self._lock:
-            users = self._list_unlocked()
-            changed = None
-            for index, user in enumerate(users):
-                if user.get("id") != user_id:
-                    continue
-                if "display_name" in patch:
-                    user["display_name"] = str(patch["display_name"] or user.get("email") or "").strip()
-                if "role" in patch and patch["role"] in USER_ROLES:
-                    user["role"] = patch["role"]
-                if "enabled" in patch:
-                    if (
-                        patch["enabled"]
-                        and user.get("deletion_status")
-                        in USER_DELETION_STATUSES
-                    ):
-                        raise ValueError(
-                            "Un utente con cancellazione incompleta non può "
-                            "essere riabilitato; ripeti la cancellazione"
-                        )
-                    user["enabled"] = bool(patch["enabled"])
-                if patch.get("password"):
-                    user["password_hash"] = generate_password_hash(str(patch["password"]))
-                user["updated_at"] = _now()
-                users[index] = user
-                changed = _public_user(user)
-                break
-            if changed:
-                self._save_unlocked(users)
-            return changed
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            user = _row_to_user(row)
+
+            sets: list[str] = []
+            params: list = []
+
+            if "display_name" in patch:
+                user["display_name"] = str(
+                    patch["display_name"] or user.get("email") or ""
+                ).strip()
+                sets.append("display_name = ?")
+                params.append(user["display_name"])
+
+            if "role" in patch and patch["role"] in USER_ROLES:
+                user["role"] = patch["role"]
+                sets.append("role = ?")
+                params.append(user["role"])
+
+            if "enabled" in patch:
+                if patch["enabled"] and user.get("deletion_status") in USER_DELETION_STATUSES:
+                    raise ValueError(
+                        "A user with an incomplete deletion cannot be re-enabled; "
+                        "retry the deletion"
+                    )
+                user["enabled"] = bool(patch["enabled"])
+                sets.append("enabled = ?")
+                params.append(1 if user["enabled"] else 0)
+
+            if patch.get("password"):
+                new_hash = generate_password_hash(str(patch["password"]))
+                user["password_hash"] = new_hash
+                sets.append("password_hash = ?")
+                params.append(new_hash)
+
+            sets.append("updated_at = ?")
+            params.append(now)
+            params.append(user_id)
+
+            conn.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE id = ?", params
+            )
+            conn.commit()
+
+            user["updated_at"] = now
+            user["api_keys"] = self._load_api_keys(conn, user_id)
+            return _public_user(user)
 
     def authenticate(self, email: str, password: str) -> Optional[dict]:
+        """Return the user if email+password match and the account is enabled."""
         email = normalize_email(email)
-        with self._lock:
-            for user in self._list_unlocked():
-                if user.get("email") != email or not user.get("enabled", True):
-                    continue
-                if check_password_hash(user.get("password_hash", ""), password):
-                    return _public_user(user)
-        return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE email = ? AND enabled = 1",
+                (email,),
+            ).fetchone()
+            if row is None:
+                return None
+            if not check_password_hash(row["password_hash"], password):
+                return None
+            user = _row_to_user(row)
+            user["api_keys"] = self._load_api_keys(conn, user["id"])
+            return _public_user(user)
 
     def bootstrap_admin_if_empty(self, *, email: str, password: str) -> dict | None:
-        with self._lock:
-            if self._list_unlocked():
+        """Create the first admin user if the database is empty.
+
+        Returns the new admin user dict, or None if users already exist.
+        Uses BEGIN IMMEDIATE so two concurrent startups cannot create two admins.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            if count > 0:
+                conn.rollback()
                 return None
             user = _user_record(
                 email=normalize_email(email or "admin@example.local"),
@@ -147,54 +243,84 @@ class UserStore:
                 role="admin",
                 enabled=True,
             )
-            self._save_unlocked([user])
+            conn.execute(
+                """
+                INSERT INTO users
+                    (id, email, display_name, password_hash, role,
+                     enabled, created_at, updated_at, deletion_status,
+                     deletion_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')
+                """,
+                (
+                    user["id"],
+                    user["email"],
+                    user["display_name"],
+                    user["password_hash"],
+                    user["role"],
+                    1,
+                    user["created_at"],
+                    user["updated_at"],
+                ),
+            )
+            conn.commit()
             return _public_user(user)
 
+    # ------------------------------------------------------------------
+    # API key CRUD
+    #
+    # API keys are stored as SHA-256 hashes (never plaintext).
+    # The raw key is returned to the caller only once, at creation time.
+    # ------------------------------------------------------------------
+
     def get_api_keys(self, user_id: str, *, include_raw: bool = False) -> list[dict]:
-        """Return API keys for a user with raw values hidden by default."""
-        with self._lock:
-            for user in self._list_unlocked():
-                if user.get("id") != user_id:
-                    continue
-                return [
-                    _public_api_key(key, user_id=user_id, include_raw=include_raw)
-                    for key in (user.get("api_keys") or [])
-                ]
-        return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? ORDER BY created_at",
+                (user_id,),
+            ).fetchall()
+            return [
+                _public_api_key(_row_to_api_key(row), user_id=user_id, include_raw=include_raw)
+                for row in rows
+            ]
 
     def get_api_key(self, user_id: str, key_name: str, *, include_raw: bool = False) -> dict | None:
-        """Return one API key by name, hiding the raw value unless requested."""
-        with self._lock:
-            for user in self._list_unlocked():
-                if user.get("id") != user_id:
-                    continue
-                for key in (user.get("api_keys") or []):
-                    if key.get("name") == key_name:
-                        return _public_api_key(key, user_id=user_id, include_raw=include_raw)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
                 return None
-        return None
+            return _public_api_key(_row_to_api_key(row), user_id=user_id, include_raw=include_raw)
 
     def update_api_key_usage(self, user_id: str, key_name: str, *, extra: dict | None = None) -> None:
-        """Update last_used and usage_count for a named API key."""
         if not extra:
             extra = {}
-        with self._lock:
-            users = self._list_unlocked()
-            for user in users:
-                if user.get("id") != user_id:
-                    continue
-                for key in (user.get("api_keys") or []):
-                    if key.get("name") == key_name and key.get("enabled", True):
-                        key["last_used"] = _now()
-                        key["usage_count"] = key.get("usage_count", 0) + 1
-                        key.update(extra)
-                        user["updated_at"] = _now()
-                        break
-                else:
-                    continue
-                self._save_unlocked(users)
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ? AND enabled = 1",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
                 return
-            # Key not found -- no-op
+            new_count = row["usage_count"] + 1
+            conn.execute(
+                "UPDATE api_keys SET last_used = ?, usage_count = ? WHERE id = ?",
+                (now, new_count, row["id"]),
+            )
+            for k, v in extra.items():
+                if k in ("last_used", "usage_count"):
+                    continue
+                conn.execute(
+                    f"UPDATE api_keys SET {k} = ? WHERE id = ?",
+                    (v, row["id"]),
+                )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
 
     def create_api_key(
         self,
@@ -209,7 +335,12 @@ class UserStore:
         expires_at: str | None = None,
         validate: Callable[[], None] | None = None,
     ) -> dict:
-        """Create a new API key for a user. Returns the key with masked value."""
+        """Create a new API key for a user.
+
+        The raw key value is generated automatically (or uses the provided
+        one). It is returned in the result dict under ``"key"`` so the caller
+        can show it once to the user. Only the hash is stored in the database.
+        """
         name = name.strip()
         if not name:
             raise ValueError("name is required")
@@ -223,7 +354,7 @@ class UserStore:
             knowledge_base_ids
         )
         if (
-            {"query", "ingest", "agent_manage"} & set(normalized_scopes)
+            API_SCOPES_REQUIRING_KB & set(normalized_scopes)
             and not normalized_knowledge_base_ids
         ):
             raise ValueError(
@@ -245,22 +376,50 @@ class UserStore:
             "expires_at": expires_at,
         }
 
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                if validate is not None:
-                    validate()
-                existing = usr.get("api_keys") or []
-                if any(k.get("name") == new_key["name"] for k in existing):
-                    raise ValueError(f"API key name '{new_key['name']}' already exists for this user")
-                usr["api_keys"] = existing + [new_key]
-                usr["updated_at"] = now
-                self._save_unlocked(users)
-                break
-            else:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if user_row is None:
                 raise ValueError("User not found")
+            if validate is not None:
+                validate()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO api_keys
+                        (id, user_id, name, key_hash, key_prefix, key_suffix,
+                         scopes, knowledge_base_ids, enabled, created_at,
+                         last_used, usage_count, description, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_key["id"],
+                        user_id,
+                        new_key["name"],
+                        new_key["key_hash"],
+                        new_key["key_prefix"],
+                        new_key["key_suffix"],
+                        json.dumps(new_key["scopes"]),
+                        json.dumps(new_key["knowledge_base_ids"]),
+                        1 if new_key["enabled"] else 0,
+                        new_key["created_at"],
+                        new_key["last_used"],
+                        new_key["usage_count"],
+                        new_key["description"],
+                        new_key["expires_at"],
+                    ),
+                )
+                conn.execute(
+                    "UPDATE users SET updated_at = ? WHERE id = ?",
+                    (now, user_id),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                raise ValueError(
+                    f"API key name '{new_key['name']}' already exists for this user"
+                )
 
         return {
             "name": new_key["name"],
@@ -276,41 +435,47 @@ class UserStore:
         }
 
     def toggle_api_key_enabled(self, *, user_id: str, key_name: str, enabled: bool | None = None) -> dict | None:
-        """Toggle enabled state for an API key. Returns updated key or None."""
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") == key_name:
-                        if enabled is None:
-                            key["enabled"] = not key.get("enabled", True)
-                        else:
-                            key["enabled"] = bool(enabled)
-                        break
-                else:
-                    return None
-                usr["updated_at"] = _now()
-                self._save_unlocked(users)
-                return _public_api_key(key, user_id=user_id)
-            return None
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
+                return None
+            if enabled is None:
+                new_enabled = not bool(row["enabled"])
+            else:
+                new_enabled = bool(enabled)
+            conn.execute(
+                "UPDATE api_keys SET enabled = ? WHERE id = ?",
+                (1 if new_enabled else 0, row["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["enabled"] = new_enabled
+            return _public_api_key(key, user_id=user_id)
 
     def delete_api_key(self, *, user_id: str, key_name: str) -> bool:
-        """Delete an API key for a user. Returns True if found and deleted."""
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                original = usr.get("api_keys") or []
-                usr["api_keys"] = [k for k in original if k.get("name") != key_name]
-                if len(usr["api_keys"]) == len(original):
-                    return False
-                usr["updated_at"] = _now()
-                self._save_unlocked(users)
-                return True
-            return False
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM api_keys WHERE id = ?", (row["id"],))
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            return True
 
     def delete_user(
         self,
@@ -318,163 +483,191 @@ class UserStore:
         *,
         before_delete: Callable[[dict], None] | None = None,
     ) -> bool:
-        """Delete a user after an optional cleanup succeeds."""
-        if before_delete is None:
-            with self._lock:
-                users = self._list_unlocked()
-                if not any(user.get("id") == user_id for user in users):
-                    return False
-                users = [
-                    user for user in users if user.get("id") != user_id
-                ]
-                self._save_unlocked(users)
-                return True
+        """Delete a user and (optionally) run a preflight callback first.
 
-        with self._lock:
-            users = self._list_unlocked()
-            target = next((user for user in users if user.get("id") == user_id), None)
-            if target is None:
+        If before_delete is None, the user is deleted immediately.
+
+        If before_delete is provided, the deletion happens in 3 phases:
+          1. Mark the user as "deleting" (disabled) in the DB.
+          2. Run the before_delete callback (no DB connection held).
+             - If it raises UserDeletionPreflightError, restore the user.
+             - If it raises any other Exception, mark as "delete_failed".
+          3. Actually delete the user row (cascade removes API keys).
+
+        This phased approach lets the caller clean up external resources
+        (ChromaDB collections, workspace files, etc.) before the user row
+        is removed, while still being safe if the callback fails.
+        """
+        if before_delete is None:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM users WHERE id = ?", (user_id,)
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+        # Phase 1: mark as deleting
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if row is None:
                 return False
-            original_target = deepcopy(target)
+            original = _row_to_user(row)
+            original["api_keys"] = self._load_api_keys(conn, user_id)
+            now = _now()
+            conn.execute(
+                """
+                UPDATE users SET enabled = 0, deletion_status = 'deleting',
+                                 deletion_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, user_id),
+            )
+            conn.commit()
+            target = deepcopy(original)
             target["enabled"] = False
             target["deletion_status"] = "deleting"
             target["deletion_error"] = ""
-            target["updated_at"] = _now()
-            self._save_unlocked(users)
 
+        # Phase 2: run preflight callback (no connection held)
         try:
             before_delete(_public_user(target))
         except UserDeletionPreflightError:
-            with self._lock:
-                users = self._list_unlocked()
-                for index, current in enumerate(users):
-                    if current.get("id") == user_id:
-                        users[index] = original_target
-                        self._save_unlocked(users)
-                        break
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE users SET enabled = ?, deletion_status = ?,
+                                     deletion_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        1 if original["enabled"] else 0,
+                        original.get("deletion_status", ""),
+                        original.get("deletion_error", ""),
+                        _now(),
+                        user_id,
+                    ),
+                )
+                conn.commit()
             raise
         except Exception as exc:
-            with self._lock:
-                users = self._list_unlocked()
-                current = next(
-                    (user for user in users if user.get("id") == user_id),
-                    None,
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE users SET enabled = 0,
+                                 deletion_status = 'delete_failed',
+                                 deletion_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(exc), _now(), user_id),
                 )
-                if current is not None:
-                    current["enabled"] = False
-                    current["deletion_status"] = "delete_failed"
-                    current["deletion_error"] = str(exc)
-                    current["updated_at"] = _now()
-                    self._save_unlocked(users)
+                conn.commit()
             raise
 
-        with self._lock:
-            users = self._list_unlocked()
-            if not any(user.get("id") == user_id for user in users):
-                return False
-            users = [user for user in users if user.get("id") != user_id]
-            self._save_unlocked(users)
-            return True
+        # Phase 3: actually delete
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM users WHERE id = ?", (user_id,)
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
     def rotate_api_key(self, *, user_id: str, key_name: str) -> dict | None:
-        """Generate a new raw key value. Returns updated key or None."""
         new_key = _generate_api_key()
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") == key_name:
-                        key.pop("key", None)
-                        key["key_hash"] = api_key_hash(new_key)
-                        key["key_prefix"] = new_key[:8]
-                        key["key_suffix"] = new_key[-4:]
-                        break
-                else:
-                    return None
-                usr["updated_at"] = _now()
-                self._save_unlocked(users)
-                return {**_public_api_key(key, user_id=user_id), "key": new_key}
-            return None
-
-    def migrate_legacy_api_keys(self) -> int:
-        """Hash legacy keys and make their default-only access explicit."""
-        migrated = 0
-        with self._lock:
-            users = self._list_unlocked()
-            for user in users:
-                for key in user.get("api_keys") or []:
-                    changed = False
-                    if not key.get("id"):
-                        key["id"] = uuid.uuid4().hex
-                        changed = True
-                    raw = str(key.pop("key", "") or "")
-                    if raw:
-                        key["key_hash"] = api_key_hash(raw)
-                        key["key_prefix"] = raw[:8]
-                        key["key_suffix"] = raw[-4:]
-                        changed = True
-                    if "knowledge_base_ids" not in key:
-                        key["knowledge_base_ids"] = ["default"]
-                        changed = True
-                    if changed:
-                        migrated += 1
-            if migrated:
-                self._save_unlocked(users)
-        return migrated
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE api_keys SET key_hash = ?, key_prefix = ?, key_suffix = ?
+                WHERE id = ?
+                """,
+                (api_key_hash(new_key), new_key[:8], new_key[-4:], row["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["key_hash"] = api_key_hash(new_key)
+            key["key_prefix"] = new_key[:8]
+            key["key_suffix"] = new_key[-4:]
+            result = _public_api_key(key, user_id=user_id)
+            result["key"] = new_key
+            return result
 
     def update_api_key_name(self, *, user_id: str, key_name: str, new_name: str) -> dict | None:
-        """Rename an API key. Returns updated key or None."""
         new_name = new_name.strip()
         if not new_name:
             raise ValueError("new_name is required")
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                if any(k.get("name") == new_name and k.get("name") != key_name for k in (usr.get("api_keys") or [])):
-                    raise ValueError(f"API key name '{new_name}' already exists for this user")
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") == key_name:
-                        key["name"] = new_name
-                        break
-                else:
-                    return None
-                usr["updated_at"] = _now()
-                self._save_unlocked(users)
-                return _public_api_key(key, user_id=user_id)
-            return None
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
+                return None
+            dup = conn.execute(
+                "SELECT id FROM api_keys WHERE user_id = ? AND name = ? AND id != ?",
+                (user_id, new_name, row["id"]),
+            ).fetchone()
+            if dup is not None:
+                raise ValueError(
+                    f"API key name '{new_name}' already exists for this user"
+                )
+            conn.execute(
+                "UPDATE api_keys SET name = ? WHERE id = ?",
+                (new_name, row["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["name"] = new_name
+            return _public_api_key(key, user_id=user_id)
 
     def update_api_key_scopes(self, *, user_id: str, key_name: str, scopes: list[str]) -> dict | None:
-        """Update scopes for an API key. Returns updated key or None."""
         normalized = self._normalize_api_scopes(scopes)
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") == key_name:
-                        knowledge_base_ids = self._normalize_knowledge_base_ids(
-                            key.get("knowledge_base_ids")
-                        )
-                        if (
-                            {"query", "ingest", "agent_manage"} & set(normalized)
-                            and not knowledge_base_ids
-                        ):
-                            raise ValueError(
-                                "At least one knowledge base is required for query, ingest, or agent_manage"
-                            )
-                        key["scopes"] = normalized
-                        break
-                else:
-                    return None
-                usr["updated_at"] = _now()
-                self._save_unlocked(users)
-                return _public_api_key(key, user_id=user_id)
-            return None
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
+                return None
+            knowledge_base_ids = self._normalize_knowledge_base_ids(
+                json.loads(row["knowledge_base_ids"] or "[]")
+            )
+            if (
+                API_SCOPES_REQUIRING_KB & set(normalized)
+                and not knowledge_base_ids
+            ):
+                raise ValueError(
+                    "At least one knowledge base is required for query, ingest, or agent_manage"
+                )
+            conn.execute(
+                "UPDATE api_keys SET scopes = ? WHERE id = ?",
+                (json.dumps(normalized), row["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["scopes"] = normalized
+            return _public_api_key(key, user_id=user_id)
 
     def update_api_key_knowledge_bases(
         self,
@@ -484,25 +677,31 @@ class UserStore:
         knowledge_base_ids: list[str],
     ) -> dict | None:
         normalized = self._normalize_knowledge_base_ids(knowledge_base_ids)
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") != key_name:
-                        continue
-                    scopes = set(key.get("scopes") or ["query"])
-                    if {"query", "ingest", "agent_manage"} & scopes and not normalized:
-                        raise ValueError(
-                            "At least one knowledge base is required for query, ingest, or agent_manage"
-                        )
-                    key["knowledge_base_ids"] = normalized
-                    usr["updated_at"] = _now()
-                    self._save_unlocked(users)
-                    return _public_api_key(key, user_id=user_id)
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
                 return None
-            return None
+            scopes = set(json.loads(row["scopes"] or "[]")) or {"query"}
+            if API_SCOPES_REQUIRING_KB & scopes and not normalized:
+                raise ValueError(
+                    "At least one knowledge base is required for query, ingest, or agent_manage"
+                )
+            conn.execute(
+                "UPDATE api_keys SET knowledge_base_ids = ? WHERE id = ?",
+                (json.dumps(normalized), row["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["knowledge_base_ids"] = normalized
+            return _public_api_key(key, user_id=user_id)
 
     def update_api_key_access(
         self,
@@ -513,36 +712,48 @@ class UserStore:
         knowledge_base_ids: list[str],
         validate: Callable[[], None] | None = None,
     ) -> dict | None:
-        """Atomically update scopes and KB grants after in-lock validation."""
-
         normalized_scopes = self._normalize_api_scopes(scopes)
         normalized_knowledge_base_ids = self._normalize_knowledge_base_ids(
             knowledge_base_ids
         )
         if (
-            {"query", "ingest", "agent_manage"} & set(normalized_scopes)
+            API_SCOPES_REQUIRING_KB & set(normalized_scopes)
             and not normalized_knowledge_base_ids
         ):
             raise ValueError(
                 "At least one knowledge base is required for query, ingest, or agent_manage"
             )
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key.get("name") != key_name:
-                        continue
-                    if validate is not None:
-                        validate()
-                    key["scopes"] = normalized_scopes
-                    key["knowledge_base_ids"] = normalized_knowledge_base_ids
-                    usr["updated_at"] = _now()
-                    self._save_unlocked(users)
-                    return _public_api_key(key, user_id=user_id)
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                (user_id, key_name),
+            ).fetchone()
+            if row is None:
                 return None
-            return None
+            if validate is not None:
+                validate()
+            conn.execute(
+                """
+                UPDATE api_keys SET scopes = ?, knowledge_base_ids = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(normalized_scopes),
+                    json.dumps(normalized_knowledge_base_ids),
+                    row["id"],
+                ),
+            )
+            conn.execute(
+                "UPDATE users SET updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            conn.commit()
+            key = _row_to_api_key(row)
+            key["scopes"] = normalized_scopes
+            key["knowledge_base_ids"] = normalized_knowledge_base_ids
+            return _public_api_key(key, user_id=user_id)
 
     def add_knowledge_base_to_api_key(
         self,
@@ -554,70 +765,48 @@ class UserStore:
         required_scope: str | None = None,
         validate: Callable[[], None] | None = None,
     ) -> dict | None:
-        """Grant one KB without replacing grants added by concurrent writers."""
         normalized_id = self._normalize_knowledge_base_ids(
             [knowledge_base_id]
         )[0]
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                for key in (usr.get("api_keys") or []):
-                    if key_id:
-                        if str(key.get("id") or "") != str(key_id):
-                            continue
-                    elif key.get("name") != key_name:
-                        continue
-                    if not key.get("enabled", True):
-                        return None
-                    if (
-                        required_scope
-                        and required_scope not in set(key.get("scopes") or [])
-                    ):
-                        return None
-                    if validate is not None:
-                        validate()
-                    allowed = self._normalize_knowledge_base_ids(
-                        key.get("knowledge_base_ids")
-                    )
-                    if normalized_id not in allowed:
-                        allowed.append(normalized_id)
-                        key["knowledge_base_ids"] = allowed
-                        usr["updated_at"] = _now()
-                        self._save_unlocked(users)
-                    return _public_api_key(key, user_id=user_id)
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if key_id:
+                row = conn.execute(
+                    "SELECT * FROM api_keys WHERE user_id = ? AND id = ?",
+                    (user_id, str(key_id)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM api_keys WHERE user_id = ? AND name = ?",
+                    (user_id, key_name),
+                ).fetchone()
+            if row is None:
                 return None
-            return None
-
-    def ensure_api_key_knowledge_base_ids(
-        self,
-        *,
-        default_knowledge_base_id: str = "default",
-        user_ids: set[str] | None = None,
-    ) -> int:
-        """Make legacy API-key KB grants explicit under the users-file lock."""
-        normalized_default = self._normalize_knowledge_base_ids(
-            [default_knowledge_base_id]
-        )
-        updated = 0
-        with self._lock:
-            users = self._list_unlocked()
-            for usr in users:
-                if user_ids is not None and str(usr.get("id") or "") not in user_ids:
-                    continue
-                user_changed = False
-                for key in (usr.get("api_keys") or []):
-                    if "knowledge_base_ids" in key:
-                        continue
-                    key["knowledge_base_ids"] = list(normalized_default)
-                    updated += 1
-                    user_changed = True
-                if user_changed:
-                    usr["updated_at"] = _now()
-            if updated:
-                self._save_unlocked(users)
-        return updated
+            if not row["enabled"]:
+                return None
+            scopes = set(json.loads(row["scopes"] or "[]"))
+            if required_scope and required_scope not in scopes:
+                return None
+            if validate is not None:
+                validate()
+            allowed = self._normalize_knowledge_base_ids(
+                json.loads(row["knowledge_base_ids"] or "[]")
+            )
+            if normalized_id not in allowed:
+                allowed.append(normalized_id)
+                conn.execute(
+                    "UPDATE api_keys SET knowledge_base_ids = ? WHERE id = ?",
+                    (json.dumps(allowed), row["id"]),
+                )
+                conn.execute(
+                    "UPDATE users SET updated_at = ? WHERE id = ?",
+                    (now, user_id),
+                )
+                conn.commit()
+            key = _row_to_api_key(row)
+            key["knowledge_base_ids"] = allowed
+            return _public_api_key(key, user_id=user_id)
 
     def remove_knowledge_base_from_api_keys(
         self,
@@ -627,72 +816,175 @@ class UserStore:
         finalize: Callable[[], None] | None = None,
         lease_check: Callable[[], None] | None = None,
     ) -> dict:
+        """Remove a knowledge base from all of a user's API keys.
+
+        If removing it would leave a key with no knowledge bases and a scope
+        that requires one (query/ingest/agent_manage), that key is disabled.
+
+        Two-phase commit with an optional finalize callback:
+          Phase 1: update the DB under a transaction.
+          Phase 2: call finalize() (no DB connection held).
+        If finalize raises, the changes are rolled back.
+        """
         from utils.index_lock import DistributedLockLeaseLostError
 
         updated = 0
         disabled = 0
-        with self._lock:
-            users = self._list_unlocked()
-            original_users = deepcopy(users)
-            owner_found = False
-            for usr in users:
-                if usr.get("id") != user_id:
-                    continue
-                owner_found = True
-                for key in (usr.get("api_keys") or []):
-                    allowed = self._normalize_knowledge_base_ids(
-                        key.get("knowledge_base_ids")
-                    )
-                    if knowledge_base_id not in allowed:
-                        continue
-                    key["knowledge_base_ids"] = [
-                        item for item in allowed if item != knowledge_base_id
-                    ]
-                    updated += 1
-                    scopes = set(key.get("scopes") or ["query"])
-                    if (
-                        not key["knowledge_base_ids"]
-                        and (
-                            bool({"query", "ingest", "agent_manage"} & scopes)
-                            or "kb_manage" not in scopes
-                        )
-                    ):
-                        key["enabled"] = False
-                        disabled += 1
-                if updated:
-                    usr["updated_at"] = _now()
-                    if lease_check is not None:
-                        lease_check()
-                    self._save_unlocked(users)
-                break
-            if not owner_found:
+        now = _now()
+
+        # Phase 1: read and modify under transaction
+        originals: list[dict] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if user_row is None:
                 raise ValueError("User not found")
-            try:
+            key_rows = conn.execute(
+                "SELECT * FROM api_keys WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            for row in key_rows:
+                allowed = self._normalize_knowledge_base_ids(
+                    json.loads(row["knowledge_base_ids"] or "[]")
+                )
+                if knowledge_base_id not in allowed:
+                    continue
+                originals.append(_row_to_api_key(row))
+                new_allowed = [item for item in allowed if item != knowledge_base_id]
+                updated += 1
+                scopes = set(json.loads(row["scopes"] or "[]")) or {"query"}
+                new_enabled = bool(row["enabled"])
+                if (
+                    not new_allowed
+                    and (
+                        bool(API_SCOPES_REQUIRING_KB & scopes)
+                        or "kb_manage" not in scopes
+                    )
+                ):
+                    new_enabled = False
+                    disabled += 1
+                conn.execute(
+                    """
+                    UPDATE api_keys SET knowledge_base_ids = ?, enabled = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(new_allowed), 1 if new_enabled else 0, row["id"]),
+                )
+            if updated:
                 if lease_check is not None:
                     lease_check()
-                if finalize is not None:
-                    finalize()
-            except DistributedLockLeaseLostError:
-                # A rollback is itself a live write. Once the lease is known
-                # to be lost, leave recovery to the next protected run.
-                raise
-            except Exception:
-                if updated:
-                    try:
-                        self._save_unlocked(original_users)
-                    except Exception as rollback_exc:
-                        raise RuntimeError(
-                            "API key cleanup failed and rollback was not completed"
-                        ) from rollback_exc
-                raise
+                conn.execute(
+                    "UPDATE users SET updated_at = ? WHERE id = ?",
+                    (now, user_id),
+                )
+                conn.commit()
+            else:
+                conn.rollback()
+
+        # Phase 2: finalize callback (no connection held)
+        try:
+            if lease_check is not None:
+                lease_check()
+            if finalize is not None:
+                finalize()
+        except DistributedLockLeaseLostError:
+            raise
+        except Exception:
+            if updated:
+                with self._connect() as conn:
+                    for orig in originals:
+                        conn.execute(
+                            """
+                            UPDATE api_keys SET knowledge_base_ids = ?,
+                                                 enabled = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                json.dumps(orig["knowledge_base_ids"]),
+                                1 if orig["enabled"] else 0,
+                                orig["id"],
+                            ),
+                        )
+                    conn.execute(
+                        "UPDATE users SET updated_at = ? WHERE id = ?",
+                        (now, user_id),
+                    )
+                    conn.commit()
+            raise
+
         return {
             "updated": updated,
             "disabled": disabled,
         }
 
+    # ------------------------------------------------------------------
+    # API key lookup by raw value
+    #
+    # This is the authentication path: given a raw API key from the
+    # X-API-Key header, find the matching (enabled) key+user in the DB.
+    # The lookup is by SHA-256 hash, never by plaintext comparison.
+    # ------------------------------------------------------------------
+
+    def find_api_key_by_value(self, value: str) -> Optional[dict]:
+        """Find an enabled API key by its raw value across all enabled users.
+
+        Returns None if the key is not found, disabled, expired, or belongs
+        to a disabled user. The returned dict includes ``user_id`` and
+        ``api_key_id`` so the caller can attribute the request.
+        """
+        if not value:
+            return None
+        target_hash = api_key_hash(value)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ak.*, u.id AS u_id, u.enabled AS u_enabled
+                FROM api_keys ak
+                JOIN users u ON ak.user_id = u.id
+                WHERE ak.key_hash = ? AND ak.enabled = 1 AND u.enabled = 1
+                """,
+                (target_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            expires_at = row["expires_at"]
+            if expires_at and _is_expired(expires_at):
+                return None
+            scopes = json.loads(row["scopes"] or "[]")
+            knowledge_base_ids = json.loads(row["knowledge_base_ids"] or "[]")
+            return {
+                "name": row["name"],
+                "key": value,
+                "enabled": True,
+                "scopes": scopes,
+                "knowledge_base_ids": knowledge_base_ids,
+                "can_upload": "ingest" in scopes,
+                "user_id": row["u_id"],
+                "api_key_id": row["id"] or row["name"],
+                "_user_key_name": row["name"],
+                "_user_id_for_logging": row["u_id"],
+            }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_api_keys(self, conn: sqlite3.Connection, user_id: str) -> list[dict]:
+        """Load all API keys for a user (internal, uses an existing connection)."""
+        rows = conn.execute(
+            "SELECT * FROM api_keys WHERE user_id = ? ORDER BY created_at",
+            (user_id,),
+        ).fetchall()
+        return [_row_to_api_key(row) for row in rows]
+
     def _normalize_api_scopes(self, scopes: list[str]) -> list[str]:
-        """Normalize scopes to known values."""
-        valid: set[str] = {"query", "ingest", "speech", "kb_manage", "agent_manage"}
+        """Filter scopes to the valid set, lowercase, deduplicate.
+
+        If nothing valid remains, default to ["query"].
+        """
+        valid: set[str] = set(API_SCOPES)
         result: list[str] = []
         for s in scopes:
             cleaned = str(s).strip().lower()
@@ -703,6 +995,11 @@ class UserStore:
         return result
 
     def _normalize_knowledge_base_ids(self, values) -> list[str]:
+        """Normalize a list/string of knowledge-base IDs.
+
+        Accepts None (defaults to ["default"]), a comma-separated string,
+        or a list. Each ID is validated and deduplicated.
+        """
         from utils.knowledge_base_store import validate_knowledge_base_id
 
         if values is None:
@@ -716,47 +1013,56 @@ class UserStore:
                 result.append(knowledge_base_id)
         return result
 
-    def _public_list_unlocked(self) -> list[dict]:
-        return [_public_user(user) for user in self._list_unlocked()]
 
-    def _list_unlocked(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid user store: {self.path}") from exc
-        users = data.get("users") if isinstance(data, dict) else data
-        if not isinstance(users, list):
-            raise ValueError(f"Invalid user store: {self.path}")
-        return users
-
-    def _save_unlocked(self, users: list[dict]) -> None:
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=".users.",
-            suffix=".json",
-            dir=str(self.path.parent),
-            text=True,
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"users": users}, f, indent=2, sort_keys=True)
-                f.write("\n")
-            os.replace(tmp_name, self.path)
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+# ----------------------------------------------------------------------
+# Module-level helpers
+#
+# These are pure functions that do not need a database connection.
+# They convert sqlite3.Row objects into plain dicts and generate IDs/timestamps.
+# ----------------------------------------------------------------------
 
 def normalize_email(value: str) -> str:
+    """Lowercase and trim an email address."""
     return str(value or "").strip().lower()
 
 
+def _row_to_user(row: sqlite3.Row) -> dict:
+    """Convert a users-table row into a dict (including password_hash)."""
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "display_name": row["display_name"],
+        "password_hash": row["password_hash"],
+        "role": row["role"],
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "deletion_status": row["deletion_status"] or "",
+        "deletion_error": row["deletion_error"] or "",
+    }
+
+
+def _row_to_api_key(row: sqlite3.Row) -> dict:
+    """Convert an api_keys-table row into a dict."""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "key_hash": row["key_hash"],
+        "key_prefix": row["key_prefix"],
+        "key_suffix": row["key_suffix"],
+        "scopes": json.loads(row["scopes"] or "[]"),
+        "knowledge_base_ids": json.loads(row["knowledge_base_ids"] or "[]"),
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+        "last_used": row["last_used"] or "",
+        "usage_count": row["usage_count"],
+        "description": row["description"] or "",
+        "expires_at": row["expires_at"],
+    }
+
+
 def _public_user(user: dict) -> dict:
+    """Strip the password_hash before returning a user to the caller."""
     result = {key: value for key, value in user.items() if key != "password_hash"}
     if "api_keys" in result:
         result["api_keys"] = [
@@ -774,6 +1080,7 @@ def _user_record(
     role: str = "user",
     enabled: bool = True,
 ) -> dict:
+    """Build a new user dict with a fresh id and hashed password."""
     now = _now()
     return {
         "id": _user_id(email),
@@ -788,6 +1095,11 @@ def _user_record(
 
 
 def _public_api_key(key: dict, *, user_id: str, include_raw: bool = False) -> dict:
+    """Strip secret fields (hash, prefix, suffix) from an API key dict.
+
+    If include_raw is True and the dict has a "key" field, include it
+    (used only at creation/rotation time, when the user sees the key once).
+    """
     result = {
         name: value
         for name, value in key.items()
@@ -810,32 +1122,54 @@ def _public_api_key(key: dict, *, user_id: str, include_raw: bool = False) -> di
 
 
 def _user_id(email: str) -> str:
+    """Generate a stable-ish slug from an email plus a random suffix."""
     slug = re.sub(r"[^a-z0-9_.-]+", "-", email.lower()).strip("-._")
     slug = slug[:48] or "user"
     return f"{slug}-{uuid.uuid4().hex[:8]}"
 
 
 def _now() -> str:
+    """Current UTC time as an ISO string (for storage in the DB)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _generate_api_key() -> str:
+    """Generate a random API key string (rag_ prefix + 32 URL-safe chars)."""
     return f"rag_{secrets.token_urlsafe(32)}"
 
 
 def api_key_hash(value: str) -> str:
+    """SHA-256 hash of an API key value (for storage and lookup)."""
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
-
-
-def api_key_matches(record: dict, candidate: str) -> bool:
-    stored_hash = str(record.get("key_hash") or "")
-    if stored_hash:
-        return hmac.compare_digest(stored_hash, api_key_hash(candidate))
-    legacy = str(record.get("key") or "")
-    return bool(legacy) and hmac.compare_digest(legacy, str(candidate or ""))
 
 
 def _mask_api_key(key: str) -> str:
     if not key or len(key) <= 8:
         return "*" * len(key) if key else ""
     return f"{key[:8]}...{key[-4:]}"
+
+
+def _is_expired(expires_at: str | None) -> bool:
+    if not expires_at:
+        return False
+    parsed = _parse_expiration(expires_at)
+    if parsed is None:
+        return False
+    return parsed <= datetime.now(timezone.utc)
+
+
+def _parse_expiration(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            day = datetime.fromisoformat(raw).date()
+            return datetime.combine(day, time.max, tzinfo=timezone.utc)
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

@@ -38,7 +38,7 @@ def flask_app(tmp_path, monkeypatch):
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "PROMPTS_DIR": str(tmp_path / "prompts"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
@@ -50,7 +50,7 @@ def flask_app(tmp_path, monkeypatch):
             "RATE_LIMIT_WINDOW": 60,
         }
     )
-    user = UserStore(app.config["USERS_FILE"]).create_user(
+    user = UserStore(app.config["USERS_DB"]).create_user(
         email="admin@example.local",
         password="admin",
         display_name="Admin",
@@ -919,7 +919,7 @@ def test_api_agents_list_with_availability(client, agent_payload):
 
 
 def test_api_agents_create_with_prompt_ref(client, agent_payload, flask_app):
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     prompt = PromptStore(flask_app.config["PROMPTS_DIR"]).create_user_prompt(
         user["id"],
         "Personal agent prompt",
@@ -995,7 +995,7 @@ def test_system_prompt_scope_personal_resolves_prompt(client, flask_app, monkeyp
 
     app_module = importlib.import_module("app.app")
     rag_engine = importlib.import_module("utils.rag_engine")
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     prompt = PromptStore(flask_app.config["PROMPTS_DIR"]).create_user_prompt(
         user["id"],
         "Scoped persona",
@@ -1045,7 +1045,7 @@ def test_system_prompt_scope_fail_closed_on_missing_prompt(client):
 
 
 def _create_api_key(flask_app, **kwargs):
-    user_store = UserStore(flask_app.config["USERS_FILE"])
+    user_store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     return user_store.create_api_key(
         user_id=user_id,
@@ -1058,7 +1058,7 @@ def _create_api_key(flask_app, **kwargs):
 
 
 def test_agent_manage_key_requires_and_retains_a_kb_boundary(flask_app):
-    store = UserStore(flask_app.config["USERS_FILE"])
+    store = UserStore(flask_app.config["USERS_DB"])
     user_id = flask_app.config["TEST_USER_ID"]
     with pytest.raises(ValueError, match="agent_manage"):
         store.create_api_key(
@@ -1423,7 +1423,7 @@ def test_query_agent_catalog_error_does_not_leak_path(
         "/api/agents",
         json=agent_payload(name="Catalog Error Agent"),
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     workspace = workspace_for_user(user, app=flask_app)
     Path(workspace.chat_agents_file).write_text("{broken", encoding="utf-8")
 
@@ -1446,7 +1446,7 @@ def test_agent_without_prompt_is_available_and_runs(
         "/api/agents",
         json=agent_payload(name="Promptless Agent"),
     ).get_json()
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     workspace = workspace_for_user(user, app=flask_app)
     catalog_path = Path(workspace.chat_agents_file)
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))

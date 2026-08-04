@@ -226,7 +226,7 @@ def test_session_posts_require_csrf_token_and_login_redirect_stays_local(tmp_pat
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
             "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace-uploads"),

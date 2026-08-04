@@ -18,14 +18,11 @@ if str(APP_ROOT) not in sys.path:
 
 from utils.knowledge_base_store import KnowledgeBaseCatalogError, KnowledgeBaseStore
 from utils.settings_store import SettingsStore
-from utils.user_store import UserStore
-from utils.workspace import safe_workspace_id
 
 
 def migrate(
     *,
     workspace_root: Path,
-    users_file: Path,
     apply: bool,
     max_additional: int,
 ) -> dict:
@@ -34,7 +31,6 @@ def migrate(
         "workspaces_checked": 0,
         "catalogs_created": 0,
         "data_sources_updated": 0,
-        "api_keys_updated": 0,
         "errors": [],
         "changes": [],
     }
@@ -107,46 +103,6 @@ def migrate(
                     }
                 )
 
-    if users_file.exists():
-        try:
-            users_document = _read_json(users_file)
-        except ValueError as exc:
-            report["errors"].append(
-                {
-                    "error": "invalid_users_file",
-                    "detail": str(exc),
-                }
-            )
-            return report
-        users = (
-            users_document.get("users")
-            if isinstance(users_document, dict)
-            else users_document
-        )
-        users = users if isinstance(users, list) else []
-        eligible_user_ids: set[str] = set()
-        changed_keys = 0
-        for user in users:
-            if not isinstance(user, dict):
-                continue
-            workspace_id = safe_workspace_id(user.get("id"))
-            if workspace_id not in valid_workspaces:
-                continue
-            eligible_user_ids.add(str(user.get("id") or ""))
-            for key in user.get("api_keys") or []:
-                if isinstance(key, dict) and "knowledge_base_ids" not in key:
-                    changed_keys += 1
-        if apply and changed_keys:
-            changed_keys = UserStore(
-                str(users_file)
-            ).ensure_api_key_knowledge_base_ids(
-                user_ids=eligible_user_ids,
-            )
-        if changed_keys:
-            report["api_keys_updated"] = changed_keys
-            report["changes"].append(
-                {"change": "default_api_key_allowlists", "count": changed_keys}
-            )
     return report
 
 
@@ -186,10 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces"),
     )
     parser.add_argument(
-        "--users-file",
-        default=os.getenv("RAG_USERS_FILE", "app/data/users.json"),
-    )
-    parser.add_argument(
         "--max-additional",
         type=int,
         default=int(os.getenv("RAG_MAX_KNOWLEDGE_BASES", "20")),
@@ -197,7 +149,6 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     report = migrate(
         workspace_root=Path(arguments.workspace_root),
-        users_file=Path(arguments.users_file),
         apply=arguments.apply,
         max_additional=arguments.max_additional,
     )

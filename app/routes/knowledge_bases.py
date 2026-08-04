@@ -577,7 +577,7 @@ def _delete_runtime_config(
             "SECRET_KEY": workspace.secret_key,
         }
     runtime["KNOWLEDGE_BASES_FILE"] = workspace.knowledge_bases_file
-    runtime["USERS_FILE"] = app.config["USERS_FILE"]
+    runtime["USERS_DB"] = app.config["USERS_DB"]
     return runtime
 
 
@@ -795,7 +795,7 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
 
         from utils.user_store import UserStore
 
-        user_store = UserStore(config["USERS_FILE"])
+        user_store = UserStore(config["USERS_DB"])
 
         def remove_catalog() -> None:
             assert_distributed_locks_healthy()
@@ -933,7 +933,7 @@ def _add_created_knowledge_base_to_api_key(
         return
     from utils.user_store import UserStore
 
-    updated = UserStore(app.config["USERS_FILE"]).add_knowledge_base_to_api_key(
+    updated = UserStore(app.config["USERS_DB"]).add_knowledge_base_to_api_key(
         user_id=key["user_id"],
         key_name=key_name,
         knowledge_base_id=knowledge_base_id,

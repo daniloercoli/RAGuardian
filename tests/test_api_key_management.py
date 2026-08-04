@@ -9,34 +9,24 @@ from app.utils.api_key_logger import ApiKeyLogger
 from app.utils.user_store import UserStore
 
 
-def _make_user(path: Path, user_id: str, *, role: str = "user") -> Path:
-    existing = []
-    if path.exists():
-        with path.open("r") as f:
-            existing = json.load(f)
-
-    existing.append({
-        "id": user_id,
-        "email": f"{user_id}@example.com",
-        "display_name": user_id,
-        "password_hash": "dummy",
-        "role": role,
-        "enabled": True,
-        "api_keys": [],
-    })
-
-    with path.open("w") as f:
-        json.dump(existing, f)
+def _make_user(path: Path, user_id: str, *, role: str = "user") -> dict:
+    store = UserStore(path)
+    return store.create_user(
+        email=f"{user_id}@example.com",
+        password="dummy",
+        display_name=user_id,
+        role=role,
+    )
 
 
 def test_create_and_retrieve_api_key():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
         created = store.create_api_key(
-            user_id="user-1",
+            user_id=user["id"],
             name="prod",
             scopes=["query"],
             description="Production key",
@@ -48,7 +38,7 @@ def test_create_and_retrieve_api_key():
         assert created["masked_key"].startswith(created["key"][:8])
         assert created["masked_key"].endswith(created["key"][-4:])
 
-        keys = store.get_api_keys("user-1")
+        keys = store.get_api_keys(user["id"])
         assert len(keys) == 1
         assert keys[0]["name"] == "prod"
         assert keys[0]["description"] == "Production key"
@@ -56,7 +46,7 @@ def test_create_and_retrieve_api_key():
 
 
 def test_bootstrap_admin_if_empty_creates_only_one_admin_concurrently(tmp_path):
-    store_path = tmp_path / "users.json"
+    store_path = tmp_path / "users.db"
     store = UserStore(store_path)
 
     def bootstrap(email: str):
@@ -72,35 +62,14 @@ def test_bootstrap_admin_if_empty_creates_only_one_admin_concurrently(tmp_path):
     assert sum(result is not None for result in results) == 1
 
 
-def test_user_store_never_overwrites_corrupt_json(tmp_path):
-    store_path = tmp_path / "users.json"
-    corrupt_payload = "{not-valid-json"
-    store_path.write_text(corrupt_payload, encoding="utf-8")
-    store = UserStore(store_path)
-
-    with pytest.raises(ValueError, match="Invalid user store"):
-        store.remove_knowledge_base_from_api_keys(
-            user_id="user-1",
-            knowledge_base_id="default",
-        )
-    assert store_path.read_text(encoding="utf-8") == corrupt_payload
-
-    with pytest.raises(ValueError, match="Invalid user store"):
-        store.create_user(
-            email="new@example.com",
-            password="secret",
-        )
-    assert store_path.read_text(encoding="utf-8") == corrupt_payload
-
-
 def test_raw_api_key_is_hashed_and_cannot_be_retrieved():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
         store.create_api_key(
-            user_id="user-1",
+            user_id=user["id"],
             name="secret",
             scopes=["query"],
             api_key_value="raw-secret-value",
@@ -111,72 +80,21 @@ def test_raw_api_key_is_hashed_and_cannot_be_retrieved():
         assert listed_key["masked_key"] == "raw-secr...alue"
         assert "key" not in listed_key
 
-        hidden_key = store.get_api_key("user-1", "secret")
+        hidden_key = store.get_api_key(user["id"], "secret")
         assert "key" not in hidden_key
-        assert "raw-secret-value" not in store_path.read_text(encoding="utf-8")
-        assert "key_hash" in json.loads(store_path.read_text(encoding="utf-8"))["users"][0]["api_keys"][0]
-
-
-def test_legacy_raw_api_keys_are_migrated_to_hashes(tmp_path):
-    store_path = tmp_path / "users.json"
-    _make_user(store_path, "user-1")
-    data = json.loads(store_path.read_text(encoding="utf-8"))
-    data[0]["api_keys"] = [{"name": "legacy", "key": "legacy-secret", "enabled": True}]
-    store_path.write_text(json.dumps(data), encoding="utf-8")
-
-    store = UserStore(store_path)
-    assert store.migrate_legacy_api_keys() == 1
-
-    raw = store_path.read_text(encoding="utf-8")
-    assert "legacy-secret" not in raw
-    assert store.migrate_legacy_api_keys() == 0
-
-
-def test_legacy_api_key_kb_grants_are_migrated_atomically(tmp_path):
-    store_path = tmp_path / "users.json"
-    _make_user(store_path, "user-1")
-    _make_user(store_path, "user-2")
-    data = json.loads(store_path.read_text(encoding="utf-8"))
-    data[0]["api_keys"] = [
-        {"name": "legacy", "key": "legacy-secret", "enabled": True},
-        {
-            "name": "explicit",
-            "key": "explicit-secret",
-            "enabled": True,
-            "knowledge_base_ids": [],
-        },
-    ]
-    data[1]["api_keys"] = [
-        {"name": "excluded", "key": "excluded-secret", "enabled": True},
-    ]
-    store_path.write_text(json.dumps(data), encoding="utf-8")
-    store = UserStore(store_path)
-
-    assert store.ensure_api_key_knowledge_base_ids(user_ids={"user-1"}) == 1
-    assert store.get_api_key(
-        "user-1",
-        "legacy",
-    )["knowledge_base_ids"] == ["default"]
-    assert store.get_api_key(
-        "user-1",
-        "explicit",
-    )["knowledge_base_ids"] == []
-    raw_users = json.loads(store_path.read_text(encoding="utf-8"))["users"]
-    assert "knowledge_base_ids" not in raw_users[1]["api_keys"][0]
-    assert store.ensure_api_key_knowledge_base_ids() == 1
-    assert store.ensure_api_key_knowledge_base_ids() == 0
+        assert b"raw-secret-value" not in store_path.read_bytes()
 
 
 def test_duplicate_key_name_fails():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        store.create_api_key(user_id="user-1", name="key", scopes=["query"])
+        store.create_api_key(user_id=user["id"], name="key", scopes=["query"])
 
         try:
-            store.create_api_key(user_id="user-1", name="key", scopes=["query"])
+            store.create_api_key(user_id=user["id"], name="key", scopes=["query"])
             assert False, "Should have raised ValueError"
         except ValueError:
             pass
@@ -184,69 +102,69 @@ def test_duplicate_key_name_fails():
 
 def test_rename_to_duplicate_key_name_fails():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        store.create_api_key(user_id="user-1", name="first", scopes=["query"])
-        store.create_api_key(user_id="user-1", name="second", scopes=["query"])
+        store.create_api_key(user_id=user["id"], name="first", scopes=["query"])
+        store.create_api_key(user_id=user["id"], name="second", scopes=["query"])
 
         with pytest.raises(ValueError):
-            store.update_api_key_name(user_id="user-1", key_name="first", new_name="second")
+            store.update_api_key_name(user_id=user["id"], key_name="first", new_name="second")
 
 
 def test_toggle_api_key_enabled():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        store.create_api_key(user_id="user-1", name="test", scopes=["ingest"])
+        store.create_api_key(user_id=user["id"], name="test", scopes=["ingest"])
 
-        result = store.toggle_api_key_enabled(user_id="user-1", key_name="test", enabled=False)
+        result = store.toggle_api_key_enabled(user_id=user["id"], key_name="test", enabled=False)
         assert result is not None
         assert result["enabled"] is False
 
 
 def test_delete_api_key():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        store.create_api_key(user_id="user-1", name="ephemeral", scopes=["query"])
-        assert len(store.get_api_keys("user-1")) == 1
+        store.create_api_key(user_id=user["id"], name="ephemeral", scopes=["query"])
+        assert len(store.get_api_keys(user["id"])) == 1
 
-        store.delete_api_key(user_id="user-1", key_name="ephemeral")
-        assert len(store.get_api_keys("user-1")) == 0
+        store.delete_api_key(user_id=user["id"], key_name="ephemeral")
+        assert len(store.get_api_keys(user["id"])) == 0
 
 
 def test_update_usage_counts():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        store.create_api_key(user_id="user-1", name="metered", scopes=["query"])
+        store.create_api_key(user_id=user["id"], name="metered", scopes=["query"])
 
         for _ in range(3):
-            store.update_api_key_usage(user_id="user-1", key_name="metered")
+            store.update_api_key_usage(user_id=user["id"], key_name="metered")
 
-        keys = store.get_api_keys("user-1")
+        keys = store.get_api_keys(user["id"])
         assert keys[0]["usage_count"] == 3
         assert keys[0]["last_used"] is not None
 
 
 def test_get_api_keys_returns_empty_for_unknown_user():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
+        store_path = Path(tmp) / "users.db"
         store = UserStore(store_path)
         assert store.get_api_keys("nonexistent") == []
 
 
 def test_create_api_key_requires_existing_user():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
+        store_path = Path(tmp) / "users.db"
         store = UserStore(store_path)
 
         try:
@@ -258,11 +176,11 @@ def test_create_api_key_requires_existing_user():
 
 def test_masked_key_format():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        key = store.create_api_key(user_id="user-1", name="masked-test", scopes=["query"])
+        key = store.create_api_key(user_id=user["id"], name="masked-test", scopes=["query"])
         raw = key["key"]
         masked = key["masked_key"]
 
@@ -274,23 +192,23 @@ def test_masked_key_format():
 
 def test_toggle_nonexistent_key_returns_none():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
         result = store.toggle_api_key_enabled(
-            user_id="user-1", key_name="nonexistent", enabled=True
+            user_id=user["id"], key_name="nonexistent", enabled=True
         )
         assert result is None
 
 
 def test_delete_nonexistent_key_returns_false():
     with tempfile.TemporaryDirectory() as tmp:
-        store_path = Path(tmp) / "users.json"
-        _make_user(store_path, "user-1")
+        store_path = Path(tmp) / "users.db"
+        user = _make_user(store_path, "user-1")
 
         store = UserStore(store_path)
-        result = store.delete_api_key(user_id="user-1", key_name="nonexistent")
+        result = store.delete_api_key(user_id=user["id"], key_name="nonexistent")
         assert result is False
 
 

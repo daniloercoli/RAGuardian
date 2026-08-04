@@ -28,7 +28,7 @@ def _personal_prompt_owner():
         if not user:
             abort(401)
         current = UserStore(
-            current_app.config.get("USERS_FILE")
+            current_app.config.get("USERS_DB")
         ).get(user["id"])
         if not current or not current.get("enabled", True):
             abort(401)

@@ -15,7 +15,6 @@ def test_migration_dry_run_apply_and_idempotency(tmp_path):
     workspace_root = tmp_path / "workspaces"
     workspace = workspace_root / "alice"
     settings_file = workspace / "settings.json"
-    users_file = tmp_path / "users.json"
     _write_json(
         settings_file,
         {
@@ -29,27 +28,14 @@ def test_migration_dry_run_apply_and_idempotency(tmp_path):
             ]
         },
     )
-    _write_json(
-        users_file,
-        {
-            "users": [
-                {
-                    "id": "alice",
-                    "api_keys": [{"name": "legacy", "scopes": ["query"]}],
-                }
-            ]
-        },
-    )
 
     dry_run = migrate(
         workspace_root=workspace_root,
-        users_file=users_file,
         apply=False,
         max_additional=20,
     )
     assert dry_run["catalogs_created"] == 1
     assert dry_run["data_sources_updated"] == 1
-    assert dry_run["api_keys_updated"] == 1
     assert not (workspace / "knowledge_bases.json").exists()
     assert "knowledge_base_id" not in json.loads(
         settings_file.read_text(encoding="utf-8")
@@ -57,7 +43,6 @@ def test_migration_dry_run_apply_and_idempotency(tmp_path):
 
     applied = migrate(
         workspace_root=workspace_root,
-        users_file=users_file,
         apply=True,
         max_additional=20,
     )
@@ -69,19 +54,14 @@ def test_migration_dry_run_apply_and_idempotency(tmp_path):
     assert json.loads(settings_file.read_text(encoding="utf-8"))["data_sources"][0][
         "knowledge_base_id"
     ] == "default"
-    assert json.loads(users_file.read_text(encoding="utf-8"))["users"][0][
-        "api_keys"
-    ][0]["knowledge_base_ids"] == ["default"]
 
     repeated = migrate(
         workspace_root=workspace_root,
-        users_file=users_file,
         apply=True,
         max_additional=20,
     )
     assert repeated["catalogs_created"] == 0
     assert repeated["data_sources_updated"] == 0
-    assert repeated["api_keys_updated"] == 0
     assert repeated["changes"] == []
 
 
@@ -96,7 +76,6 @@ def test_migration_reports_corrupt_catalog_without_repairing_it(tmp_path):
 
     report = migrate(
         workspace_root=workspace_root,
-        users_file=tmp_path / "missing-users.json",
         apply=True,
         max_additional=20,
     )
@@ -133,7 +112,6 @@ def test_settings_migration_serializes_concurrent_store_updates(
         target=migrate,
         kwargs={
             "workspace_root": workspace_root,
-            "users_file": tmp_path / "missing-users.json",
             "apply": True,
             "max_additional": 20,
         },

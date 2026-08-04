@@ -116,7 +116,7 @@ def workspace_from_request(app=None) -> WorkspaceContext:
     with lifecycle_read_lock():
         api_key = getattr(request, "api_key", None)
         if api_key:
-            user = UserStore(app.config["USERS_FILE"]).get(
+            user = UserStore(app.config["USERS_DB"]).get(
                 str(api_key.get("user_id") or "")
             )
         else:

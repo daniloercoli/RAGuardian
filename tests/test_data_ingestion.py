@@ -25,7 +25,7 @@ def flask_app(tmp_path, monkeypatch):
             "SETTINGS_FILE": str(tmp_path / "settings.json"),
             "FILE_INDEX": str(tmp_path / "files.json"),
             "UPLOAD_FOLDER": str(tmp_path / "uploads"),
-            "USERS_FILE": str(tmp_path / "users.json"),
+            "USERS_DB": str(tmp_path / "users.db"),
             "SECRETS_FILE": str(tmp_path / "secrets.json"),
             "WORKSPACE_DATA_DIR": str(tmp_path / "workspaces"),
             "WORKSPACE_UPLOAD_DIR": str(tmp_path / "workspace_uploads"),
@@ -46,7 +46,7 @@ def _workspace_settings(flask_app):
     from utils.user_store import UserStore
     from utils.workspace import workspace_for_user
 
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     return SettingsStore(workspace_for_user(user, app=flask_app).settings_file)
 
 
@@ -842,7 +842,7 @@ def test_late_data_source_worker_stops_before_writing_an_inactive_kb(
         workspace_for_user,
     )
 
-    user = UserStore(flask_app.config["USERS_FILE"]).create_user(
+    user = UserStore(flask_app.config["USERS_DB"]).create_user(
         email="sync@example.local",
         password="admin",
         display_name="Sync",
@@ -975,7 +975,7 @@ def test_plugin_change_deletes_all_previous_secret_refs(
 
     source = settings_store.load()["data_sources"][0]
     new_ref = source["secrets"]["token"]["ref"]
-    user = UserStore(flask_app.config["USERS_FILE"]).list()[0]
+    user = UserStore(flask_app.config["USERS_DB"]).list()[0]
     workspace = workspace_for_user(user, app=flask_app)
 
     assert response.status_code == 302

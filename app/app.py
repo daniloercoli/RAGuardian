@@ -144,7 +144,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["UPLOAD_FOLDER"] = Config.paths.upload_folder
     app.config["SETTINGS_FILE"] = Config.paths.settings_file
     app.config["FILE_INDEX"] = Config.paths.file_index
-    app.config["USERS_FILE"] = os.getenv("RAG_USERS_FILE", "app/data/users.json")
+    app.config["USERS_DB"] = os.getenv("RAG_USERS_DB", "app/data/users.db")
     app.config["PROMPTS_DIR"] = os.getenv("RAG_PROMPTS_DIR", "app/data")
     app.config["SECRETS_FILE"] = os.getenv("RAG_SECRETS_FILE", "app/data/secrets.json")
     app.config["API_KEY_USAGE_FILE"] = os.getenv("RAG_API_KEY_USAGE_FILE", "app/data/api_keys_usage.json")
@@ -194,9 +194,6 @@ def create_app(test_config: dict | None = None) -> Flask:
     os.makedirs(app.config["WORKSPACE_UPLOAD_DIR"], exist_ok=True)
     from utils.user_store import UserStore
 
-    migrated_api_keys = UserStore(app.config["USERS_FILE"]).migrate_legacy_api_keys()
-    if migrated_api_keys:
-        log.info("Migrated %d legacy API key(s) to hashed storage", migrated_api_keys)
     SettingsStore(app.config["SETTINGS_FILE"]).load()
     model_config_error = get_model_configuration_error()
     if model_config_error:
@@ -303,7 +300,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             key_name = api_key_info.get("_user_key_name") or api_key_info.get("name", "")
             try:
                 from utils.user_store import UserStore
-                store = UserStore(app.config.get("USERS_FILE"))
+                store = UserStore(app.config.get("USERS_DB"))
                 store.update_api_key_usage(
                     user_id,
                     key_name,
@@ -2005,13 +2002,13 @@ def _code_interpreter_response(prepared: dict, code: str, result: dict) -> dict:
 def _any_user_api_keys(app: Flask) -> bool:
     from utils.user_store import UserStore
 
-    return any(user.get("api_keys") for user in UserStore(app.config["USERS_FILE"]).list())
+    return any(user.get("api_keys") for user in UserStore(app.config["USERS_DB"]).list())
 
 
 def _has_users(app: Flask) -> bool:
     from utils.user_store import UserStore
 
-    return UserStore(app.config["USERS_FILE"]).has_users()
+    return UserStore(app.config["USERS_DB"]).has_users()
 
 
 def _workspace_config(
@@ -2033,7 +2030,7 @@ def _workspace_config(
         )
     request._rag_knowledge_base_id = context.knowledge_base_id
     config = context.as_config()
-    config["USERS_FILE"] = app.config["USERS_FILE"]
+    config["USERS_DB"] = app.config["USERS_DB"]
     return config
 
 
@@ -2052,7 +2049,7 @@ def _workspace_query_configs(app: Flask, knowledge_base_ids) -> tuple[dict, ...]
     configs = []
     for context in contexts:
         config = context.as_config()
-        config["USERS_FILE"] = app.config["USERS_FILE"]
+        config["USERS_DB"] = app.config["USERS_DB"]
         configs.append(config)
     ids = [config["KNOWLEDGE_BASE_ID"] for config in configs]
     request._rag_knowledge_base_ids = ids
@@ -2129,7 +2126,7 @@ def _workspace_shared_config(app: Flask) -> dict:
 
     with lifecycle_read_lock():
         config = workspace_from_request(app).as_config()
-    config["USERS_FILE"] = app.config["USERS_FILE"]
+    config["USERS_DB"] = app.config["USERS_DB"]
     return config
 
 
@@ -2276,7 +2273,7 @@ def _resolve_system_prompt(
         if api_user_id:
             from utils.user_store import UserStore
 
-            user = UserStore(current_app.config.get("USERS_FILE")).get(api_user_id)
+            user = UserStore(current_app.config.get("USERS_DB")).get(api_user_id)
     if not user:
         if system_prompt_scope:
             raise ValidationError("Utente non autenticato", "system_prompt_id")

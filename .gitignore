@@ -35,7 +35,7 @@ app/chroma_db/
 # Runtime RAG data (contains secrets and local state)
 app/data/settings.json
 app/data/files.json
-app/data/users.json
+app/data/users.db
 app/data/secrets.json
 app/data/api_keys_usage.json
 app/data/*.lock

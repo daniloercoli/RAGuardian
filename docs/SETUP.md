@@ -129,7 +129,7 @@ RAG_QUEUE_NAME=rag-default
 Runtime files are intentionally ignored by git:
 
 - `app/data/settings.json`
-- `app/data/users.json`
+- `app/data/users.db`
 - `app/data/secrets.json`
 - `app/data/workspaces/`
 - `app/uploads/`
