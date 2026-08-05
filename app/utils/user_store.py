@@ -358,7 +358,7 @@ class UserStore:
             and not normalized_knowledge_base_ids
         ):
             raise ValueError(
-                "At least one knowledge base is required for query, ingest, or agent_manage"
+                "At least one knowledge base is required for query, ingest, agent_manage, history_read, or history_manage"
             )
         new_key = {
             "id": uuid.uuid4().hex,
@@ -654,7 +654,7 @@ class UserStore:
                 and not knowledge_base_ids
             ):
                 raise ValueError(
-                    "At least one knowledge base is required for query, ingest, or agent_manage"
+                    "At least one knowledge base is required for query, ingest, agent_manage, history_read, or history_manage"
                 )
             conn.execute(
                 "UPDATE api_keys SET scopes = ? WHERE id = ?",
@@ -688,7 +688,7 @@ class UserStore:
             scopes = set(json.loads(row["scopes"] or "[]")) or {"query"}
             if API_SCOPES_REQUIRING_KB & scopes and not normalized:
                 raise ValueError(
-                    "At least one knowledge base is required for query, ingest, or agent_manage"
+                    "At least one knowledge base is required for query, ingest, agent_manage, history_read, or history_manage"
                 )
             conn.execute(
                 "UPDATE api_keys SET knowledge_base_ids = ? WHERE id = ?",
@@ -721,7 +721,7 @@ class UserStore:
             and not normalized_knowledge_base_ids
         ):
             raise ValueError(
-                "At least one knowledge base is required for query, ingest, or agent_manage"
+                "At least one knowledge base is required for query, ingest, agent_manage, history_read, or history_manage"
             )
         now = _now()
         with self._connect() as conn:

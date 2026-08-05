@@ -163,6 +163,73 @@ class ConversationMemoryStore:
                 version=state.version,
             )
 
+    def append_turn_once(
+        self,
+        conversation_id: Optional[str],
+        *,
+        user: str,
+        assistant: str,
+        knowledge_base_ids=None,
+    ) -> Optional[ConversationSummaryJob]:
+        """Idempotent append: skip if the last turn already matches ``user``.
+
+        Used when a turn is persisted durably and the warm memory is being
+        reconciled, so a double append (e.g. retry within the lease window)
+        does not duplicate the turn in the prompt context.
+        """
+
+        if not conversation_id:
+            return None
+
+        clamped_user = _clamp_text(user, CONVERSATION_MAX_STORED_MESSAGE_CHARS)
+        with self._lock:
+            state = self._get_state(conversation_id, create=False)
+            if state and state.turns:
+                last = state.turns[-1]
+                if last.user == clamped_user:
+                    return None
+        return self.append_turn(
+            conversation_id,
+            user=user,
+            assistant=assistant,
+            knowledge_base_ids=knowledge_base_ids,
+        )
+
+    def hydrate_if_absent(
+        self,
+        conversation_id: Optional[str],
+        *,
+        summary: str,
+        turns: list[ConversationTurn],
+        knowledge_base_ids=None,
+        version: Optional[int] = None,
+    ) -> bool:
+        """Populate warm memory from durable history if no state exists yet.
+
+        Returns ``True`` when hydration happened, ``False`` when a state was
+        already present (or the conversation id was empty).
+        """
+
+        if not conversation_id:
+            return False
+
+        with self._lock:
+            existing = self._get_state(conversation_id, create=False)
+            if existing is not None:
+                return False
+
+            state = self._get_state(conversation_id, create=True)
+            state.summary = _clamp_text(summary or "", self.summary_max_chars)
+            state.turns = list(turns or [])
+            state.knowledge_base_ids = {
+                str(value) for value in (knowledge_base_ids or ()) if value
+            }
+            state.version = int(version) if version is not None else len(state.turns)
+            state.updated_at = time.time()
+            self._conversations.move_to_end(conversation_id)
+            self._evict_if_needed()
+            return True
+
     def apply_summary(self, job: ConversationSummaryJob, summary: str) -> bool:
         with self._lock:
             state = self._get_state(job.conversation_id, create=False)
@@ -371,6 +438,57 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
             state.updated_at = time.time()
             state.version += 1
             self._save_state(job.conversation_id, state)
+            return True
+
+    def append_turn_once(
+        self,
+        conversation_id: Optional[str],
+        *,
+        user: str,
+        assistant: str,
+        knowledge_base_ids=None,
+    ) -> Optional[ConversationSummaryJob]:
+        if not conversation_id:
+            return None
+
+        clamped_user = _clamp_text(user, CONVERSATION_MAX_STORED_MESSAGE_CHARS)
+        with self._redis_lock(conversation_id):
+            state = self._load_state(conversation_id)
+            if state and state.turns and state.turns[-1].user == clamped_user:
+                return None
+        return self.append_turn(
+            conversation_id,
+            user=user,
+            assistant=assistant,
+            knowledge_base_ids=knowledge_base_ids,
+        )
+
+    def hydrate_if_absent(
+        self,
+        conversation_id: Optional[str],
+        *,
+        summary: str,
+        turns: list[ConversationTurn],
+        knowledge_base_ids=None,
+        version: Optional[int] = None,
+    ) -> bool:
+        if not conversation_id:
+            return False
+
+        with self._redis_lock(conversation_id):
+            existing = self._load_state(conversation_id)
+            if existing is not None:
+                return False
+
+            state = ConversationState()
+            state.summary = _clamp_text(summary or "", self.summary_max_chars)
+            state.turns = list(turns or [])
+            state.knowledge_base_ids = {
+                str(value) for value in (knowledge_base_ids or ()) if value
+            }
+            state.version = int(version) if version is not None else len(state.turns)
+            state.updated_at = time.time()
+            self._save_state(conversation_id, state)
             return True
 
     def clear(self, conversation_id: Optional[str]) -> bool:

@@ -71,6 +71,37 @@ document.addEventListener("DOMContentLoaded", () => {
     let conversationResetTrigger = null;
     const conversationStorageKey = "ragConversationId";
     let conversationId = loadOrCreateConversationId();
+    const lastTurnStorageKey = "ragLastTurnId";
+    let lastTurnId = loadLastTurnId();
+    let currentTurnId = null;
+
+    function loadLastTurnId() {
+        try {
+            return (window.sessionStorage && sessionStorage.getItem(lastTurnStorageKey)) || null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function persistLastTurnId(value) {
+        try {
+            if (window.sessionStorage) {
+                if (value) {
+                    sessionStorage.setItem(lastTurnStorageKey, value);
+                } else {
+                    sessionStorage.removeItem(lastTurnStorageKey);
+                }
+            }
+        } catch (error) {
+            // Best effort only.
+        }
+    }
+
+    function resetLastTurnId() {
+        lastTurnId = null;
+        currentTurnId = null;
+        persistLastTurnId(null);
+    }
 
     function setControlLabel(button, label) {
         if (!button) return;
@@ -415,6 +446,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const response = await postAsk(ciBody, askTimeout);
                 if (!response.ok) {
                     const data = await readErrorPayload(response);
+                    reconcileTurnIdFromError(data);
                     const messageDiv = appendBotMessage(
                         formatError(data, response.statusText)
                     );
@@ -452,6 +484,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             if (!response.ok) {
                 const data = await readErrorPayload(response);
+                reconcileTurnIdFromError(data);
                 const messageDiv = appendBotMessage(
                     formatError(data, response.statusText)
                 );
@@ -477,6 +510,12 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function applyQueryConfiguration(body, selectedModel) {
+        body.persist_history = true;
+        body.parent_turn_id = lastTurnId || undefined;
+        body.turn_id = (window.crypto && typeof window.crypto.randomUUID === "function")
+            ? window.crypto.randomUUID()
+            : `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+        currentTurnId = body.turn_id;
         if (agentActive && selectedAgentId) {
             body.agent_id = selectedAgentId;
             return body;
@@ -528,6 +567,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 state.status = "";
                 renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
                 appendSources(event.context);
+                if (currentTurnId) {
+                    lastTurnId = currentTurnId;
+                    persistLastTurnId(lastTurnId);
+                }
             } else if (event.type === "error") {
                 state.hasError = true;
                 renderBotAnswer(messageDiv, formatError(event, "Code interpreter interrupted"));
@@ -660,6 +703,17 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function reconcileTurnIdFromError(data) {
+        if (!data || typeof data !== "object") return;
+        const expected = data.expected_parent_turn_id;
+        if (typeof expected === "string" && expected) {
+            lastTurnId = expected;
+            persistLastTurnId(lastTurnId);
+        } else if (data.code === "turn_id_conflict" || data.code === "continuity_error") {
+            resetLastTurnId();
+        }
+    }
+
     async function renderStreamingResponse(response, messageDiv, timeout) {
         const state = {
             answerText: "",
@@ -725,6 +779,10 @@ document.addEventListener("DOMContentLoaded", () => {
             state.answerText = event.answer || state.answerText;
             renderBotAnswer(messageDiv, state.answerText);
             appendSources(event.context);
+            if (currentTurnId) {
+                lastTurnId = currentTurnId;
+                persistLastTurnId(lastTurnId);
+            }
         } else if (event.type === "error") {
             state.hasError = true;
             renderBotAnswer(messageDiv, formatError(event, "Streaming interrupted"));
@@ -951,6 +1009,7 @@ document.addEventListener("DOMContentLoaded", () => {
         conversationId = createConversationId();
         persistConversationId(conversationId);
         clearServerConversation(previousConversationId, targetKnowledgeBaseIds);
+        resetLastTurnId();
         chatbox.replaceChildren();
         clearUploadedFiles();
         if (emptyState) {
@@ -1834,6 +1893,402 @@ document.addEventListener("DOMContentLoaded", () => {
                 sessionStorage.removeItem(agentStorageKey);
             }
         } catch (e) {/* noop */}
+    }
+
+// History drawer
+    const historyToggle = document.getElementById("historyToggle");
+    const historyDrawer = document.getElementById("historyDrawer");
+    const closeHistoryDrawer = document.getElementById("closeHistoryDrawer");
+    const toggleHistoryDrawer = document.getElementById("toggleHistoryDrawer");
+    const searchHistoryInput = document.getElementById("searchHistoryInput");
+    const historyList = document.getElementById("historyList");
+    const historyEmptyState = document.getElementById("historyEmptyState");
+    
+    let conversationHistory = [];
+    let filteredHistory = [];
+    let historyActionInProgress = false;
+    
+    if (historyToggle) {
+        historyToggle.addEventListener("click", openHistoryDrawer);
+    }
+    if (closeHistoryDrawer) {
+        closeHistoryDrawer.addEventListener("click", closeHistoryDrawerHandler);
+    }
+    if (toggleHistoryDrawer) {
+        toggleHistoryDrawer.addEventListener("click", openHistoryDrawer);
+    }
+    if (searchHistoryInput) {
+        searchHistoryInput.addEventListener("input", filterHistory);
+    }
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && historyDrawer && !historyDrawer.hidden) {
+            closeHistoryDrawerHandler();
+        }
+    });
+    
+    let lastFocusedElement = null;
+    
+    async function openHistoryDrawer() {
+        if (!historyDrawer) return;
+        lastFocusedElement = document.activeElement;
+        historyDrawer.hidden = false;
+        await loadConversationHistory();
+        renderHistoryList();
+        if (searchHistoryInput) {
+            searchHistoryInput.focus();
+        }
+        document.addEventListener("keydown", handleDrawerKeydown);
+    }
+    
+    function closeHistoryDrawerHandler() {
+        if (!historyDrawer) return;
+        historyDrawer.hidden = true;
+        document.removeEventListener("keydown", handleDrawerKeydown);
+        if (lastFocusedElement) {
+            lastFocusedElement.focus();
+            lastFocusedElement = null;
+        }
+    }
+    
+    function handleDrawerKeydown(e) {
+        if (!historyDrawer || historyDrawer.hidden) return;
+        if (e.key !== "Tab") return;
+        
+        const focusableElements = historyDrawer.querySelectorAll(
+            'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+        );
+        const firstElement = focusableElements[0];
+        const lastElement = focusableElements[focusableElements.length - 1];
+        
+        if (e.shiftKey && document.activeElement === firstElement) {
+            e.preventDefault();
+            lastElement.focus();
+        } else if (!e.shiftKey && document.activeElement === lastElement) {
+            e.preventDefault();
+            firstElement.focus();
+        }
+    }
+    
+    async function loadConversationHistory() {
+        if (!historyList) return;
+        historyList.innerHTML = '<div class="history-loading">Loading...</div>';
+        try {
+            const response = await fetch("/api/conversations?status=active");
+            if (!response.ok) {
+                conversationHistory = [];
+                filteredHistory = [];
+                historyList.innerHTML = "";
+                if (historyEmptyState) historyEmptyState.hidden = false;
+                return;
+            }
+            const data = await response.json();
+            conversationHistory = data.conversations || [];
+            filteredHistory = [...conversationHistory];
+            historyList.innerHTML = "";
+        } catch (error) {
+            console.error("Failed to load conversation history:", error);
+            conversationHistory = [];
+            filteredHistory = [];
+            historyList.innerHTML = '<div class="history-error">Failed to load conversations</div>';
+        }
+    }
+    
+    function filterHistory() {
+        const query = (searchHistoryInput?.value || "").toLowerCase().trim();
+        if (!query) {
+            filteredHistory = [...conversationHistory];
+        } else {
+            filteredHistory = conversationHistory.filter(conv => 
+                (conv.title || "").toLowerCase().includes(query)
+            );
+        }
+        renderHistoryList();
+    }
+    
+    function renderHistoryList() {
+        if (!historyList) return;
+        
+        if (filteredHistory.length === 0) {
+            historyList.innerHTML = "";
+            if (historyEmptyState) historyEmptyState.hidden = false;
+            return;
+        }
+        
+        if (historyEmptyState) historyEmptyState.hidden = true;
+        
+        historyList.innerHTML = filteredHistory.map(conv => {
+            const date = new Date(conv.updated_at * 1000).toLocaleString("it-IT");
+            const isArchived = conv.status === "archived";
+            const archivedClass = isArchived ? "archived" : "";
+            const archiveText = isArchived ? "Unarchive" : "Archive";
+            return `
+                <div class="history-item" data-id="${conv.id}" role="listitem" tabindex="0" aria-label="Conversation: ${escapeHtml(conv.title || "Untitled")}">
+                    <h4 class="history-item-title">${escapeHtml(conv.title || "Untitled")}</h4>
+                    <div class="history-item-meta">
+                        <span>${date}</span>
+                        <div class="history-item-actions">
+                            <button type="button" class="rename-btn" data-id="${conv.id}" aria-label="Rename conversation">Rename</button>
+                            <button type="button" class="archive-btn ${archivedClass}" data-id="${conv.id}" aria-label="${archiveText} conversation">${archiveText}</button>
+                            <button type="button" class="delete-btn" data-id="${conv.id}" aria-label="Delete conversation">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join("");
+        
+        historyList.querySelectorAll(".history-item").forEach(item => {
+            item.addEventListener("click", (e) => {
+                if (e.target.tagName === "BUTTON") return;
+                const id = item.dataset.id;
+                loadConversation(id);
+            });
+            item.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    const id = item.dataset.id;
+                    loadConversation(id);
+                }
+            });
+        });
+        
+        historyList.querySelectorAll(".rename-btn").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const id = btn.dataset.id;
+                const conv = conversationHistory.find(c => c.id === id);
+                if (conv) {
+                    openRenameModal(id, conv.title);
+                }
+            });
+        });
+        
+        historyList.querySelectorAll(".archive-btn").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const id = btn.dataset.id;
+                toggleArchive(id);
+            });
+        });
+        
+        historyList.querySelectorAll(".delete-btn").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const id = btn.dataset.id;
+                deleteConversation(id);
+            });
+        });
+    }
+    
+    async function loadConversation(id) {
+        if (busy) {
+            showHistoryStatus("Please wait for the current response to complete", 3000);
+            return;
+        }
+        try {
+            const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages`);
+            if (!response.ok) {
+                showHistoryStatus("Failed to load conversation", 5000);
+                return;
+            }
+            const data = await response.json();
+
+            // Release the warm server-side conversation for the previous chat so
+            // loading a conversation does not leak ephemeral state. This is best
+            // effort and intentionally not awaited (matches clearChat behaviour).
+            clearServerConversation(conversationId);
+
+            // Restore conversation continuity: adopt the loaded conversation's IDs
+            // so subsequent messages continue the same thread instead of starting
+            // a fresh conversation. clearChat() must NOT be used here because it
+            // generates a brand-new conversationId and wipes lastTurnId.
+            const conv = conversationHistory.find(c => c.id === id) || {};
+            const nextConversationId = conv.client_conversation_id || conversationId;
+            const nextTurnId = conv.last_turn_id || null;
+
+            conversationId = nextConversationId;
+            persistConversationId(conversationId);
+            currentTurnId = null;
+            if (nextTurnId) {
+                lastTurnId = nextTurnId;
+                persistLastTurnId(nextTurnId);
+            } else {
+                resetLastTurnId();
+            }
+
+            chatbox.replaceChildren();
+            clearUploadedFiles();
+            if (emptyState) emptyState.hidden = true;
+
+            const messages = data.messages || [];
+            for (const msg of messages) {
+                if (msg.role === "user") {
+                    appendMessage(msg.content, "user-message");
+                } else if (msg.role === "assistant") {
+                    appendBotMessage(msg.content);
+                }
+            }
+
+            closeHistoryDrawerHandler();
+            showHistoryStatus("Conversation loaded");
+        } catch (error) {
+            console.error("Failed to load conversation:", error);
+            showHistoryStatus("Failed to load conversation", 5000);
+        }
+    }
+    
+    async function toggleArchive(id) {
+        if (historyActionInProgress) return;
+        historyActionInProgress = true;
+        try {
+            const conv = conversationHistory.find(c => c.id === id);
+            if (!conv) return;
+
+            const isArchived = conv.status === "archived";
+            const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ archived: !isArchived })
+            });
+
+            if (!response.ok) {
+                showHistoryStatus("Failed to update conversation", 5000);
+                return;
+            }
+
+            await loadConversationHistory();
+            renderHistoryList();
+            const action = !isArchived ? "Archived" : "Unarchived";
+            showHistoryStatus(`${action} conversation`);
+        } catch (error) {
+            console.error("Failed to archive conversation:", error);
+            showHistoryStatus("Failed to update conversation", 5000);
+        } finally {
+            historyActionInProgress = false;
+        }
+    }
+    
+    async function deleteConversation(id) {
+        if (historyActionInProgress) return;
+        if (!confirm("Delete this conversation? This cannot be undone.")) return;
+        historyActionInProgress = true;
+        try {
+            const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
+                method: "DELETE"
+            });
+
+            if (!response.ok) {
+                showHistoryStatus("Failed to delete conversation", 5000);
+                return;
+            }
+
+            await loadConversationHistory();
+            renderHistoryList();
+            showHistoryStatus("Conversation deleted");
+        } catch (error) {
+            console.error("Failed to delete conversation:", error);
+            showHistoryStatus("Failed to delete conversation", 5000);
+        } finally {
+            historyActionInProgress = false;
+        }
+    }
+    
+    const historyStatus = document.getElementById("historyStatus");
+    const renameModal = document.getElementById("renameModal");
+    const renameInput = document.getElementById("renameInput");
+    const cancelRenameButton = document.getElementById("cancelRenameButton");
+    const confirmRenameButton = document.getElementById("confirmRenameButton");
+    let pendingRenameId = null;
+    
+    let historyStatusTimer = null;
+    function showHistoryStatus(message, duration = 3000) {
+        if (!historyStatus) return;
+        if (historyStatusTimer) {
+            clearTimeout(historyStatusTimer);
+            historyStatusTimer = null;
+        }
+        historyStatus.textContent = message;
+        historyStatus.hidden = false;
+        historyStatusTimer = setTimeout(() => {
+            historyStatus.hidden = true;
+            historyStatus.textContent = "";
+            historyStatusTimer = null;
+        }, duration);
+    }
+    
+    if (renameModal) {
+        renameModal.addEventListener("click", (event) => {
+            if (event.target === renameModal) closeRenameModal();
+        });
+    }
+    if (cancelRenameButton) {
+        cancelRenameButton.addEventListener("click", closeRenameModal);
+    }
+    if (confirmRenameButton) {
+        confirmRenameButton.addEventListener("click", confirmRename);
+    }
+    if (renameInput) {
+        renameInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                confirmRename();
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                closeRenameModal();
+            }
+        });
+    }
+    
+    function openRenameModal(id, currentTitle) {
+        if (!renameModal || !renameInput) return;
+        pendingRenameId = id;
+        renameInput.value = currentTitle || "";
+        renameModal.hidden = false;
+        renameInput.focus();
+    }
+    
+    function closeRenameModal() {
+        if (!renameModal) return;
+        renameModal.hidden = true;
+        pendingRenameId = null;
+        if (renameInput) renameInput.value = "";
+    }
+    
+    async function confirmRename() {
+        if (!pendingRenameId || !renameInput) return;
+        if (historyActionInProgress) return;
+        const newTitle = renameInput.value.trim();
+        if (!newTitle) {
+            showHistoryStatus("Title cannot be empty", 3000);
+            return;
+        }
+
+        historyActionInProgress = true;
+        if (confirmRenameButton) confirmRenameButton.disabled = true;
+        try {
+            const response = await fetch(`/api/conversations/${encodeURIComponent(pendingRenameId)}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: newTitle })
+            });
+
+            if (!response.ok) {
+                showHistoryStatus("Failed to rename conversation", 5000);
+                closeRenameModal();
+                return;
+            }
+
+            await loadConversationHistory();
+            renderHistoryList();
+            closeRenameModal();
+            showHistoryStatus("Conversation renamed");
+        } catch (error) {
+            console.error("Failed to rename conversation:", error);
+            showHistoryStatus("Failed to rename conversation", 5000);
+            closeRenameModal();
+        } finally {
+            historyActionInProgress = false;
+            if (confirmRenameButton) confirmRenameButton.disabled = false;
+        }
     }
 
     (async () => {

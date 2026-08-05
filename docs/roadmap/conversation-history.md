@@ -1,8 +1,26 @@
 # Roadmap: Cronologia conversazioni persistente per workspace
 
-Stato: **intervento futuro separato**. Questo documento definisce il contratto
-tecnico e l'ordine di implementazione; nessun codice della cronologia è stato
-ancora implementato.
+Stato: **implementato (Phase 0/1)**. Lo store SQLite per-workspace, il
+`ConversationService` con cache FIFO, la API di gestione
+(`/api/conversations/*`), il flag `persist_history` sulla query e il drawer UI
+sono disponibili. Questo documento resta come contratto tecnico di riferimento;
+le sezioni sotto indicano cosa è coperto e cosa resta futuro.
+
+## Copertura attuale
+
+- Store durevole SQLite per workspace con migrazioni versionate (`PRAGMA user_version`), WAL, `BEGIN IMMEDIATE` e permessi `0600`.
+- `ConversationService` come livello di coordinamento tra store durevole, `PendingTurnResultStore` e `ConversationMemoryStore` (cache calda FIFO).
+- API di gestione session-auth: `GET /api/conversations`, `GET /api/conversations/<id>`, `GET /api/conversations/<id>/messages`, `PATCH /api/conversations/<id>`, `DELETE /api/conversations/<id>`.
+- Flag `persist_history` (default `true`) e `turn_id`/`parent_turn_id` su `POST /api/v1/query`; risposta arricchita con `history_status` e `history_saved`.
+- Replay di turni completati/staged senza nuova chiamata al provider.
+- Drawer UI con ricerca, rinomina, archive/delete e caricamento progressivo del transcript.
+- Isolamento per workspace e risoluzione `history_id` UUID.
+
+## Ancora futuro
+
+- Retention automatica, quota per conversazione e backup/restore guidato.
+- Backfill dei turni precedenti al rilascio (non objetivo dichiarato).
+- Scope dedicati `history_read`/`history_manage` per accesso API key esterno (gli endpoint di gestione sono attualmente session-auth).
 
 ## Contesto
 

@@ -35,6 +35,7 @@
     <nav class="top-nav" aria-label="Primary navigation">
         <div class="nav-track">
             <a id="newChatLink" class="nav-item active" aria-current="page" href="{{ url_for('index') }}">New Chat</a>
+            <button type="button" id="historyToggle" class="link-button">History</button>
             <a id="configurationLink" href="{{ url_for('admin_files') }}">Configuration</a>
             <form method="post" action="{{ url_for('admin_logout') }}">
                 <button type="submit" class="link-button">Logout</button>

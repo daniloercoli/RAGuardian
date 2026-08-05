@@ -288,6 +288,9 @@ one global ranking. A failure or unauthorized KB fails the whole request.
 | `stream_format` | string | no | `text` | `text` or `ndjson`; used only with `stream: true` |
 | `temperature` | number | no | runtime configuration | 0.0-1.0 |
 | `k` | integer | no | runtime configuration | 1-50 |
+| `persist_history` | boolean | no | `true` | When `true` and `turn_id` is present, persists the turn to the durable per-workspace history store; when `false` the turn stays in warm memory only |
+| `turn_id` | string | no | | Stable id for the turn; reuse it on retries to get replayed results without regeneration. Pattern `^[A-Za-z0-9][A-Za-z0-9_-]*$`, max 80 chars. Required for `persist_history` |
+| `parent_turn_id` | string | no | | `turn_id` of the previous visible turn; enforces a linear chain. `null` for the first turn |
 
 When `agent_id` is present, the server resolves the agent's `provider_id`,
 `model_id`, `knowledge_base_ids`, and `prompt_ref`. Sending any explicit
@@ -379,11 +382,22 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
       "snippet": "Chunk retrieved from document..."
     }
   ],
-  "usage": null
+  "usage": null,
+  "history_status": "saved",
+  "history_saved": true
 }
 ```
 
 `conversation_id` is returned only when present in the request. `sources` is the safe field for external clients: it never exposes local paths or admin download URLs. `usage` is reserved for future token/cost metrics when the provider exposes them uniformly.
+
+When `persist_history` is `true` (the default), the response carries two extra fields describing the durable history outcome:
+
+| Field | Type | Values | Meaning |
+|---|---|---|---|
+| `history_status` | string | `saved`, `not_requested`, `disabled`, `client_turn_id_required`, `error` | Outcome of the durable turn. `saved` = persisted; `not_requested` = `persist_history` was false; `disabled` = history feature flag off; `client_turn_id_required` = `turn_id` missing, so memory was updated but nothing persisted; `error` = persistence failed |
+| `history_saved` | boolean | `true`/`false` | Convenience boolean: `true` only when `history_status` is `saved` |
+
+A retry that sends the same `turn_id` with an identical request fingerprint returns the previously persisted result with `replayed: true` (NDJSON `meta`/`done` events) without calling the provider again. A retry with the same `turn_id` but a different fingerprint returns `409 turn_id_conflict`.
 
 ### Streaming
 
@@ -453,6 +467,134 @@ Response:
   ]
 }
 ```
+
+## Persistent Conversation History (session-auth)
+
+When `RAG_CONVERSATION_HISTORY_ENABLED=1`, completed turns are persisted to a
+per-workspace SQLite database (`<WORKSPACE_DATA_DIR>/<workspace_id>/conversations.db`)
+so they survive restarts and warm-memory TTL expiry. The history is isolated
+per workspace and never crosses workspace boundaries.
+
+The management endpoints below are **session-authenticated** (browser login
+cookie/CSRF), not API-key authenticated, and back the in-app history drawer.
+They live under `/api/conversations` (no `/v1` prefix). Enable the feature with
+`RAG_CONVERSATION_HISTORY_ENABLED=1`; the `.env.example` documents retention,
+quota, lease, and pending-turn tuning knobs.
+
+### GET /api/conversations
+
+Lists conversations for the current workspace with pagination. Conversations
+with zero messages are hidden.
+
+| Query param | Type | Default | Constraints |
+|---|---|---:|---|
+| `page` | integer | `1` | >= 1 |
+| `per_page` | integer | `20` | 1-100 |
+| `status` | string | (all) | `active` or `archived` |
+| `archived` | string | (all) | `true`/`false`; sets `status` when `status` is omitted |
+
+Response:
+
+```json
+{
+  "conversations": [
+    {
+      "id": "a1b2c3d4-...",
+      "client_conversation_id": "chat-20260616-demo",
+      "scope_kind": "default",
+      "title": "Summarize my indexed documents",
+      "status": "active",
+      "agent_id": "",
+      "agent_name": "",
+      "provider_id": "mistral",
+      "model_id": "mistral-medium",
+      "message_count": 4,
+      "payload_bytes": 12345,
+      "has_incomplete_turn": false,
+      "created_at": 1754294400.0,
+      "updated_at": 1754294500.0,
+      "archived_at": null
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "per_page": 20,
+    "total": 1,
+    "page_count": 1,
+    "has_prev": false,
+    "has_next": false
+  }
+}
+```
+
+When history is disabled, `conversations` is always empty and `total` is `0`.
+
+### GET /api/conversations/{history_id}
+
+Returns the full conversation record by its server-side UUID `history_id`.
+Returns `404` when the id is not a UUID, history is disabled, or the
+conversation belongs to another workspace.
+
+### GET /api/conversations/{history_id}/messages
+
+Returns messages for a conversation with backward cursor pagination. Messages
+are returned oldest-first within the requested window.
+
+| Query param | Type | Default | Constraints |
+|---|---|---:|---|
+| `before_sequence` | integer | (latest) | >= 0; fetch messages with `sequence <` this value |
+| `limit` | integer | `50` | 1-200 |
+
+Response:
+
+```json
+{
+  "messages": [
+    {
+      "id": 1,
+      "conversation_id": "a1b2c3d4-...",
+      "turn_id": "turn_001",
+      "role": "user",
+      "message_type": "text",
+      "content": "Summarize my indexed documents",
+      "sequence": 1,
+      "sources": [],
+      "metadata": {},
+      "payload_bytes": 42,
+      "created_at": 1754294400.0
+    }
+  ],
+  "next_cursor": null,
+  "limit": 50
+}
+```
+
+`next_cursor` is the `sequence` of the oldest message in the current window, to
+pass back as `before_sequence` for the previous page. It is `null` when there
+are no older messages.
+
+### PATCH /api/conversations/{history_id}
+
+Renames and/or archives/unarchives a conversation. Send one or both fields.
+
+```json
+{
+  "title": "New title (max 120 chars)",
+  "archived": true
+}
+```
+
+- `title`: non-empty string, max 120 characters.
+- `archived`: boolean; `true` archives, `false` unarchives.
+
+Returns the updated conversation record, or `404` if not found. `400` on
+validation errors.
+
+### DELETE /api/conversations/{history_id}
+
+Hard-deletes a conversation and all its messages and turn records. Returns
+`{"deleted": true}` on success, `404` if the conversation does not exist. When
+history is disabled, returns `{"deleted": false}`.
 
 ## POST /api/v1/files
 

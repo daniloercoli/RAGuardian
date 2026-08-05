@@ -301,6 +301,93 @@ class TestBackupLifecycle:
         finally:
             bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
 
+    def test_backup_manifest_includes_conversation_db_fields(
+        self,
+        tmp_path,
+        tmp_backup_dir,
+        tmp_chroma_dir,
+    ):
+        """Backup manifest records conversation_history.db presence, size and hash."""
+        import sqlite3
+
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        workspace_data_dir = data_dir / "workspaces"
+        workspace_data_dir.mkdir(parents=True)
+        upload_dir = tmp_path / "uploads"
+        upload_dir.mkdir()
+
+        db_file = workspace_data_dir / "conversation_history.db"
+        conn = sqlite3.connect(str(db_file))
+        conn.execute(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, scope_key TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO conversations VALUES (?, ?)",
+            ("conv-1", "ws:default:conv-1"),
+        )
+        conn.commit()
+        conn.close()
+        expected_size = db_file.stat().st_size
+
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+
+        try:
+            backup_id = create_backup()["id"]
+            manifest = json.loads(
+                (tmp_backup_dir / backup_id / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert manifest["conversation_db_present"] is True
+            assert manifest["conversation_db_size_bytes"] == expected_size
+            assert len(manifest["conversation_db_sha256"]) == 64
+            assert all(
+                c in "0123456789abcdef"
+                for c in manifest["conversation_db_sha256"]
+            )
+        finally:
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
+
+    def test_backup_manifest_conversation_db_absent_when_missing(
+        self,
+        tmp_path,
+        tmp_backup_dir,
+        tmp_chroma_dir,
+    ):
+        """Manifest reports conversation_db_present=False when no DB exists."""
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        workspace_data_dir = data_dir / "workspaces"
+        workspace_data_dir.mkdir(parents=True)
+        upload_dir = tmp_path / "uploads"
+        upload_dir.mkdir()
+
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+
+        try:
+            backup_id = create_backup()["id"]
+            manifest = json.loads(
+                (tmp_backup_dir / backup_id / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert manifest["conversation_db_present"] is False
+            assert manifest["conversation_db_size_bytes"] == 0
+            assert manifest["conversation_db_sha256"] == ""
+        finally:
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
+
     def test_restore_backup_restores_chroma_and_data(self, monkeypatch, tmp_path, tmp_backup_dir, tmp_chroma_dir):
         """Full backup/restore smoke test for local Chroma files and metadata."""
         import app.utils.vector_store.backup_manager as bm

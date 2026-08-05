@@ -94,6 +94,36 @@ def _checkpoint_chroma(path: Path) -> None:
         chroma_log.warning("WAL checkpoint failed: %s – snapshot may be stale", e)
 
 
+def _checkpoint_conversation_db(workspace_data_dir: Path) -> dict[str, Any]:
+    """Checkpoint the conversation history SQLite WAL before snapshot.
+
+    Returns a small manifest summary (present, size, sha256) so callers can
+    record it without re-statting the file later.
+    """
+
+    summary: dict[str, Any] = {
+        "present": False,
+        "size_bytes": 0,
+        "sha256": "",
+    }
+    db_file = workspace_data_dir / "conversation_history.db"
+    if not db_file.exists():
+        return summary
+    try:
+        conn = sqlite3.connect(str(db_file))
+        cur = conn.cursor()
+        cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        cur.fetchone()
+        conn.close()
+        log.info("Conversation history WAL checkpointed")
+    except sqlite3.Error as e:
+        log.warning("Conversation history WAL checkpoint failed: %s", e)
+    summary["present"] = True
+    summary["size_bytes"] = db_file.stat().st_size
+    summary["sha256"] = _sha256(db_file)
+    return summary
+
+
 # ======================================================================
 # CREATE BACKUP
 # ======================================================================
@@ -144,6 +174,7 @@ def _create_backup_locked(
         # ── 2. checkpoint WAL ─────────────────────────────────────
         chroma_log.info("Flushing ChromaDB WAL before backup...")
         _checkpoint_chroma(CHROMA_DIR)
+        conversation_db_summary = _checkpoint_conversation_db(workspace_data_dir)
 
         # ── 3. copy chromadb ───────────────────────────────────────
         chroma_staging = staging / "chroma_db"
@@ -264,6 +295,9 @@ def _create_backup_locked(
             "chat_agent_catalog_schema_version": 1,
             "chat_agent_count": chat_agent_summary["chat_agent_count"],
             "chat_agents": chat_agent_summary["chat_agents"],
+            "conversation_db_present": conversation_db_summary["present"],
+            "conversation_db_size_bytes": conversation_db_summary["size_bytes"],
+            "conversation_db_sha256": conversation_db_summary["sha256"],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 

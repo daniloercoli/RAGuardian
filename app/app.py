@@ -6,6 +6,8 @@ import threading
 import time
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -175,6 +177,47 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["CORS_ALLOW_CREDENTIALS"] = _env_bool("RAG_CORS_ALLOW_CREDENTIALS", False)
     app.config["CORS_MAX_AGE"] = int(os.getenv("RAG_CORS_MAX_AGE", "600"))
     app.config["REQUEST_TIMEOUT_SECONDS"] = _env_float("RAG_REQUEST_TIMEOUT_SECONDS", 0.0)
+
+    app.config["CONVERSATION_HISTORY_ENABLED"] = _env_bool(
+        "RAG_CONVERSATION_HISTORY_ENABLED", False
+    )
+    app.config["MAX_CONVERSATIONS_PER_WORKSPACE"] = int(
+        os.getenv("RAG_MAX_CONVERSATIONS_PER_WORKSPACE", "200")
+    )
+    app.config["CONVERSATION_HISTORY_RETENTION_DAYS"] = int(
+        os.getenv("RAG_CONVERSATION_HISTORY_RETENTION_DAYS", "90")
+    )
+    app.config["MAX_CONVERSATION_HISTORY_MESSAGE_CHARS"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_HISTORY_MESSAGE_CHARS", "50000")
+    )
+    app.config["MAX_CONVERSATION_MESSAGES"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_MESSAGES", "2000")
+    )
+    app.config["MAX_CONVERSATION_BYTES"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_BYTES", "33554432")
+    )
+    app.config["MAX_CONVERSATION_SOURCES_BYTES_PER_TURN"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_SOURCES_BYTES_PER_TURN", "262144")
+    )
+    app.config["MAX_CONVERSATION_METADATA_BYTES_PER_TURN"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_METADATA_BYTES_PER_TURN", "65536")
+    )
+    app.config["MAX_CONVERSATION_HISTORY_BYTES"] = int(
+        os.getenv("RAG_MAX_CONVERSATION_HISTORY_BYTES", "268435456")
+    )
+    app.config["MAX_PENDING_HISTORY_TURNS_PER_WORKSPACE"] = int(
+        os.getenv("RAG_MAX_PENDING_HISTORY_TURNS_PER_WORKSPACE", "100")
+    )
+    app.config["CONVERSATION_TURN_LEASE_SECONDS"] = int(
+        os.getenv("RAG_CONVERSATION_TURN_LEASE_SECONDS", "900")
+    )
+    app.config["PENDING_TURN_RESULT_TTL_SECONDS"] = int(
+        os.getenv("RAG_PENDING_TURN_RESULT_TTL_SECONDS", "21600")
+    )
+    app.config["INCOMPLETE_HISTORY_TURN_RETENTION_DAYS"] = int(
+        os.getenv("RAG_INCOMPLETE_HISTORY_TURN_RETENTION_DAYS", "7")
+    )
+
     app.config["CSRF_ENABLED"] = True
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -250,6 +293,16 @@ def create_app(test_config: dict | None = None) -> Flask:
             error="Catalogo agent non valido",
             status="chat_agent_catalog_error",
         ), 500
+
+    from utils.conversation_service import ConversationTurnError
+
+    @app.errorhandler(ConversationTurnError)
+    def _conversation_turn_error(error):
+        response = jsonify(error.to_dict())
+        response.status_code = error.status_code
+        if error.retry_after:
+            response.headers["Retry-After"] = str(error.retry_after)
+        return response
 
     # ── Start backup scheduler (background thread) ──
     from utils.vector_store.backup_manager import start_scheduler
@@ -354,18 +407,21 @@ def create_app(test_config: dict | None = None) -> Flask:
 
 
 def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
+    from utils.conversation_service import ConversationTurnError
     from routes.admin_accounts import register_admin_account_routes
     from routes.auth import register_auth_routes
     from routes.backups import register_backup_routes
     from routes.prompts import register_prompt_routes
     from routes.knowledge_bases import register_knowledge_base_routes
     from routes.agents import register_agent_routes
+    from routes.conversations import register_conversation_routes
     register_admin_account_routes(app)
     register_auth_routes(app)
     register_backup_routes(app)
     register_prompt_routes(app)
     register_knowledge_base_routes(app)
     register_agent_routes(app)
+    register_conversation_routes(app)
 
     @app.route("/")
     @require_login
@@ -543,6 +599,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
         except KnowledgeBaseValidationError:
             raise
         except ChatAgentCatalogError:
+            raise
+        except ConversationTurnError:
             raise
         except Exception as e:
             log.error(f"Errore ask: {e}")
@@ -998,6 +1056,8 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             raise
         except ChatAgentCatalogError:
             raise
+        except ConversationTurnError:
+            raise
         except Exception as e:
             log.error(f"Errore api query: {e}")
             return jsonify(error=str(e), status="server_error"), 500
@@ -1130,6 +1190,239 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return jsonify(error=str(e), status="server_error"), 500
 
 
+@dataclass
+class TurnContext:
+    """State held between :meth:`begin_turn` and :meth:`complete_turn`."""
+
+    scope_key: str
+    turn_id: str
+    lease_token: str
+    request_fingerprint: str
+    outcome: object
+    replay_result: Optional[dict] = None
+
+    @property
+    def has_replay(self) -> bool:
+        return self.replay_result is not None
+
+
+def _begin_history_turn(
+    payload: dict,
+    conversation_id: Optional[str],
+    configs,
+) -> Optional[TurnContext]:
+    """Begin a durable turn. Returns ``None`` for the legacy flow."""
+
+    from utils.conversation_service import (
+        BeginTurnOutcome,
+        ConversationTurnError,
+        TurnRequest,
+        compute_request_fingerprint,
+        derive_scope_kind,
+        extract_workspace_id_from_scope,
+        get_conversation_service_for_workspace,
+    )
+
+    # Check if history persistence is requested
+    if not payload.get("persist_history", False):
+        return None
+
+    turn_id = payload.get("turn_id")
+    if not turn_id or not conversation_id:
+        return None
+
+    # Extract workspace_id from configs or scope_key
+    workspace_id = ""
+    if configs:
+        workspace_id = configs[0].get("WORKSPACE_ID", "")
+    if not workspace_id:
+        try:
+            workspace_id = extract_workspace_id_from_scope(conversation_id)
+        except ConversationTurnError:
+            return None
+
+    service = get_conversation_service_for_workspace(workspace_id)
+    if not service.enabled:
+        return None
+
+    raw_conversation_id = payload.get("conversation_id")
+    fingerprint = compute_request_fingerprint(
+        query=payload["query"],
+        model=payload.get("model"),
+        provider=payload.get("provider"),
+        temperature=payload.get("temperature"),
+        k=payload.get("k"),
+        knowledge_base_ids=payload.get("knowledge_base_ids"),
+        system_prompt_id=payload.get("system_prompt_id"),
+        response_language=payload.get("response_language"),
+        client_context=payload.get("client_context"),
+    )
+    request = TurnRequest(
+        scope_key=conversation_id,
+        scope_kind=derive_scope_kind(conversation_id),
+        client_conversation_id=raw_conversation_id or conversation_id,
+        turn_id=turn_id,
+        request_fingerprint=fingerprint,
+        parent_turn_id=payload.get("parent_turn_id"),
+        selected_knowledge_base_ids=payload.get("knowledge_base_ids"),
+        agent_id=payload.get("agent_id") or "",
+        agent_name=payload.get("agent_name") or "",
+        provider_id=payload.get("provider") or "",
+        model_id=payload.get("model") or "",
+        response_language=payload.get("response_language") or "auto",
+        workspace_id=workspace_id,
+    )
+
+    service.hydrate_for_prompt(conversation_id, conversation_id)
+
+    outcome = service.begin_turn(request)
+    if outcome.status == "disabled":
+        return None
+    if outcome.status == "new":
+        return TurnContext(
+            scope_key=conversation_id,
+            turn_id=turn_id,
+            lease_token=outcome.lease_token or "",
+            request_fingerprint=fingerprint,
+            outcome=outcome,
+        )
+    if outcome.status == "ready":
+        replay = _replay_result_from_staged(outcome.result, payload, configs)
+        return TurnContext(
+            scope_key=conversation_id,
+            turn_id=turn_id,
+            lease_token="",
+            request_fingerprint=fingerprint,
+            outcome=outcome,
+            replay_result=replay,
+        )
+    if outcome.status == "complete":
+        replay = _replay_result_from_messages(outcome.messages, payload, configs)
+        return TurnContext(
+            scope_key=conversation_id,
+            turn_id=turn_id,
+            lease_token="",
+            request_fingerprint=fingerprint,
+            outcome=outcome,
+            replay_result=replay,
+        )
+    if outcome.status == "generating":
+        raise ConversationTurnError(
+            "Turno in generazione su un altro worker",
+            code="turn_generating",
+            status_code=409,
+            retry_after=outcome.retry_after or 5,
+        )
+    if outcome.status == "conflict":
+        raise ConversationTurnError(
+            "turn_id in conflitto con una richiesta precedente",
+            code="turn_id_conflict",
+            status_code=409,
+        )
+    raise ConversationTurnError(
+        outcome.error or "Impossibile avviare il turno",
+        code=outcome.status or "turn_error",
+        status_code=409,
+    )
+
+
+def _replay_result_from_staged(result, payload, configs) -> dict:
+    if not isinstance(result, dict):
+        return {"answer": str(result), "context": [], "sources": []}
+    if payload.get("conversation_id"):
+        result["conversation_id"] = payload["conversation_id"]
+    result.update(_query_knowledge_base_response_fields(configs))
+    return result
+
+
+def _replay_result_from_messages(messages, payload, configs) -> dict:
+    answer = ""
+    model = payload.get("model") or ""
+    provider = payload.get("provider") or ""
+    for msg in reversed(messages or []):
+        if msg.get("role") == "assistant":
+            answer = msg.get("content", "")
+            break
+    result = {
+        "answer": answer,
+        "model": model,
+        "provider": provider,
+        "provider_name": provider,
+        "context": [],
+        "sources": [],
+        "usage": None,
+        "replayed": True,
+    }
+    if payload.get("conversation_id"):
+        result["conversation_id"] = payload["conversation_id"]
+    result.update(_query_knowledge_base_response_fields(configs))
+    return result
+
+
+def _complete_history_turn(
+    turn_ctx: TurnContext,
+    payload: dict,
+    result,
+    conversation_id: str,
+    configs,
+) -> None:
+    from utils.conversation_service import (
+        extract_workspace_id_from_scope,
+        get_conversation_service_for_workspace,
+    )
+
+    try:
+        workspace_id = extract_workspace_id_from_scope(conversation_id)
+    except Exception:
+        workspace_id = ""
+
+    service = get_conversation_service_for_workspace(workspace_id)
+    if not service.enabled:
+        return
+    assistant_content = ""
+    if isinstance(result, dict):
+        assistant_content = result.get("answer") or ""
+    sources = result.get("sources") if isinstance(result, dict) else None
+    service.complete_turn(
+        scope_key=conversation_id,
+        turn_id=turn_ctx.turn_id,
+        lease_token=turn_ctx.lease_token,
+        request_fingerprint=turn_ctx.request_fingerprint,
+        user_content=payload["query"],
+        assistant_content=assistant_content,
+        selected_knowledge_base_ids=payload.get("knowledge_base_ids"),
+        agent_id=payload.get("agent_id") or "",
+        agent_name=payload.get("agent_name") or "",
+        provider_id=payload.get("provider") or "",
+        model_id=payload.get("model") or "",
+        response_language=payload.get("response_language") or "auto",
+        sources=sources,
+        warm_conversation_id=conversation_id,
+        warm_knowledge_base_ids=payload.get("knowledge_base_ids"),
+    )
+
+
+def _fail_history_turn(turn_ctx: Optional[TurnContext], conversation_id: Optional[str] = None) -> None:
+    if turn_ctx is None:
+        return
+    from utils.conversation_service import (
+        extract_workspace_id_from_scope,
+        get_conversation_service_for_workspace,
+    )
+
+    workspace_id = ""
+    if conversation_id:
+        try:
+            workspace_id = extract_workspace_id_from_scope(conversation_id)
+        except Exception:
+            pass
+
+    service = get_conversation_service_for_workspace(workspace_id)
+    if not service.enabled:
+        return
+    service.fail_turn(turn_ctx.scope_key, turn_ctx.turn_id, turn_ctx.lease_token or None)
+
+
 def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
     from utils.index_lock import (
         assert_distributed_locks_healthy,
@@ -1143,6 +1436,8 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
     start = time.time()
     status = "success"
     configs = ()
+    turn_ctx = None
+    conversation_id: Optional[str] = None
 
     try:
         _ensure_request_not_timed_out()
@@ -1156,6 +1451,11 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             primary,
             plural_request=payload.get("knowledge_base_ids_explicit", False),
         )
+        turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+        if turn_ctx is not None and turn_ctx.has_replay and not stream:
+            return turn_ctx.replay_result
+        if turn_ctx is not None and turn_ctx.has_replay and stream:
+            return _replay_stream(turn_ctx, payload, conversation_id, configs)
         conversation_snapshot = _validate_conversation_knowledge_bases(
             conversation_id,
             configs,
@@ -1211,14 +1511,36 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
                 if payload.get("agent_id"):
                     result["agent_id"] = payload["agent_id"]
                     result["agent_name"] = payload.get("agent_name")
+                
+                # Add history status
+                if turn_ctx is not None:
+                    result["history_status"] = "saved"
+                    result["history_saved"] = True
+                elif payload.get("persist_history"):
+                    result["history_status"] = "not_requested"
+                    result["history_saved"] = False
+                else:
+                    result["history_status"] = "disabled"
+                    result["history_saved"] = False
+                
+                if turn_ctx is not None:
+                    _complete_history_turn(
+                        turn_ctx, payload, result, conversation_id, configs
+                    )
             elif stream:
                 result = _guard_stream_for_knowledge_bases(result, configs)
+                if turn_ctx is not None:
+                    result = _wrap_stream_for_history(
+                        result, turn_ctx, payload, conversation_id, configs
+                    )
             return result
     except RequestTimeoutExceeded:
         status = "timeout"
+        _fail_history_turn(turn_ctx, conversation_id)
         raise
     except Exception:
         status = "error"
+        _fail_history_turn(turn_ctx, conversation_id)
         _raise_if_query_knowledge_bases_became_unavailable(configs)
         raise
     finally:
@@ -1251,6 +1573,9 @@ def run_rag_query_events(payload: dict, public: bool = False):
         primary,
         plural_request=payload.get("knowledge_base_ids_explicit", False),
     )
+    turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+    if turn_ctx is not None and turn_ctx.has_replay:
+        return _replay_events(turn_ctx, payload, conversation_id, configs)
     conversation_snapshot = _validate_conversation_knowledge_bases(
         conversation_id,
         configs,
@@ -1262,6 +1587,8 @@ def run_rag_query_events(payload: dict, public: bool = False):
 
     def encode_events():
         nonlocal status
+        final_answer = ""
+        turn_completed = False
         try:
             with lifecycle_read_locks(
                 config["CHROMA_COLLECTION"] for config in configs
@@ -1327,6 +1654,13 @@ def run_rag_query_events(payload: dict, public: bool = False):
                             primary["KNOWLEDGE_BASE_ID"],
                         )
                     if (
+                        isinstance(event, dict)
+                        and event.get("type") == "done"
+                        and isinstance(event.get("answer"), str)
+                    ):
+                        final_answer = event["answer"]
+                        turn_completed = True
+                    if (
                         raw_conversation_id
                         and isinstance(event, dict)
                         and event.get("conversation_id")
@@ -1356,6 +1690,17 @@ def run_rag_query_events(payload: dict, public: bool = False):
                 return
             raise
         finally:
+            if turn_ctx is not None:
+                if status == "success" and turn_completed:
+                    _complete_history_turn(
+                        turn_ctx,
+                        payload,
+                        {"answer": final_answer},
+                        conversation_id,
+                        configs,
+                    )
+                else:
+                    _fail_history_turn(turn_ctx, conversation_id)
             metrics.end_query()
             duration = time.time() - start
             metrics.observe_query(duration=duration, status=status)
@@ -1398,6 +1743,96 @@ def _prime_stream(stream):
         yield from iterator
 
     return combined()
+
+
+def _replay_stream(turn_ctx, payload, conversation_id, configs):
+    """Yield a staged replay result as a text stream and complete the turn."""
+
+    answer = ""
+    if isinstance(turn_ctx.replay_result, dict):
+        answer = turn_ctx.replay_result.get("answer", "")
+    try:
+        yield answer
+    except Exception:
+        _fail_history_turn(turn_ctx, conversation_id)
+        raise
+    else:
+        _complete_history_turn(
+            turn_ctx, payload, {"answer": answer}, conversation_id, configs
+        )
+
+
+def _replay_events(turn_ctx, payload, conversation_id, configs):
+    """Yield a staged replay result as NDJSON events and complete the turn."""
+
+    replay = turn_ctx.replay_result or {}
+    answer = replay.get("answer", "")
+    model = replay.get("model", payload.get("model") or "")
+    provider = replay.get("provider", payload.get("provider") or "")
+    provider_name = replay.get("provider_name", provider)
+    raw_conversation_id = payload.get("conversation_id")
+    try:
+        meta_event = {
+            "type": "meta",
+            "model": model,
+            "provider": provider,
+            "provider_name": provider_name,
+            "response_language": payload.get("response_language", "auto"),
+            "replayed": True,
+        }
+        if raw_conversation_id:
+            meta_event["conversation_id"] = raw_conversation_id
+        meta_event.update(_query_knowledge_base_response_fields(configs))
+        if payload.get("agent_id"):
+            meta_event["agent_id"] = payload["agent_id"]
+            meta_event["agent_name"] = payload.get("agent_name")
+        yield json.dumps(meta_event, ensure_ascii=False) + "\n"
+
+        done_event = {
+            "type": "done",
+            "answer": answer,
+            "model": model,
+            "provider": provider,
+            "provider_name": provider_name,
+            "replayed": True,
+        }
+        if raw_conversation_id:
+            done_event["conversation_id"] = raw_conversation_id
+        done_event.update(_query_knowledge_base_response_fields(configs))
+        if payload.get("agent_id"):
+            done_event["agent_id"] = payload["agent_id"]
+            done_event["agent_name"] = payload.get("agent_name")
+        yield json.dumps(done_event, ensure_ascii=False) + "\n"
+    except Exception:
+        _fail_history_turn(turn_ctx, conversation_id)
+        raise
+    else:
+        _complete_history_turn(
+            turn_ctx, payload, {"answer": answer}, conversation_id, configs
+        )
+
+
+def _wrap_stream_for_history(stream, turn_ctx, payload, conversation_id, configs):
+    """Wrap a text stream to complete/fail the durable turn on exhaustion."""
+
+    collected = []
+
+    try:
+        for chunk in stream:
+            if isinstance(chunk, str):
+                collected.append(chunk)
+            yield chunk
+    except Exception:
+        _fail_history_turn(turn_ctx, conversation_id)
+        raise
+    else:
+        _complete_history_turn(
+            turn_ctx,
+            payload,
+            {"answer": "".join(collected)},
+            conversation_id,
+            configs,
+        )
 
 
 def _raise_if_knowledge_base_became_unavailable(config: dict | None) -> None:
@@ -4240,6 +4675,24 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     provider = data.get("provider") or None
     model = data.get("model") or None
     conversation_id = validate_conversation_id(data.get("conversation_id"), required=False)
+    turn_id = validate_string(
+        data.get("turn_id"),
+        "turn_id",
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+        required=False,
+    )
+    parent_turn_id = validate_string(
+        data.get("parent_turn_id"),
+        "parent_turn_id",
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+        required=False,
+    )
+    persist_history = validate_boolean(
+        data.get("persist_history", True),
+        field_name="persist_history",
+    )
     client_context = _validate_client_context(data.get("client_context"))
     response_language = _validate_response_language(data.get("response_language"))
     system_prompt_id = data.get("system_prompt_id") or None
@@ -4294,6 +4747,9 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "attached_files": attached_files,
         "knowledge_base_ids": knowledge_base_ids,
         "knowledge_base_ids_explicit": plural_selection,
+        "turn_id": turn_id,
+        "parent_turn_id": parent_turn_id,
+        "persist_history": persist_history,
     }
     if agent_id:
         payload["agent_id"] = agent_id

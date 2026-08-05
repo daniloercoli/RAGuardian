@@ -21,6 +21,7 @@ RAGuardian lets one deployment serve many people: each local user gets an isolat
 - **Advanced Embeddings**: Local, Regolo cloud, or custom OpenAI-compatible embeddings
 - **Smart Reranking**: BAAI local, Regolo remote, or custom OpenAI-compatible reranking
 - **Conversational Memory**: Context-aware responses with automatic summary compression
+- **Persistent Conversation History**: Optional per-workspace SQLite transcript that survives restarts and memory TTL expiry; list, open, rename, archive, and delete conversations from the UI or REST API
 - **Streaming Responses**: Real-time token streaming with NDJSON structured events
 - **Admin Dashboard**: Web UI for document/audio management, configuration, and monitoring
 - **Versioned REST API**: Production-ready APIs with authentication and rate limiting
@@ -127,6 +128,7 @@ See [Deployment](docs/DEPLOYMENT.md) for Redis, reverse proxy, logging, and prod
 - [Deployment](docs/DEPLOYMENT.md)
 - [API Reference](docs/API.md)
 - [OpenAPI Schema](docs/openapi.yaml)
+- [Conversation History Roadmap](docs/roadmap/conversation-history.md)
 - [WordPress Plugin](integrations/wordpress/rag-client/README.md)
 - [Public Repository Snapshot Workflow](docs/PUBLICATION.md)
 
@@ -144,6 +146,9 @@ See [Deployment](docs/DEPLOYMENT.md) for Redis, reverse proxy, logging, and prod
 | `app/utils/data_ingestion/` | Plugin contract, registry, Email IMAP, Microsoft Drive |
 | `app/utils/document_indexer.py` | Shared indexing pipeline for uploads and connectors |
 | `app/utils/rag_engine.py` | Retrieval, reranking, generation, conversation memory |
+| `app/utils/conversation_history_store.py` | Durable per-workspace SQLite conversation transcript store |
+| `app/utils/conversation_service.py` | Coordination layer between durable history, pending-turn buffer, and warm memory |
+| `app/routes/conversations.py` | Session-auth REST API for listing, renaming, archiving, and deleting conversations |
 | `integrations/` | External platform integrations (WordPress, etc.) |
 | `integrations/README.md` | Integration architecture, roadmap, and how to add new |
 | `integrations/wordpress/rag-client/` | WordPress plugin with modular PHP architecture |

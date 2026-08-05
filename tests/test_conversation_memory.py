@@ -149,6 +149,179 @@ def test_conversation_clear_if_version_removes_only_the_current_state():
     assert store.snapshot(conversation_id).version is None
 
 
+# ---------------------------------------------------------------------------
+# append_turn_once (idempotent append)
+# ---------------------------------------------------------------------------
+
+def test_append_turn_once_skips_when_last_user_matches():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:idempotent"
+    store.append_turn_once(
+        conversation_id,
+        user="Domanda",
+        assistant="Risposta",
+        knowledge_base_ids=["default"],
+    )
+    second = store.append_turn_once(
+        conversation_id,
+        user="Domanda",
+        assistant="Risposta diversa",
+        knowledge_base_ids=["default"],
+    )
+    assert second is None
+    snapshot = store.snapshot(conversation_id)
+    assert snapshot.version == 1
+    assert "Risposta diversa" not in snapshot.prompt_context
+
+
+def test_append_turn_once_appends_when_user_differs():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:idempotent"
+    store.append_turn_once(
+        conversation_id,
+        user="Prima domanda",
+        assistant="Prima risposta",
+    )
+    store.append_turn_once(
+        conversation_id,
+        user="Seconda domanda",
+        assistant="Seconda risposta",
+    )
+    snapshot = store.snapshot(conversation_id)
+    assert snapshot.version == 2
+    assert "Prima domanda" in snapshot.prompt_context
+    assert "Seconda domanda" in snapshot.prompt_context
+
+
+def test_append_turn_once_appends_when_state_empty():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:cold-start"
+    store.append_turn_once(
+        conversation_id,
+        user="Domanda",
+        assistant="Risposta",
+    )
+    assert store.snapshot(conversation_id).version == 1
+    assert "Domanda" in store.render_for_prompt(conversation_id)
+
+
+def test_append_turn_once_returns_none_for_empty_conversation_id():
+    store = ConversationMemoryStore()
+    assert store.append_turn_once(
+        None,
+        user="Domanda",
+        assistant="Risposta",
+    ) is None
+
+
+def test_append_turn_once_clamps_long_user_before_comparison():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:clamp"
+    long_user = "x" * (6000 + 100)
+    store.append_turn_once(
+        conversation_id,
+        user=long_user,
+        assistant="Risposta",
+    )
+    second = store.append_turn_once(
+        conversation_id,
+        user=long_user,
+        assistant="Risposta diversa",
+    )
+    assert second is None
+    assert store.snapshot(conversation_id).version == 1
+
+
+# ---------------------------------------------------------------------------
+# hydrate_if_absent
+# ---------------------------------------------------------------------------
+
+def test_hydrate_if_absent_populates_empty_memory():
+    from app.utils.conversation_memory import ConversationTurn
+
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:hydrate"
+    turns = [
+        ConversationTurn(user="Domanda A", assistant="Risposta A"),
+        ConversationTurn(user="Domanda B", assistant="Risposta B"),
+    ]
+    result = store.hydrate_if_absent(
+        conversation_id,
+        summary="Riassunto precedente.",
+        turns=turns,
+        knowledge_base_ids=["kb-a", "kb-b"],
+        version=5,
+    )
+    assert result is True
+    snapshot = store.snapshot(conversation_id)
+    assert snapshot.version == 5
+    assert "Riassunto precedente." in snapshot.prompt_context
+    assert "Domanda A" in snapshot.prompt_context
+    assert "Domanda B" in snapshot.prompt_context
+    assert snapshot.knowledge_base_ids == frozenset({"kb-a", "kb-b"})
+
+
+def test_hydrate_if_absent_returns_false_when_state_exists():
+    from app.utils.conversation_memory import ConversationTurn
+
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:hydrate-existing"
+    store.append_turn(
+        conversation_id,
+        user="Domanda warm",
+        assistant="Risposta warm",
+    )
+    result = store.hydrate_if_absent(
+        conversation_id,
+        summary="Riassunto che non dovrebbe sovrascrivere.",
+        turns=[ConversationTurn(user="Altro", assistant="Altro")],
+    )
+    assert result is False
+    snapshot = store.snapshot(conversation_id)
+    assert snapshot.version == 1
+    assert "Domanda warm" in snapshot.prompt_context
+    assert "Riassunto che non dovrebbe sovrascrivere." not in snapshot.prompt_context
+
+
+def test_hydrate_if_absent_returns_false_for_empty_conversation_id():
+    store = ConversationMemoryStore()
+    assert store.hydrate_if_absent(
+        None,
+        summary="Riassunto",
+        turns=[],
+    ) is False
+
+
+def test_hydrate_if_absent_defaults_version_to_turn_count():
+    from app.utils.conversation_memory import ConversationTurn
+
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:hydrate-default-version"
+    turns = [
+        ConversationTurn(user="A", assistant="A1"),
+        ConversationTurn(user="B", assistant="B1"),
+    ]
+    assert store.hydrate_if_absent(
+        conversation_id,
+        summary="",
+        turns=turns,
+    ) is True
+    assert store.snapshot(conversation_id).version == 2
+
+
+def test_hydrate_if_absent_accepts_empty_turns():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:hydrate-empty-turns"
+    assert store.hydrate_if_absent(
+        conversation_id,
+        summary="Solo riassunto.",
+        turns=[],
+        version=1,
+    ) is True
+    snapshot = store.snapshot(conversation_id)
+    assert "Solo riassunto." in snapshot.prompt_context
+
+
 def test_redis_clear_if_version_preserves_a_concurrent_append_and_markers():
     redis = FakeRedis()
     store = RedisConversationMemoryStore(

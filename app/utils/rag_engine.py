@@ -533,15 +533,19 @@ def generate_response(
     )
     temperature = temperature if temperature is not None else rag["temperature"]
 
-    if not context_docs:
+    if not context_docs and not rag["use_internal_knowledge"]:
         yield "Nessun documento caricato. Carica PDF dalla pagina admin File."
         return
 
-    context = "\n\n---\n\n".join(
-        _document_prompt_block(doc) for doc in context_docs
-    )
-    sources = [os.path.basename(doc.metadata.get("source", "?")) for doc in context_docs]
-    log.info(f"Context: {len(context_docs)} docs ({len(context)} char) � sources: {sources}")
+    if context_docs:
+        context = "\n\n---\n\n".join(
+            _document_prompt_block(doc) for doc in context_docs
+        )
+        sources = [os.path.basename(doc.metadata.get("source", "?")) for doc in context_docs]
+    else:
+        context = ""
+        sources = []
+    log.info(f"Context: {len(context_docs)} docs ({len(context)} char) — sources: {sources}")
     language_instruction = _response_language_instruction(response_language)
 
     if rag["use_internal_knowledge"]:
@@ -549,7 +553,7 @@ def generate_response(
 - {language_instruction}
 - Dai prioritaria importanza alle informazioni del contesto quando sono presenti
 - Usa il contesto conversazionale solo per capire riferimenti, preferenze e follow-up
-- Se il contesto � insufficiente, completa la risposta con la tua conoscenza interna
+- Se il contesto è insufficiente, completa la risposta con la tua conoscenza interna
 - Tieni presente che la conoscenza interna potrebbe contenere informazioni non aggiornate; preferisci sempre il contesto quando disponibile
 - Mantieni le risposte concise ma complete"""
     else:
@@ -557,7 +561,7 @@ def generate_response(
 - {language_instruction}
 - Non inventare informazioni
 - Usa il contesto conversazionale solo per capire riferimenti, preferenze e follow-up
-- Ammetti se il contesto � insufficiente
+- Ammetti se il contesto è insufficiente
 - Mantieni le risposte concise ma complete"""
 
     if custom_system_prompt:
@@ -566,10 +570,10 @@ def generate_response(
     conversation_block = conversation_context.strip() or "Nessun contesto conversazionale precedente."
     client_block = _client_context_block(client_context)
 
-    prompt = f"""--- CONTESTO DOCUMENTALE ---
-{context}
----
---- CONTESTO CONVERSAZIONE ---
+    context_section = (
+        f"--- CONTESTO DOCUMENTALE ---\n{context}\n---\n" if context else ""
+    )
+    prompt = f"""{context_section}--- CONTESTO CONVERSAZIONE ---
 {conversation_block}
 ---
 --- CONTESTO CLIENT ---

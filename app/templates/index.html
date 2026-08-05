@@ -18,6 +18,24 @@
         {% set nav_mode = "main" %}
         {% include "_page_header.html" %}
 
+        <aside class="history-drawer" id="historyDrawer" aria-label="Previous conversations" hidden role="complementary">
+            <div class="history-drawer-header">
+                <h3 id="historyDrawerTitle">Previous conversations</h3>
+                <button type="button" id="closeHistoryDrawer" class="icon-btn" title="Close drawer" aria-label="Close drawer">✕</button>
+            </div>
+            <div class="history-drawer-search">
+                <label class="sr-only" for="searchHistoryInput">Search conversations</label>
+                <input type="search" id="searchHistoryInput" placeholder="Search..." aria-label="Search conversations">
+            </div>
+            <div id="historyList" class="history-list" role="list"></div>
+            <div id="historyEmptyState" class="history-empty" hidden aria-live="polite">
+                <p>No conversations yet</p>
+            </div>
+            <div class="history-drawer-footer">
+                <button type="button" id="toggleHistoryDrawer" class="secondary">Show history</button>
+            </div>
+        </aside>
+
         <section class="chat-section">
             <div class="chat-toolbar" aria-label="Chat settings">
                 <label class="chat-control" for="agentSelect">
@@ -89,7 +107,8 @@
                     </div>
                 </div>
             </div>
-            <div id="streamStatus" class="stream-status" hidden>Generating response...</div>
+            <div id="streamStatus" class="stream-status" hidden aria-live="polite">Generating response...</div>
+            <div id="historyStatus" class="history-status" role="status" aria-live="polite" aria-atomic="true" hidden></div>
             <div class="input-extras">
                 <label class="toggle-label">
                     <input type="checkbox" id="codeInterpreterToggle">
@@ -109,7 +128,7 @@
             <input type="file" id="dataFileInput" class="audio-file-input" accept=".csv,.xlsx,.xls,.json,.parquet,.tsv,.zip,.png,.jpg,.jpeg,.gif,.pdf,.txt,.md" multiple>
         </section>
 
-        <div id="newChatModal" class="modal-backdrop" hidden>
+<div id="newChatModal" class="modal-backdrop" hidden>
             <section
                 class="modal-panel new-chat-modal-panel"
                 role="dialog"
@@ -119,11 +138,30 @@
             >
                 <h2 id="newChatModalTitle">Start a new chat?</h2>
                 <p id="newChatModalDescription" class="muted">
-                    This conversation is not saved. If you start a new chat, you won’t be able to return to it.
+                    This conversation is not saved. If you start a new chat, you won't be able to return to it.
                 </p>
                 <div class="modal-actions">
                     <button type="button" id="keepConversationButton" class="secondary">Keep conversation</button>
                     <button type="button" id="confirmNewChatButton" class="danger">Start new chat</button>
+                </div>
+            </section>
+        </div>
+
+        <div id="renameModal" class="modal-backdrop" hidden>
+            <section
+                class="modal-panel rename-modal-panel"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="renameModalTitle"
+            >
+                <h2 id="renameModalTitle">Rename conversation</h2>
+                <label class="form-grid">
+                    <span class="sr-only">New title</span>
+                    <input type="text" id="renameInput" placeholder="Enter new title" autocomplete="off">
+                </label>
+                <div class="modal-actions">
+                    <button type="button" id="cancelRenameButton" class="secondary">Cancel</button>
+                    <button type="button" id="confirmRenameButton">Rename</button>
                 </div>
             </section>
         </div>

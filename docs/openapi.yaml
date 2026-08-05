@@ -25,6 +25,8 @@ tags:
     description: Catalog and lifecycle management for isolated knowledge bases.
   - name: Chat Agents
     description: Named presets bundling a provider, model, knowledge bases, and prompt for query-by-agent_id.
+  - name: Conversation History
+    description: Session-auth endpoints for the persistent per-workspace conversation transcript.
   - name: OCR
     description: Text extraction from images and PDFs.
   - name: Speech
@@ -599,6 +601,259 @@ paths:
           $ref: "#/components/responses/KnowledgeBaseConflict"
         "500":
           $ref: "#/components/responses/ServerError"
+  /api/conversations:
+    get:
+      tags:
+        - Conversation History
+      operationId: listConversations
+      summary: List persisted conversations
+      description: |
+        Lists conversations persisted to the per-workspace SQLite history store
+        for the logged-in workspace. Conversations with zero messages are
+        hidden. Session-authenticated (browser login cookie + CSRF); not part of
+        the API-key v1 contract. Returns an empty list when history is
+        disabled (`RAG_CONVERSATION_HISTORY_ENABLED=0`).
+      security:
+        - SessionAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: per_page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - active
+              - archived
+        - name: archived
+          in: query
+          required: false
+          description: "Sets `status` when `status` is omitted. `true` -> archived, `false` -> active."
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+      responses:
+        "200":
+          description: Paginated conversation list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversations
+                  - pagination
+                properties:
+                  conversations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ConversationRecord"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /api/conversations/{history_id}:
+    get:
+      tags:
+        - Conversation History
+      operationId: getConversation
+      summary: Get a conversation record
+      description: |
+        Returns the full conversation record by its server-side UUID
+        `history_id`. Session-authenticated. Returns `404` when the id is not a
+        UUID, history is disabled, or the conversation belongs to another
+        workspace.
+      security:
+        - SessionAuth: []
+      parameters:
+        - name: history_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Conversation record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    patch:
+      tags:
+        - Conversation History
+      operationId: updateConversation
+      summary: Rename and/or archive a conversation
+      description: |
+        Updates the `title` and/or `archived` flag of a conversation.
+        Session-authenticated. `title` is max 120 chars; `archived` is a boolean.
+      security:
+        - SessionAuth: []
+      parameters:
+        - name: history_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                title:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                archived:
+                  type: boolean
+              additionalProperties: false
+      responses:
+        "200":
+          description: Updated conversation record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationRecord"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      tags:
+        - Conversation History
+      operationId: deleteConversation
+      summary: Hard-delete a conversation
+      description: |
+        Permanently deletes a conversation and all its messages and turn
+        records. Session-authenticated. Returns `{"deleted": false}` when
+        history is disabled.
+      security:
+        - SessionAuth: []
+      parameters:
+        - name: history_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - deleted
+                properties:
+                  deleted:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /api/conversations/{history_id}/messages:
+    get:
+      tags:
+        - Conversation History
+      operationId: listConversationMessages
+      summary: List messages for a conversation
+      description: |
+        Returns messages for a conversation with backward cursor pagination.
+        Messages are returned oldest-first within the requested window.
+        Session-authenticated.
+      security:
+        - SessionAuth: []
+      parameters:
+        - name: history_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: before_sequence
+          in: query
+          required: false
+          description: Fetch messages with `sequence <` this value (cursor from a previous page).
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Paginated messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - messages
+                  - next_cursor
+                  - limit
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ConversationMessage"
+                  next_cursor:
+                    description: "Sequence of the oldest message in the window, to pass as `before_sequence` for the previous page. `null` when there are no older messages."
+                    oneOf:
+                      - type: integer
+                      - type: "null"
+                  limit:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /api/v1/files:
     post:
       tags:
@@ -878,6 +1133,14 @@ components:
       in: header
       name: X-API-Key
       description: User/workspace API key configured from `/admin/api-keys`. `RAG_API_KEY` remains available as a legacy global compatibility key.
+    SessionAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: |
+        Browser session cookie issued after login. Used only by the
+        `/api/conversations/*` history-management endpoints, which back the
+        in-app history drawer and require CSRF protection.
   parameters:
     KnowledgeBaseId:
       name: knowledge_base_id
@@ -957,6 +1220,17 @@ components:
             missing:
               value:
                 error: Job non trovato
+                status: not_found
+    NotFoundError:
+      description: Conversation or resource not found, or history is disabled.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            notFound:
+              value:
+                error: Conversation not found
                 status: not_found
     ValidationError:
       description: Request payload failed validation.
@@ -1677,6 +1951,30 @@ components:
           minimum: 1
           maximum: 50
           description: Number of retrieved chunks.
+        persist_history:
+          type: boolean
+          default: true
+          description: |
+            When `true` and `turn_id` is present, persists the turn to the
+            durable per-workspace SQLite history store. When `false`, the turn
+            stays in warm memory only and `history_status` is `not_requested`.
+        turn_id:
+          type: string
+          minLength: 1
+          maxLength: 80
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          description: |
+            Stable id for the turn. Reuse it on retries to receive the persisted
+            result with `replayed: true` without regenerating. Required for
+            `persist_history` to take effect; without it the response carries
+            `history_status: client_turn_id_required`.
+        parent_turn_id:
+          type: string
+          maxLength: 80
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+          description: |
+            `turn_id` of the previous visible turn; enforces a linear chain.
+            Omit (or send `null`) for the first turn of a conversation.
       additionalProperties: false
     ClientContext:
       type: object
@@ -1755,6 +2053,22 @@ components:
             - type: object
               additionalProperties: true
             - type: "null"
+        history_status:
+          type: string
+          enum:
+            - saved
+            - not_requested
+            - disabled
+            - client_turn_id_required
+            - error
+          description: |
+            Outcome of the durable history turn. `saved` = persisted;
+            `not_requested` = `persist_history` was false; `disabled` = feature
+            flag off; `client_turn_id_required` = `turn_id` missing (memory
+            updated, nothing persisted); `error` = persistence failed.
+        history_saved:
+          type: boolean
+          description: Convenience boolean; `true` only when `history_status` is `saved`.
     ContextItem:
       type: object
       required:
@@ -1913,4 +2227,161 @@ components:
           type: integer
           minimum: 0
         file_deleted:
+          type: boolean
+    ConversationRecord:
+      type: object
+      description: |
+        A persisted conversation record from the per-workspace SQLite history
+        store. Identified by its server-side UUID `id`; the `client_conversation_id`
+        is the id supplied by the client.
+      required:
+        - id
+        - client_conversation_id
+        - scope_kind
+        - title
+        - status
+        - message_count
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Server-side UUID used by the history-management endpoints.
+        client_conversation_id:
+          type: string
+          description: Id originally supplied by the client.
+        scope_key:
+          type: string
+          description: Internal unique key used by the warm memory layer.
+        scope_kind:
+          type: string
+          enum:
+            - default
+            - kb
+            - multi
+        title:
+          type: string
+          maxLength: 120
+        status:
+          type: string
+          enum:
+            - active
+            - archived
+        agent_id:
+          type: string
+        agent_name:
+          type: string
+        provider_id:
+          type: string
+        model_id:
+          type: string
+        prompt_ref:
+          type: object
+          additionalProperties: true
+        response_language:
+          type: string
+        summary:
+          type: string
+        summary_version:
+          type: integer
+        summary_through_sequence:
+          type: integer
+        message_count:
+          type: integer
+          minimum: 0
+        payload_bytes:
+          type: integer
+          minimum: 0
+        last_turn_id:
+          oneOf:
+            - type: string
+            - type: "null"
+        has_incomplete_turn:
+          type: boolean
+          description: True when the conversation has at least one turn not yet completed.
+        created_at:
+          type: number
+          description: Unix timestamp (seconds).
+        updated_at:
+          type: number
+          description: Unix timestamp (seconds).
+        archived_at:
+          oneOf:
+            - type: number
+            - type: "null"
+    ConversationMessage:
+      type: object
+      description: A single message (user or assistant) in a persisted conversation.
+      required:
+        - id
+        - conversation_id
+        - turn_id
+        - role
+        - content
+        - sequence
+        - created_at
+      properties:
+        id:
+          type: integer
+        conversation_id:
+          type: string
+          format: uuid
+        turn_id:
+          type: string
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+        message_type:
+          type: string
+          description: Content kind, e.g. `text` or a Code Interpreter marker.
+        content:
+          type: string
+        sequence:
+          type: integer
+          minimum: 1
+          description: Monotonic position within the conversation; used as cursor.
+        sources:
+          type: array
+          description: Safe source list (no local paths or admin download URLs).
+          items:
+            type: object
+            additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+        payload_bytes:
+          type: integer
+          minimum: 0
+        created_at:
+          type: number
+          description: Unix timestamp (seconds).
+    Pagination:
+      type: object
+      description: Page-based pagination envelope.
+      required:
+        - page
+        - per_page
+        - total
+        - page_count
+        - has_prev
+        - has_next
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        per_page:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+        page_count:
+          type: integer
+          minimum: 1
+        has_prev:
+          type: boolean
+        has_next:
           type: boolean
