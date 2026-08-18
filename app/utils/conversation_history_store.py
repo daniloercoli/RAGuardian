@@ -1,7 +1,7 @@
 """Persistent conversation history backed by a per-workspace SQLite database.
 
 This module implements Phase 0/1 of the conversation-history roadmap:
-versioned migrations (``PRAGMA user_version``), the schema for
+fresh-install schema validation, the schema for
 conversations / messages / turn reservations, and the
 :class:`ConversationHistoryStore` that coordinates atomic turn completion,
 idempotent retries, summary compare-and-swap, pagination and quota.
@@ -25,6 +25,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from utils.conversation_artifacts import (
+    ConversationArtifactDeletionPlan,
+    ConversationArtifactReferences,
+    exclusive_references,
+    references_from_history_metadata,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -37,8 +44,14 @@ _TURN_ID_MAX_LEN = 80
 _REQUEST_FINGERPRINT_LEN = 64
 _LEASE_TOKEN_LEN = 32
 _SCOPE_KINDS = ("default", "kb", "multi")
-_TURN_STATUSES = ("generating", "ready", "complete", "failed")
 _CONVERSATION_STATUSES = ("active", "archived")
+_EXPECTED_TABLES = {
+    "conversations",
+    "conversation_knowledge_bases",
+    "turn_requests",
+    "messages",
+    "conversation_artifact_cleanup_outbox",
+}
 
 
 def _now() -> float:
@@ -133,12 +146,25 @@ class ConversationNotFoundError(ConversationHistoryError):
         super().__init__(message, code="conversation_not_found")
 
 
+class ConversationArchivedError(ConversationHistoryError):
+    def __init__(self, message: str = "conversation_archived"):
+        super().__init__(message, code="conversation_archived")
+
+
+class IncompatibleConversationSchemaError(ConversationHistoryError):
+    def __init__(self):
+        super().__init__(
+            "Unsupported conversation database schema; reset the local database",
+            code="incompatible_conversation_schema",
+        )
+
+
 # ---------------------------------------------------------------------------
-# Connection + migrations
+# Connection + fresh schema initialization
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS conversations (
+CREATE TABLE conversations (
   id                       TEXT PRIMARY KEY,
   client_conversation_id   TEXT NOT NULL,
   scope_key                TEXT NOT NULL UNIQUE,
@@ -164,12 +190,12 @@ CREATE TABLE IF NOT EXISTS conversations (
   archived_at              REAL
 );
 
-CREATE INDEX IF NOT EXISTS idx_conversations_updated
+CREATE INDEX idx_conversations_updated
   ON conversations(updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_conversations_status_updated
+CREATE INDEX idx_conversations_status_updated
   ON conversations(status, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS conversation_knowledge_bases (
+CREATE TABLE conversation_knowledge_bases (
   conversation_id          TEXT NOT NULL,
   knowledge_base_id        TEXT NOT NULL,
   is_selected              INTEGER NOT NULL DEFAULT 1
@@ -180,10 +206,10 @@ CREATE TABLE IF NOT EXISTS conversation_knowledge_bases (
   FOREIGN KEY (conversation_id)
     REFERENCES conversations(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_conversation_kb
+CREATE INDEX idx_conversation_kb
   ON conversation_knowledge_bases(knowledge_base_id, conversation_id);
 
-CREATE TABLE IF NOT EXISTS turn_requests (
+CREATE TABLE turn_requests (
   conversation_id          TEXT NOT NULL,
   turn_id                  TEXT NOT NULL,
   parent_turn_id           TEXT,
@@ -200,11 +226,11 @@ CREATE TABLE IF NOT EXISTS turn_requests (
   FOREIGN KEY (conversation_id)
     REFERENCES conversations(id) ON DELETE CASCADE
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_requests_linear_parent
+CREATE UNIQUE INDEX idx_turn_requests_linear_parent
   ON turn_requests(conversation_id, COALESCE(parent_turn_id, ''))
   WHERE status IN ('generating', 'ready', 'complete');
 
-CREATE TABLE IF NOT EXISTS messages (
+CREATE TABLE messages (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_id          TEXT NOT NULL,
   turn_id                  TEXT NOT NULL,
@@ -222,8 +248,14 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE (conversation_id, sequence),
   UNIQUE (conversation_id, turn_id, role)
 );
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_sequence
+CREATE INDEX idx_messages_conversation_sequence
   ON messages(conversation_id, sequence);
+
+CREATE TABLE conversation_artifact_cleanup_outbox (
+  cleanup_key              TEXT PRIMARY KEY,
+  references_json          TEXT NOT NULL,
+  created_at               REAL NOT NULL
+);
 """
 
 
@@ -238,37 +270,47 @@ def get_history_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open a connection to a per-workspace conversations database."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = not path.exists()
     conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn)
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            if candidate.exists():
+                os.chmod(candidate, 0o600)
+        except OSError:
+            pass
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    if created:
         _ensure_schema_with_connection(conn)
-    else:
-        _ensure_schema_with_connection(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
 def _ensure_schema_with_connection(conn: sqlite3.Connection) -> None:
-    current = conn.execute("PRAGMA user_version").fetchone()[0]
-    if current >= SCHEMA_VERSION:
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if current == SCHEMA_VERSION:
+        if tables != _EXPECTED_TABLES:
+            raise IncompatibleConversationSchemaError()
         return
+    if current != 0 or tables:
+        raise IncompatibleConversationSchemaError()
     conn.executescript(_SCHEMA_SQL)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
 
 def ensure_schema(db_path: str | Path) -> None:
-    """Create or migrate the schema. Safe to call on every access."""
+    """Create the current schema or validate an existing current database."""
     conn = get_history_connection(db_path)
-    try:
-        pass
-    finally:
-        conn.close()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +395,7 @@ class ConversationHistoryStore:
         *,
         workspace_data_dir: Optional[str | Path] = None,
         max_conversations: int = 200,
+        max_pending_turns: int = 100,
         max_messages_per_conversation: int = 2000,
         max_conversation_bytes: int = 33_554_432,
         max_message_chars: int = 50_000,
@@ -367,6 +410,7 @@ class ConversationHistoryStore:
         self.workspace_data_dir = Path(workspace_data_dir or "app/data/workspaces")
         self.path = self.workspace_data_dir / workspace_id / "conversations.db"
         self.max_conversations = max_conversations
+        self.max_pending_turns = max_pending_turns
         self.max_messages_per_conversation = max_messages_per_conversation
         self.max_conversation_bytes = max_conversation_bytes
         self.max_message_chars = max_message_chars
@@ -432,6 +476,8 @@ class ConversationHistoryStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                self._cleanup_expired_locked(conn, now)
+                self._enforce_conversation_quota_for_new_scope(conn, scope_key)
                 conversation = self._get_or_create_conversation(
                     conn,
                     client_conversation_id=client_conversation_id,
@@ -446,6 +492,20 @@ class ConversationHistoryStore:
                     now=now,
                 )
                 conversation_id = conversation["id"]
+
+                # Record KB ownership as soon as the reservation exists, not
+                # only after the answer commits.  This lets a destructive KB
+                # delete find and purge ready/generating stubs (and their
+                # staged payloads) after a worker crash.  New associations are
+                # deliberately not marked selected until ``complete_turn`` so
+                # a failed attempt does not change the last committed UI
+                # selection.
+                self._associate_reservation_knowledge_bases(
+                    conn,
+                    conversation_id,
+                    selected_knowledge_base_ids or [],
+                    now,
+                )
 
                 existing = conn.execute(
                     "SELECT * FROM turn_requests WHERE conversation_id = ? AND turn_id = ?",
@@ -523,9 +583,20 @@ class ConversationHistoryStore:
                 "status": "ready",
                 "replayed": True,
                 "result_digest": existing["result_digest"],
+                "lease_token": existing["lease_token"],
+                "lease_expires_at": existing["lease_expires_at"],
             }
 
         if status == "failed":
+            # A failed reservation releases its parent slot. Another turn may
+            # have completed from that parent in the meantime, so retrying the
+            # old row must re-check continuity before changing it back to an
+            # indexed (``generating``) status.
+            self._assert_linear_parent(
+                conn,
+                existing["conversation_id"],
+                existing["parent_turn_id"],
+            )
             lease_token = _new_lease_token()
             lease_expires = now + self.lease_seconds
             conn.execute(
@@ -581,43 +652,160 @@ class ConversationHistoryStore:
         conversation_id: str,
         parent_turn_id: Optional[str],
     ) -> None:
-        last_complete = conn.execute(
-            """
-            SELECT turn_id FROM turn_requests
-             WHERE conversation_id = ? AND status = 'complete'
-             ORDER BY updated_at DESC LIMIT 1
-            """,
+        conversation = conn.execute(
+            "SELECT last_turn_id FROM conversations WHERE id = ?",
             (conversation_id,),
         ).fetchone()
+        expected_parent_turn_id = (
+            conversation["last_turn_id"] if conversation is not None else None
+        )
 
         if parent_turn_id is None:
-            if last_complete is not None:
+            if expected_parent_turn_id is not None:
                 raise ContinuityError(
                     "parent_turn_id required: a complete turn exists",
-                    expected_parent_turn_id=last_complete["turn_id"],
+                    expected_parent_turn_id=expected_parent_turn_id,
                 )
             return
 
-        if last_complete is None:
+        if expected_parent_turn_id is None:
             raise ContinuityError(
                 "parent_turn_id does not match any complete turn",
                 expected_parent_turn_id=None,
             )
-        if last_complete["turn_id"] != parent_turn_id:
+        if expected_parent_turn_id != parent_turn_id:
             raise ContinuityError(
                 "parent_turn_id does not match last complete turn",
-                expected_parent_turn_id=last_complete["turn_id"],
+                expected_parent_turn_id=expected_parent_turn_id,
             )
 
     def _enforce_pending_quota(self, conn: sqlite3.Connection) -> None:
         count = conn.execute(
             """
             SELECT COUNT(*) FROM turn_requests
-             WHERE status IN ('generating', 'ready')
+             WHERE status != 'complete'
             """
         ).fetchone()[0]
-        if count >= self.max_conversations:
+        if self.max_pending_turns > 0 and count >= self.max_pending_turns:
             raise QuotaExceededError("pending turn quota exceeded")
+
+    def _enforce_conversation_quota_for_new_scope(
+        self,
+        conn: sqlite3.Connection,
+        scope_key: str,
+    ) -> None:
+        """Reject a new scope when the completed-conversation quota is full.
+
+        Empty reservation stubs do not count as conversations. The same check
+        is repeated at first completion so concurrent stubs cannot race past
+        the quota.
+        """
+
+        if self.max_conversations <= 0:
+            return
+        existing = conn.execute(
+            "SELECT 1 FROM conversations WHERE scope_key = ?", (scope_key,)
+        ).fetchone()
+        if existing is not None:
+            return
+        count = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE message_count > 0"
+        ).fetchone()[0]
+        if count >= self.max_conversations:
+            raise QuotaExceededError("conversation quota exceeded")
+
+    def _enforce_conversation_quota_on_first_commit(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        current_count: int,
+    ) -> None:
+        if self.max_conversations <= 0 or current_count > 0:
+            return
+        count = conn.execute(
+            """
+            SELECT COUNT(*) FROM conversations
+             WHERE message_count > 0 AND id != ?
+            """,
+            (conversation_id,),
+        ).fetchone()[0]
+        if count >= self.max_conversations:
+            raise QuotaExceededError("conversation quota exceeded")
+
+    def recover_ready_turn(
+        self,
+        scope_key: str,
+        turn_id: str,
+        *,
+        request_fingerprint: str,
+        expected_lease_token: Optional[str],
+    ) -> dict:
+        """Atomically replace a ``ready`` turn whose staged payload was lost.
+
+        Only the worker that observed the current lease may recover it. A race
+        with a successful completion returns the completed messages instead;
+        a race with another recovery is surfaced as ``TurnInProgressError``.
+        """
+
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._get_turn_for_update(conn, scope_key, turn_id)
+                if row is None:
+                    raise ConversationNotFoundError("turn not found")
+                if row["request_fingerprint"] != request_fingerprint:
+                    raise TurnConflictError()
+                if row["status"] == "complete":
+                    messages = self._messages_for_turn(
+                        conn, row["conversation_id"], turn_id
+                    )
+                    conn.rollback()
+                    return {
+                        "status": "complete",
+                        "replayed": True,
+                        "messages": messages,
+                    }
+                if row["status"] != "ready":
+                    raise TurnInProgressError()
+                if row["lease_token"] != expected_lease_token:
+                    raise TurnInProgressError()
+
+                lease_token = _new_lease_token()
+                lease_expires_at = now + self.lease_seconds
+                conn.execute(
+                    """
+                    UPDATE turn_requests
+                       SET status = 'generating', result_digest = NULL,
+                           lease_token = ?, lease_expires_at = ?, updated_at = ?
+                     WHERE conversation_id = ? AND turn_id = ?
+                    """,
+                    (
+                        lease_token,
+                        lease_expires_at,
+                        now,
+                        row["conversation_id"],
+                        turn_id,
+                    ),
+                )
+                conversation_row = conn.execute(
+                    "SELECT * FROM conversations WHERE id = ?",
+                    (row["conversation_id"],),
+                ).fetchone()
+                conn.commit()
+                return {
+                    "status": "new",
+                    "lease_token": lease_token,
+                    "lease_expires_at": lease_expires_at,
+                    "conversation": (
+                        _conversation_row(conversation_row)
+                        if conversation_row is not None
+                        else None
+                    ),
+                }
+            except Exception:
+                conn.rollback()
+                raise
 
     def mark_turn_ready(
         self,
@@ -711,6 +899,11 @@ class ConversationHistoryStore:
                 if conv is None:
                     raise ConversationNotFoundError("conversation not found")
 
+                self._enforce_conversation_quota_on_first_commit(
+                    conn,
+                    conversation_id,
+                    conv["message_count"],
+                )
                 self._enforce_message_quota(conn, conversation_id, conv["message_count"])
                 self._enforce_conversation_bytes(
                     conn, conversation_id, conv["payload_bytes"],
@@ -798,6 +991,7 @@ class ConversationHistoryStore:
                         turn_id, now, conversation_id,
                     ),
                 )
+                messages = self._messages_for_turn(conn, conversation_id, turn_id)
                 conn.commit()
 
                 return {
@@ -806,6 +1000,7 @@ class ConversationHistoryStore:
                     "message_count": new_message_count,
                     "payload_bytes": new_payload_bytes,
                     "title": title,
+                    "messages": messages,
                 }
             except Exception:
                 conn.rollback()
@@ -892,7 +1087,8 @@ class ConversationHistoryStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT id FROM conversations WHERE id = ?", (history_id,)
+                    "SELECT id, last_turn_id FROM conversations WHERE id = ?",
+                    (history_id,),
                 ).fetchone()
                 if row is None:
                     raise ConversationNotFoundError()
@@ -911,22 +1107,35 @@ class ConversationHistoryStore:
                 )
                 cleaned = expired.rowcount
 
-                last_complete = conn.execute(
-                    """
-                    SELECT turn_id FROM turn_requests
-                     WHERE conversation_id = ? AND status = 'complete'
-                     ORDER BY updated_at DESC LIMIT 1
-                    """,
-                    (history_id,),
-                ).fetchone()
-
                 conn.commit()
                 return {
-                    "parent_turn_id": (
-                        last_complete["turn_id"] if last_complete else None
-                    ),
+                    "parent_turn_id": row["last_turn_id"],
                     "cleaned_up_leases": cleaned,
                 }
+            except Exception:
+                conn.rollback()
+                raise
+
+    def cleanup_expired(self, *, now: Optional[float] = None) -> dict:
+        """Apply active-history and incomplete-turn retention policies.
+
+        Archived conversations are never removed by time retention. Expired
+        generating leases first become failed; old ``ready``/``failed`` rows
+        and empty reservation stubs are then removed after the configured
+        incomplete-turn retention window.
+
+        Returned scope/turn identifiers let :class:`ConversationService`
+        remove corresponding warm and staged state without coupling this
+        durable store to either backend.
+        """
+
+        effective_now = _now() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._cleanup_expired_locked(conn, effective_now)
+                conn.commit()
+                return result
             except Exception:
                 conn.rollback()
                 raise
@@ -979,7 +1188,7 @@ class ConversationHistoryStore:
                      WHERE conversation_id = ? AND sequence < ?
                      ORDER BY sequence DESC LIMIT ?
                     """,
-                    (history_id, before_sequence, limit),
+                    (history_id, before_sequence, limit + 1),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -988,14 +1197,50 @@ class ConversationHistoryStore:
                      WHERE conversation_id = ?
                      ORDER BY sequence DESC LIMIT ?
                     """,
-                    (history_id, limit),
+                    (history_id, limit + 1),
                 ).fetchall()
+            has_more = len(rows) > limit
+            if has_more:
+                rows = rows[:limit]
             messages = [_message_row(r) for r in rows]
             messages.reverse()
             next_cursor = None
-            if len(messages) == limit and messages:
+            if has_more and messages:
                 next_cursor = messages[0]["sequence"]
             return messages, next_cursor
+
+    def list_messages_after_sequence(
+        self,
+        history_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 200,
+    ) -> tuple[list[dict], Optional[int]]:
+        """Read an ascending durable tail without materializing the transcript."""
+
+        limit = max(1, min(limit, 200))
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM conversations WHERE id = ?", (history_id,)
+            ).fetchone()
+            if exists is None:
+                raise ConversationNotFoundError(history_id)
+            rows = conn.execute(
+                """
+                SELECT * FROM messages
+                 WHERE conversation_id = ? AND sequence > ?
+                 ORDER BY sequence ASC LIMIT ?
+                """,
+                (history_id, max(0, int(after_sequence)), limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            if has_more:
+                rows = rows[:limit]
+            messages = [_message_row(row) for row in rows]
+            next_after = None
+            if has_more and messages:
+                next_after = int(messages[-1]["sequence"])
+            return messages, next_after
 
     def list(
         self,
@@ -1045,43 +1290,34 @@ class ConversationHistoryStore:
     # ------------------------------------------------------------------
 
     def rename(self, history_id: str, title: str) -> dict:
-        title = (title or "").strip()
-        if not title:
-            raise ConversationHistoryError("title cannot be empty")
-        if len(title) > TITLE_RENAME_MAX_LEN:
-            raise ConversationHistoryError(
-                f"title exceeds {TITLE_RENAME_MAX_LEN} characters"
-            )
-        now = _now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    "SELECT * FROM conversations WHERE id = ?", (history_id,)
-                ).fetchone()
-                if row is None:
-                    raise ConversationNotFoundError()
-                conn.execute(
-                    "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
-                    (title, now, history_id),
-                )
-                conn.commit()
-                return {**_conversation_row(row), "title": title}
-            except Exception:
-                conn.rollback()
-                raise
+        return self.update_conversation(history_id, title=title)
 
     def archive(self, history_id: str) -> dict:
-        return self._set_status(history_id, "archived")
+        return self.update_conversation(history_id, archived=True)
 
     def unarchive(self, history_id: str) -> dict:
-        return self._set_status(history_id, "active")
+        return self.update_conversation(history_id, archived=False)
 
-    def _set_status(self, history_id: str, status: str) -> dict:
-        if status not in _CONVERSATION_STATUSES:
-            raise ConversationHistoryError("invalid status")
+    def update_conversation(
+        self,
+        history_id: str,
+        *,
+        title: Optional[str] = None,
+        archived: Optional[bool] = None,
+    ) -> dict:
+        """Atomically rename and/or change archive status."""
+
+        if title is not None:
+            title = str(title).strip()
+            if not title:
+                raise ConversationHistoryError("title cannot be empty")
+            if len(title) > TITLE_RENAME_MAX_LEN:
+                raise ConversationHistoryError(
+                    f"title exceeds {TITLE_RENAME_MAX_LEN} characters"
+                )
+        if archived is not None and not isinstance(archived, bool):
+            raise ConversationHistoryError("archived must be boolean")
         now = _now()
-        archived_at = now if status == "archived" else None
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1090,18 +1326,43 @@ class ConversationHistoryStore:
                 ).fetchone()
                 if row is None:
                     raise ConversationNotFoundError()
+                if archived is True:
+                    incomplete = conn.execute(
+                        """
+                        SELECT 1 FROM turn_requests
+                         WHERE conversation_id = ?
+                           AND status IN ('generating', 'ready')
+                         LIMIT 1
+                        """,
+                        (history_id,),
+                    ).fetchone()
+                    if incomplete is not None:
+                        raise TurnInProgressError(
+                            "cannot archive a conversation with an active turn"
+                        )
+                next_title = title if title is not None else row["title"]
+                next_status = row["status"]
+                archived_at = row["archived_at"]
+                if archived is True:
+                    next_status = "archived"
+                    archived_at = now
+                elif archived is False:
+                    next_status = "active"
+                    archived_at = None
                 conn.execute(
                     """
                     UPDATE conversations
-                       SET status = ?, archived_at = ?, updated_at = ?
+                       SET title = ?, status = ?, archived_at = ?, updated_at = ?
                      WHERE id = ?
                     """,
-                    (status, archived_at, now, history_id),
+                    (next_title, next_status, archived_at, now, history_id),
                 )
                 conn.commit()
                 result = _conversation_row(row)
-                result["status"] = status
+                result["title"] = next_title
+                result["status"] = next_status
                 result["archived_at"] = archived_at
+                result["updated_at"] = now
                 return result
             except Exception:
                 conn.rollback()
@@ -1171,6 +1432,150 @@ class ConversationHistoryStore:
                 conn.rollback()
                 raise
 
+    def delete_with_artifact_cleanup(
+        self,
+        history_id: str,
+    ) -> tuple[bool, ConversationArtifactDeletionPlan]:
+        """Atomically delete one conversation and persist its cleanup plan."""
+
+        cleanup_key = f"conversation:{history_id}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT id FROM conversations WHERE id = ?", (history_id,)
+                ).fetchone()
+                if row is None:
+                    plan = self._artifact_cleanup_outbox_locked(
+                        conn, cleanup_key, (history_id,)
+                    )
+                    conn.commit()
+                    return False, plan
+                plan = self._artifact_cleanup_plan_locked(conn, (history_id,))
+                if plan.safe:
+                    self._stage_artifact_cleanup_locked(
+                        conn, cleanup_key, plan.exclusive
+                    )
+                conn.execute(
+                    "DELETE FROM conversations WHERE id = ?", (history_id,)
+                )
+                conn.commit()
+                return True, plan
+            except Exception:
+                conn.rollback()
+                raise
+
+    def complete_artifact_cleanup(self, cleanup_key: str) -> bool:
+        if not cleanup_key:
+            return False
+        with self._connect() as conn:
+            result = conn.execute(
+                "DELETE FROM conversation_artifact_cleanup_outbox "
+                "WHERE cleanup_key = ?",
+                (cleanup_key,),
+            )
+            conn.commit()
+            return bool(result.rowcount)
+
+    def artifact_cleanup_plan(
+        self,
+        history_ids: list[str] | tuple[str, ...] | set[str],
+    ) -> ConversationArtifactDeletionPlan:
+        """Snapshot artifact ownership before deleting conversations.
+
+        The returned ``exclusive`` references occur in the target set but in
+        no retained durable conversation.  Invalid/corrupt metadata makes the
+        plan unsafe and therefore empty: leaking an artifact is preferable to
+        deleting a file whose ownership cannot be proven.
+        """
+
+        requested_ids = sorted(
+            {
+                str(history_id)
+                for history_id in history_ids
+                if str(history_id or "")
+            }
+        )
+        if not requested_ids:
+            return ConversationArtifactDeletionPlan(
+                conversation_ids=(),
+                target=ConversationArtifactReferences(),
+                retained=ConversationArtifactReferences(),
+                exclusive=ConversationArtifactReferences(),
+            )
+
+        placeholders = ",".join("?" for _ in requested_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM conversations WHERE id IN ({placeholders})",
+                requested_ids,
+            ).fetchall()
+            existing_ids = tuple(sorted(row["id"] for row in rows))
+            return self._artifact_cleanup_plan_locked(conn, existing_ids)
+
+    def artifact_cleanup_plan_by_knowledge_base(
+        self,
+        knowledge_base_id: str,
+    ) -> ConversationArtifactDeletionPlan:
+        """Snapshot exclusive artifacts for the KB hard-delete cascade."""
+
+        if not knowledge_base_id:
+            return ConversationArtifactDeletionPlan(
+                conversation_ids=(),
+                target=ConversationArtifactReferences(),
+                retained=ConversationArtifactReferences(),
+                exclusive=ConversationArtifactReferences(),
+            )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT conversation_id
+                  FROM conversation_knowledge_bases
+                 WHERE knowledge_base_id = ?
+                 ORDER BY conversation_id ASC
+                """,
+                (knowledge_base_id,),
+            ).fetchall()
+            conversation_ids = tuple(row["conversation_id"] for row in rows)
+            return self._artifact_cleanup_plan_locked(conn, conversation_ids)
+
+    def _artifact_cleanup_plan_locked(
+        self,
+        conn: sqlite3.Connection,
+        conversation_ids: tuple[str, ...],
+    ) -> ConversationArtifactDeletionPlan:
+        target_ids = set(conversation_ids)
+        target = ConversationArtifactReferences()
+        retained = ConversationArtifactReferences()
+        safe = True
+
+        if target_ids:
+            rows = conn.execute(
+                "SELECT conversation_id, metadata FROM messages"
+            ).fetchall()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    safe = False
+                    continue
+                references = references_from_history_metadata(metadata)
+                if row["conversation_id"] in target_ids:
+                    target = target.union(references)
+                else:
+                    retained = retained.union(references)
+
+        exclusive = ConversationArtifactReferences()
+        if safe:
+            exclusive = exclusive_references(target, retained)
+        return ConversationArtifactDeletionPlan(
+            conversation_ids=conversation_ids,
+            target=target,
+            retained=retained,
+            exclusive=exclusive,
+            safe=safe,
+        )
+
     def delete_by_knowledge_base(self, knowledge_base_id: str) -> int:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1195,6 +1600,136 @@ class ConversationHistoryStore:
                 conn.rollback()
                 raise
 
+    def delete_by_knowledge_base_with_artifact_cleanup(
+        self,
+        knowledge_base_id: str,
+    ) -> tuple[int, ConversationArtifactDeletionPlan]:
+        """Cascade a KB and checkpoint exclusive artifacts in one commit."""
+
+        cleanup_key = f"knowledge-base:{knowledge_base_id}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT conversation_id
+                      FROM conversation_knowledge_bases
+                     WHERE knowledge_base_id = ?
+                     ORDER BY conversation_id ASC
+                    """,
+                    (knowledge_base_id,),
+                ).fetchall()
+                conversation_ids = tuple(row["conversation_id"] for row in rows)
+                if not conversation_ids:
+                    plan = self._artifact_cleanup_outbox_locked(
+                        conn, cleanup_key, ()
+                    )
+                    conn.commit()
+                    return 0, plan
+                plan = self._artifact_cleanup_plan_locked(conn, conversation_ids)
+                if plan.safe:
+                    self._stage_artifact_cleanup_locked(
+                        conn, cleanup_key, plan.exclusive
+                    )
+                for conversation_id in conversation_ids:
+                    conn.execute(
+                        "DELETE FROM conversations WHERE id = ?",
+                        (conversation_id,),
+                    )
+                conn.commit()
+                return len(conversation_ids), plan
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _stage_artifact_cleanup_locked(
+        self,
+        conn: sqlite3.Connection,
+        cleanup_key: str,
+        references: ConversationArtifactReferences,
+    ) -> None:
+        payload = {
+            "attachment_ids": sorted(references.attachment_ids),
+            "image_names": sorted(references.image_names),
+            "run_ids": sorted(references.run_ids),
+        }
+        conn.execute(
+            """
+            INSERT INTO conversation_artifact_cleanup_outbox
+                   (cleanup_key, references_json, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cleanup_key) DO UPDATE SET
+                references_json = excluded.references_json,
+                created_at = excluded.created_at
+            """,
+            (cleanup_key, _canonical_json(payload), _now()),
+        )
+
+    def _artifact_cleanup_outbox_locked(
+        self,
+        conn: sqlite3.Connection,
+        cleanup_key: str,
+        conversation_ids: tuple[str, ...],
+    ) -> ConversationArtifactDeletionPlan:
+        row = conn.execute(
+            "SELECT references_json FROM conversation_artifact_cleanup_outbox "
+            "WHERE cleanup_key = ?",
+            (cleanup_key,),
+        ).fetchone()
+        if row is None:
+            return ConversationArtifactDeletionPlan(
+                conversation_ids=conversation_ids,
+                target=ConversationArtifactReferences(),
+                retained=ConversationArtifactReferences(),
+                exclusive=ConversationArtifactReferences(),
+                safe=False,
+            )
+        try:
+            payload = json.loads(row["references_json"] or "{}")
+            references = ConversationArtifactReferences(
+                attachment_ids=frozenset(payload.get("attachment_ids") or ()),
+                image_names=frozenset(payload.get("image_names") or ()),
+                run_ids=frozenset(payload.get("run_ids") or ()),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ConversationArtifactDeletionPlan(
+                conversation_ids=conversation_ids,
+                target=ConversationArtifactReferences(),
+                retained=ConversationArtifactReferences(),
+                exclusive=ConversationArtifactReferences(),
+                safe=False,
+            )
+        return ConversationArtifactDeletionPlan(
+            conversation_ids=conversation_ids,
+            target=references,
+            retained=ConversationArtifactReferences(),
+            exclusive=references,
+            safe=True,
+        )
+
+    def scope_keys_by_knowledge_base(self, knowledge_base_id: str) -> list[str]:
+        """Return conversation scope keys that reference a knowledge base.
+
+        Callers that own volatile per-scope state can take this snapshot before
+        :meth:`delete_by_knowledge_base` and clear those caches after the
+        durable cascade succeeds.
+        """
+        if not knowledge_base_id:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.scope_key
+                  FROM conversations AS c
+                  JOIN conversation_knowledge_bases AS ckb
+                    ON ckb.conversation_id = c.id
+                 WHERE ckb.knowledge_base_id = ?
+                 ORDER BY c.scope_key ASC
+                """,
+                (knowledge_base_id,),
+            ).fetchall()
+            return [row["scope_key"] for row in rows]
+
     def count_by_knowledge_base(self, knowledge_base_id: str) -> int:
         with self._connect() as conn:
             return conn.execute(
@@ -1207,6 +1742,7 @@ class ConversationHistoryStore:
             ).fetchone()[0]
 
     def quota_status(self) -> dict:
+        self.cleanup_expired()
         with self._connect() as conn:
             total_conversations = conn.execute(
                 "SELECT COUNT(*) FROM conversations WHERE message_count > 0"
@@ -1223,11 +1759,106 @@ class ConversationHistoryStore:
                 "bytes": total_bytes,
                 "max_bytes": self.max_history_bytes,
                 "pending_turns": pending,
+                "max_pending_turns": self.max_pending_turns,
             }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _cleanup_expired_locked(
+        self,
+        conn: sqlite3.Connection,
+        now: float,
+    ) -> dict:
+        deleted_scope_keys: list[str] = []
+        deleted_turns: list[dict] = []
+        conversations_deleted = 0
+        turns_deleted = 0
+
+        # An expired lease no longer represents active work. Keep the failed
+        # row until incomplete retention elapses so retries retain fingerprint
+        # conflict semantics during that window.
+        expired = conn.execute(
+            """
+            UPDATE turn_requests
+               SET status = 'failed', lease_token = NULL,
+                   lease_expires_at = NULL
+             WHERE status = 'generating'
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?
+            """,
+            (now,),
+        )
+        expired_leases_failed = max(0, expired.rowcount)
+
+        if self.retention_days > 0:
+            cutoff = now - (self.retention_days * 86_400)
+            rows = conn.execute(
+                """
+                SELECT id, scope_key FROM conversations AS c
+                 WHERE c.status = 'active'
+                   AND c.message_count > 0
+                   AND c.updated_at < ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM turn_requests AS t
+                        WHERE t.conversation_id = c.id
+                          AND t.status IN ('generating', 'ready')
+                   )
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                conn.execute("DELETE FROM conversations WHERE id = ?", (row["id"],))
+                deleted_scope_keys.append(row["scope_key"])
+            conversations_deleted += len(rows)
+
+        if self.incomplete_turn_retention_days > 0:
+            cutoff = now - (self.incomplete_turn_retention_days * 86_400)
+            rows = conn.execute(
+                """
+                SELECT t.conversation_id, t.turn_id, c.scope_key
+                  FROM turn_requests AS t
+                  JOIN conversations AS c ON c.id = t.conversation_id
+                 WHERE t.status IN ('ready', 'failed')
+                   AND t.updated_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "DELETE FROM turn_requests WHERE conversation_id = ? AND turn_id = ?",
+                    (row["conversation_id"], row["turn_id"]),
+                )
+                deleted_turns.append(
+                    {"scope_key": row["scope_key"], "turn_id": row["turn_id"]}
+                )
+            turns_deleted += len(rows)
+
+            stub_rows = conn.execute(
+                """
+                SELECT c.id, c.scope_key FROM conversations AS c
+                 WHERE c.message_count = 0
+                   AND c.updated_at < ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM turn_requests AS t
+                        WHERE t.conversation_id = c.id
+                   )
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in stub_rows:
+                conn.execute("DELETE FROM conversations WHERE id = ?", (row["id"],))
+                deleted_scope_keys.append(row["scope_key"])
+            conversations_deleted += len(stub_rows)
+
+        return {
+            "conversations_deleted": conversations_deleted,
+            "turns_deleted": turns_deleted,
+            "expired_leases_failed": expired_leases_failed,
+            "deleted_scope_keys": deleted_scope_keys,
+            "deleted_turns": deleted_turns,
+        }
 
     def _get_turn_for_update(
         self,
@@ -1267,6 +1898,8 @@ class ConversationHistoryStore:
             "SELECT * FROM conversations WHERE scope_key = ?", (scope_key,)
         ).fetchone()
         if row is not None:
+            if row["status"] == "archived":
+                raise ConversationArchivedError()
             return _conversation_row(row)
         conversation_id = _new_id()
         conn.execute(
@@ -1374,6 +2007,28 @@ class ConversationHistoryStore:
                     """,
                     (conversation_id, kb_id),
                 )
+
+    def _associate_reservation_knowledge_bases(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        knowledge_base_ids: list[str],
+        now: float,
+    ) -> None:
+        """Persist KB ownership for an incomplete turn without selecting it."""
+
+        for kb_id in dict.fromkeys(knowledge_base_ids):
+            if not kb_id:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversation_knowledge_bases
+                    (conversation_id, knowledge_base_id, is_selected,
+                     first_used_at, last_used_at)
+                VALUES (?, ?, 0, ?, ?)
+                """,
+                (conversation_id, kb_id, now, now),
+            )
 
     def _load_knowledge_bases(
         self,

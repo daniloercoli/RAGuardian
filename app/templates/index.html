@@ -27,12 +27,16 @@
                 <label class="sr-only" for="searchHistoryInput">Search conversations</label>
                 <input type="search" id="searchHistoryInput" placeholder="Search..." aria-label="Search conversations">
             </div>
+            <div class="history-drawer-filters" aria-label="Conversation status">
+                <button type="button" id="historyActiveFilter" class="history-filter-button" data-history-status="active" aria-pressed="true">Active</button>
+                <button type="button" id="historyArchivedFilter" class="history-filter-button" data-history-status="archived" aria-pressed="false">Archived</button>
+            </div>
             <div id="historyList" class="history-list" role="list"></div>
             <div id="historyEmptyState" class="history-empty" hidden aria-live="polite">
-                <p>No conversations yet</p>
+                <p id="historyEmptyMessage">No active conversations yet</p>
             </div>
             <div class="history-drawer-footer">
-                <button type="button" id="toggleHistoryDrawer" class="secondary">Show history</button>
+                <button type="button" id="historyLoadMore" class="secondary" hidden>Load more</button>
             </div>
         </aside>
 
@@ -157,7 +161,7 @@
                 <h2 id="renameModalTitle">Rename conversation</h2>
                 <label class="form-grid">
                     <span class="sr-only">New title</span>
-                    <input type="text" id="renameInput" placeholder="Enter new title" autocomplete="off">
+                    <input type="text" id="renameInput" placeholder="Enter new title" autocomplete="off" maxlength="120">
                 </label>
                 <div class="modal-actions">
                     <button type="button" id="cancelRenameButton" class="secondary">Cancel</button>

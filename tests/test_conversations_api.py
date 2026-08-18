@@ -294,6 +294,28 @@ class TestConversationsAPI:
         )
         assert response.status_code == 400
 
+    def test_update_rejects_malformed_json_with_json_error(
+        self,
+        client,
+        setup_conversations,
+    ):
+        conv_id = setup_conversations["conv_id"]
+        response = client.patch(
+            f"/api/conversations/{conv_id}",
+            data="{",
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        assert response.get_json()["code"] == "validation_error"
+
+    def test_conversation_error_handlers_do_not_change_unrelated_routes(self, client):
+        response = client.get("/route-that-does-not-exist")
+
+        assert response.status_code == 404
+        assert response.mimetype == "text/html"
+
     def test_archive_conversation(self, client, setup_conversations):
         conv_id = setup_conversations["conv_id"]
         response = client.patch(

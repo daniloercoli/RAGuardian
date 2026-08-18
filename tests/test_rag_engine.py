@@ -57,6 +57,60 @@ def test_public_sources_are_sanitized(tmp_path):
     ]
 
 
+def test_source_metadata_uses_public_allowlist_without_mutating_document(
+    tmp_path,
+):
+    local_source = str(tmp_path / "private" / "manual.pdf")
+    metadata = {
+        "source": local_source,
+        "knowledge_base_origins": [
+            {
+                "knowledge_base_id": "kb-1",
+                "source": "/srv/rag/uploads/manual.pdf",
+                "details": {
+                    "file_path": r"C:\Users\operator\secret\extract.txt",
+                    "debug_value": "/var/tmp/rag/debug.json",
+                },
+            },
+            {
+                "knowledge_base_id": "kb-web",
+                "source": "https://docs.example.test/guide.html",
+            },
+        ],
+        "provenance": {
+            "local_path": "../private/cache.bin",
+        },
+        "authorization": "Bearer super-secret",
+        "admin_url": "https://internal.example.test/signed?token=secret",
+        "system_prompt": "private instructions",
+    }
+    doc = SimpleNamespace(page_content="Contenuto", metadata=metadata)
+
+    context = _serialize_context([doc], include_downloads=False)
+    source = _serialize_sources([doc])[0]
+
+    assert source["filename"] == "manual.pdf"
+    origins = source["knowledge_base_origins"]
+    assert origins[0]["source"] == "manual.pdf"
+    assert "details" not in origins[0]
+    assert origins[1]["source"] == "guide.html"
+    assert context[0]["metadata"]["source"] == "manual.pdf"
+    assert "provenance" not in context[0]["metadata"]
+    assert "authorization" not in context[0]["metadata"]
+    assert "admin_url" not in context[0]["metadata"]
+    assert "system_prompt" not in context[0]["metadata"]
+
+    exposed = repr({"context": context, "sources": [source]})
+    assert str(tmp_path) not in exposed
+    assert "/srv/rag" not in exposed
+    assert "C:\\Users\\operator" not in exposed
+    assert "/var/tmp/rag" not in exposed
+    assert "super-secret" not in exposed
+    assert "private instructions" not in exposed
+    assert metadata["source"] == local_source
+    assert metadata["knowledge_base_origins"][0]["source"].startswith("/srv/")
+
+
 def test_query_rag_stream_events_returns_tokens_and_final_context(tmp_path, monkeypatch):
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()

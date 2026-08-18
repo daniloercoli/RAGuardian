@@ -22,6 +22,7 @@ import subprocess
 import tarfile
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -51,6 +52,8 @@ WORKSPACE_UPLOAD_DIR = Path(
 )
 _INITIAL_WORKSPACE_DATA_DIR = WORKSPACE_DATA_DIR
 _INITIAL_WORKSPACE_UPLOAD_DIR = WORKSPACE_UPLOAD_DIR
+SQLITE_CATALOG_SCHEMA_VERSION = 1
+SQLITE_DATABASE_SCHEMA_VERSION = 1
 
 
 class BackupError(RuntimeError):
@@ -76,7 +79,7 @@ def _sha256(path: Path) -> str:
 
 
 # ======================================================================
-# SQLITE WAL FLUSH (must run before snapshot)
+# SQLITE SNAPSHOTS
 # ======================================================================
 def _checkpoint_chroma(path: Path) -> None:
     """Force ChromaDB SQLite WAL → FULL so hot snapshot is consistent."""
@@ -94,34 +97,187 @@ def _checkpoint_chroma(path: Path) -> None:
         chroma_log.warning("WAL checkpoint failed: %s – snapshot may be stale", e)
 
 
-def _checkpoint_conversation_db(workspace_data_dir: Path) -> dict[str, Any]:
-    """Checkpoint the conversation history SQLite WAL before snapshot.
+def _configured_users_db_path() -> Path:
+    configured = os.getenv("RAG_USERS_DB")
+    return Path(configured) if configured else DATA_DIR / "users.db"
 
-    Returns a small manifest summary (present, size, sha256) so callers can
-    record it without re-statting the file later.
+
+def _sqlite_sidecars(path: Path) -> tuple[Path, Path]:
+    return Path(f"{path}-wal"), Path(f"{path}-shm")
+
+
+def _remove_sqlite_sidecars(path: Path) -> None:
+    for sidecar in _sqlite_sidecars(path):
+        sidecar.unlink(missing_ok=True)
+
+
+def _move_sqlite_sidecars(source: Path, destination: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        source_sidecar = Path(f"{source}{suffix}")
+        destination_sidecar = Path(f"{destination}{suffix}")
+        if source_sidecar.exists():
+            _remove_path(destination_sidecar)
+            shutil.move(str(source_sidecar), str(destination_sidecar))
+
+
+def _sqlite_integrity_ok(path: Path) -> bool:
+    """Run SQLite quick_check without creating or consuming WAL sidecars."""
+
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True, timeout=30)) as conn:
+            result = conn.execute("PRAGMA quick_check").fetchone()
+        return bool(result and result[0] == "ok")
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
+def _sqlite_schema_version(path: Path) -> int:
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return -1
+
+
+def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
+    """Create a transactionally consistent main-file SQLite snapshot.
+
+    SQLite's online backup API reads a single coherent database state and
+    includes committed pages that are still present only in the source WAL.
+    The destination is replaced only after backup and integrity validation.
     """
 
-    summary: dict[str, Any] = {
-        "present": False,
-        "size_bytes": 0,
-        "sha256": "",
-    }
-    db_file = workspace_data_dir / "conversation_history.db"
-    if not db_file.exists():
-        return summary
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = destination.with_name(f".{destination.name}.snapshot")
+    snapshot.unlink(missing_ok=True)
+    _remove_sqlite_sidecars(snapshot)
     try:
-        conn = sqlite3.connect(str(db_file))
-        cur = conn.cursor()
-        cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        cur.fetchone()
-        conn.close()
-        log.info("Conversation history WAL checkpointed")
-    except sqlite3.Error as e:
-        log.warning("Conversation history WAL checkpoint failed: %s", e)
-    summary["present"] = True
-    summary["size_bytes"] = db_file.stat().st_size
-    summary["sha256"] = _sha256(db_file)
-    return summary
+        with closing(sqlite3.connect(str(source), timeout=30)) as source_conn:
+            source_conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                checkpoint = source_conn.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                log.debug("SQLite WAL checkpoint for %s: %s", source, checkpoint)
+            except sqlite3.Error as exc:
+                # The online backup remains consistent even when another writer
+                # prevents a checkpoint; the WAL pages are read by SQLite itself.
+                log.warning("SQLite WAL checkpoint failed for %s: %s", source, exc)
+            with closing(
+                sqlite3.connect(str(snapshot), timeout=30)
+            ) as destination_conn:
+                source_conn.backup(destination_conn)
+                destination_conn.commit()
+    except (OSError, sqlite3.Error) as exc:
+        snapshot.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(snapshot)
+        raise BackupError(f"Unable to snapshot SQLite database {source}: {exc}") from exc
+
+    if not _sqlite_integrity_ok(snapshot):
+        snapshot.unlink(missing_ok=True)
+        _remove_sqlite_sidecars(snapshot)
+        raise BackupError(f"SQLite snapshot failed integrity check: {source}")
+    os.replace(snapshot, destination)
+    destination.chmod(0o600)
+    _remove_sqlite_sidecars(destination)
+
+
+def _sqlite_manifest_entry(
+    *,
+    source: Path,
+    destination: Path,
+    staging_root: Path,
+    kind: str,
+    component: str,
+    relative_path: Path,
+) -> dict[str, Any]:
+    _snapshot_sqlite_database(source, destination)
+    schema_version = _sqlite_schema_version(destination)
+    if schema_version != SQLITE_DATABASE_SCHEMA_VERSION:
+        raise BackupError(
+            f"Unsupported {kind} database schema: {schema_version}"
+        )
+    entry: dict[str, Any] = {
+        "kind": kind,
+        "component": component,
+        "backup_path": destination.relative_to(staging_root).as_posix(),
+        "relative_path": relative_path.as_posix(),
+        "size_bytes": destination.stat().st_size,
+        "sha256": _sha256(destination),
+        "schema_version": schema_version,
+    }
+    if kind == "conversation_history" and relative_path.parts:
+        entry["workspace_id"] = relative_path.parts[0]
+    return entry
+
+
+def _stage_sqlite_databases(
+    *,
+    staging: Path,
+    data_staging: Path,
+    workspace_data_dir: Path,
+    workspace_data_staging: Path,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    users_db = _configured_users_db_path()
+    if users_db.is_file():
+        users_relative = _relative_directory(users_db, DATA_DIR)
+        if users_relative is None:
+            users_destination = staging / "users_db" / "users.db"
+            users_component = "users_db"
+            users_relative = Path("users.db")
+        else:
+            users_destination = data_staging / users_relative
+            users_component = "data"
+        entries.append(
+            _sqlite_manifest_entry(
+                source=users_db,
+                destination=users_destination,
+                staging_root=staging,
+                kind="users",
+                component=users_component,
+                relative_path=users_relative,
+            )
+        )
+
+    if workspace_data_dir.exists():
+        for source in sorted(workspace_data_dir.rglob("conversations.db")):
+            if not source.is_file():
+                continue
+            relative = _relative_directory(source, workspace_data_dir)
+            if relative is None:
+                raise BackupError(
+                    f"Conversation database escapes workspace root: {source}"
+                )
+            entries.append(
+                _sqlite_manifest_entry(
+                    source=source,
+                    destination=workspace_data_staging / relative,
+                    staging_root=staging,
+                    kind="conversation_history",
+                    component="workspace_data",
+                    relative_path=relative,
+                )
+            )
+    return entries
+
+
+def _sqlite_catalog_sha256(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return ""
+    payload = [
+        {
+            "backup_path": entry["backup_path"],
+            "sha256": entry["sha256"],
+            "size_bytes": entry["size_bytes"],
+        }
+        for entry in entries
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 # ======================================================================
@@ -174,7 +330,6 @@ def _create_backup_locked(
         # ── 2. checkpoint WAL ─────────────────────────────────────
         chroma_log.info("Flushing ChromaDB WAL before backup...")
         _checkpoint_chroma(CHROMA_DIR)
-        conversation_db_summary = _checkpoint_conversation_db(workspace_data_dir)
 
         # ── 3. copy chromadb ───────────────────────────────────────
         chroma_staging = staging / "chroma_db"
@@ -190,7 +345,7 @@ def _create_backup_locked(
             shutil.copytree(
                 str(DATA_DIR),
                 str(data_staging),
-                ignore=shutil.ignore_patterns("*.lock"),
+                ignore=shutil.ignore_patterns("*.lock", "*-wal", "*-shm"),
             )
         else:
             data_staging.mkdir()
@@ -210,7 +365,7 @@ def _create_backup_locked(
                 primary_source=DATA_DIR,
                 primary_staging=data_staging,
                 separate_staging=staging / "workspace_data",
-                ignore=shutil.ignore_patterns("*.lock"),
+                ignore=shutil.ignore_patterns("*.lock", "*-wal", "*-shm"),
             )
         )
         workspace_upload_staging, workspace_upload_separate = (
@@ -221,6 +376,12 @@ def _create_backup_locked(
                 separate_staging=staging / "workspace_uploads",
             )
         )
+        sqlite_databases = _stage_sqlite_databases(
+            staging=staging,
+            data_staging=data_staging,
+            workspace_data_dir=workspace_data_dir,
+            workspace_data_staging=workspace_data_staging,
+        )
         assert_distributed_locks_healthy()
 
         # ── 5. build manifest ──────────────────────────────────────
@@ -230,12 +391,18 @@ def _create_backup_locked(
         uploads_size = _dir_size(uploads_staging) if uploads_staging.exists() else 0
         workspace_data_size = _dir_size(workspace_data_staging)
         workspace_uploads_size = _dir_size(workspace_upload_staging)
+        external_users_size = (
+            _dir_size(staging / "users_db")
+            if (staging / "users_db").exists()
+            else 0
+        )
         total_size = (
             chroma_size
             + data_size
             + uploads_size
             + (workspace_data_size if workspace_data_separate else 0)
             + (workspace_uploads_size if workspace_upload_separate else 0)
+            + external_users_size
         )
         knowledge_base_summary = _knowledge_base_manifest_summary(
             data_staging,
@@ -248,6 +415,15 @@ def _create_backup_locked(
             data_staging,
             workspace_data_root=workspace_data_staging,
         )
+        users_database = next(
+            (entry for entry in sqlite_databases if entry["kind"] == "users"),
+            None,
+        )
+        conversation_databases = [
+            entry
+            for entry in sqlite_databases
+            if entry["kind"] == "conversation_history"
+        ]
 
         manifest = {
             "backup_id": backup_id,
@@ -295,9 +471,32 @@ def _create_backup_locked(
             "chat_agent_catalog_schema_version": 1,
             "chat_agent_count": chat_agent_summary["chat_agent_count"],
             "chat_agents": chat_agent_summary["chat_agents"],
-            "conversation_db_present": conversation_db_summary["present"],
-            "conversation_db_size_bytes": conversation_db_summary["size_bytes"],
-            "conversation_db_sha256": conversation_db_summary["sha256"],
+            "sqlite_database_catalog_schema_version": (
+                SQLITE_CATALOG_SCHEMA_VERSION
+            ),
+            "sqlite_databases": sqlite_databases,
+            "users_db_present": users_database is not None,
+            "users_db_size_bytes": (
+                users_database["size_bytes"] if users_database else 0
+            ),
+            "users_db_sha256": users_database["sha256"] if users_database else "",
+            "users_db_backup_path": (
+                users_database["backup_path"] if users_database else ""
+            ),
+            "users_db_separate": bool(
+                users_database and users_database["component"] == "users_db"
+            ),
+            "users_database": users_database,
+            "conversation_db_present": bool(conversation_databases),
+            "conversation_db_count": len(conversation_databases),
+            "conversation_db_size_bytes": sum(
+                entry["size_bytes"] for entry in conversation_databases
+            ),
+            "conversation_db_sha256": _sqlite_catalog_sha256(
+                conversation_databases
+            ),
+            "conversation_db_sha256_semantics": "catalog_sha256",
+            "conversation_databases": conversation_databases,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -340,6 +539,7 @@ def _create_backup_locked(
                 "uploads",
                 "workspace_data",
                 "workspace_uploads",
+                "users_db",
             ):
                 shutil.rmtree(final_dir / component_name, ignore_errors=True)
         manifest["archive_filename"] = final_archive.name
@@ -423,6 +623,7 @@ def _restore_backup_locked(
     restore_status = "success"
     extract_root: Optional[Path] = None
     restore_dirs: list[Path] = []
+    restore_files: list[Path] = []
     swapped: list[tuple[Path, Optional[Path]]] = []
     chroma_clients_reset = False
 
@@ -490,6 +691,29 @@ def _restore_backup_locked(
             workspace_data_dir=workspace_data_dir,
             workspace_upload_dir=workspace_upload_dir,
         )
+        if not _verify_sqlite_database_manifest(source_root, manifest):
+            raise BackupError(
+                f"Backup {backup_id} failed extracted SQLite verification"
+            )
+        users_database = manifest.get("users_database")
+        source_users_db: Path | None = None
+        users_db_target: Path | None = None
+        users_db_needs_file_swap = False
+        if isinstance(users_database, dict):
+            source_users_db = _manifest_component_path(
+                source_root,
+                users_database.get("backup_path"),
+                fallback=source_root / "__missing_users_database__",
+            )
+            users_db_target = _configured_users_db_path()
+            users_relative = _manifest_relative_path(
+                users_database.get("relative_path")
+            )
+            users_db_needs_file_swap = not (
+                users_database.get("component") == "data"
+                and _relative_directory(users_db_target, DATA_DIR)
+                == users_relative
+            )
 
         bak_suffix = f".bak.{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
         components = _restore_components(
@@ -545,6 +769,43 @@ def _restore_backup_locked(
                 assert_distributed_locks_healthy()
                 shutil.move(str(restore_dir), str(target))
                 assert_distributed_locks_healthy()
+
+            if (
+                source_users_db is not None
+                and users_db_target is not None
+                and users_db_needs_file_swap
+            ):
+                assert_distributed_locks_healthy()
+                users_db_target.parent.mkdir(parents=True, exist_ok=True)
+                restore_file = users_db_target.with_name(
+                    f"{users_db_target.name}.restore.{backup_id}"
+                )
+                _remove_path(restore_file)
+                shutil.copy2(source_users_db, restore_file)
+                restore_file.chmod(0o600)
+                restore_files.append(restore_file)
+                previous = users_db_target.with_name(
+                    f"{users_db_target.name}{bak_suffix}"
+                )
+                _remove_path(previous)
+                _remove_sqlite_sidecars(previous)
+                previous_path = None
+                if users_db_target.exists():
+                    try:
+                        shutil.move(str(users_db_target), str(previous))
+                    except Exception:
+                        if previous.exists() and not users_db_target.exists():
+                            swapped.append((users_db_target, previous))
+                        raise
+                    previous_path = previous
+                    swapped.append((users_db_target, previous_path))
+                    _move_sqlite_sidecars(users_db_target, previous)
+                else:
+                    swapped.append((users_db_target, previous_path))
+                assert_distributed_locks_healthy()
+                _remove_sqlite_sidecars(users_db_target)
+                shutil.move(str(restore_file), str(users_db_target))
+                assert_distributed_locks_healthy()
         except DistributedLockLeaseLostError:
             raise
         except Exception:
@@ -564,6 +825,10 @@ def _restore_backup_locked(
         _validate_restored_chat_agents(
             DATA_DIR,
             manifest=manifest,
+            workspace_data_root=workspace_data_dir,
+        )
+        _validate_restored_sqlite_databases(
+            manifest,
             workspace_data_root=workspace_data_dir,
         )
         verify_ok = actual_docs == expected_docs
@@ -606,7 +871,7 @@ def _restore_backup_locked(
         assert_distributed_locks_healthy()
         bump_lifecycle_generation()
         return result
-    except DistributedLockLeaseLostError as e:
+    except DistributedLockLeaseLostError:
         restore_status = "error"
         preserved = {
             str(target): str(previous) if previous else ""
@@ -671,6 +936,8 @@ def _restore_backup_locked(
         for restore_dir in restore_dirs:
             if restore_dir.exists():
                 shutil.rmtree(restore_dir, ignore_errors=True)
+        for restore_file in restore_files:
+            _remove_path(restore_file)
         if extract_root and extract_root.exists():
             shutil.rmtree(extract_root, ignore_errors=True)
         metrics.observe_backup("restore", time.time() - restore_start, restore_status)
@@ -689,11 +956,15 @@ def _rollback_restore_components(
     for target, previous in reversed(swapped):
         assert_distributed_locks_healthy()
         if target.exists():
-            shutil.rmtree(target)
+            _remove_path(target)
+            if target.suffix == ".db":
+                _remove_sqlite_sidecars(target)
             assert_distributed_locks_healthy()
         if previous and previous.exists():
             assert_distributed_locks_healthy()
             shutil.move(str(previous), str(target))
+            if target.suffix == ".db":
+                _move_sqlite_sidecars(previous, target)
             assert_distributed_locks_healthy()
     swapped.clear()
 
@@ -780,6 +1051,11 @@ def verify_backup(backup_id: str) -> dict[str, Any]:
             path_key="workspace_uploads_backup_path",
             checksum_key="workspace_uploads_sha256",
         )
+    sqlite_databases_ok = (
+        True
+        if encrypted_only
+        else _verify_sqlite_database_manifest(backup_path, manifest)
+    )
 
     # Verify the compressed or encrypted archive and its checksum.
     tar_ok = (
@@ -803,6 +1079,7 @@ def verify_backup(backup_id: str) -> dict[str, Any]:
             and uploads_ok
             and workspace_data_ok
             and workspace_uploads_ok
+            and sqlite_databases_ok
             and tar_ok
             and archive_checksum_ok
         )
@@ -813,6 +1090,7 @@ def verify_backup(backup_id: str) -> dict[str, Any]:
         "uploads_checksum_ok": uploads_ok,
         "workspace_data_checksum_ok": workspace_data_ok,
         "workspace_uploads_checksum_ok": workspace_uploads_ok,
+        "sqlite_databases_ok": sqlite_databases_ok,
         "tar_archive_ok": tar_ok,
         "archive_checksum_ok": archive_checksum_ok,
         "document_count": manifest.get("document_count", 0),
@@ -1236,6 +1514,13 @@ def _relative_directory(path: Path, root: Path) -> Path | None:
         return None
 
 
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
 def _copy_directory(
     source: Path,
     destination: Path,
@@ -1277,14 +1562,194 @@ def _manifest_component_path(
     if value is None:
         return fallback
     if not isinstance(value, str) or not value:
-        raise BackupError("Invalid workspace component path in backup manifest")
+        raise BackupError("Invalid component path in backup manifest")
     root = backup_root.resolve()
     candidate = (backup_root / value).resolve()
     try:
         candidate.relative_to(root)
     except ValueError as exc:
-        raise BackupError("Unsafe workspace component path in backup manifest") from exc
+        raise BackupError("Unsafe component path in backup manifest") from exc
     return candidate
+
+
+def _manifest_relative_path(value: Any) -> Path:
+    if not isinstance(value, str) or not value:
+        raise BackupError("Invalid relative SQLite path in backup manifest")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise BackupError("Unsafe relative SQLite path in backup manifest")
+    return relative
+
+
+def _verify_sqlite_database_manifest(
+    backup_root: Path,
+    manifest: dict[str, Any],
+) -> bool:
+    """Verify each SQLite snapshot and the catalog's aggregate semantics."""
+
+    if (
+        manifest.get("sqlite_database_catalog_schema_version")
+        != SQLITE_CATALOG_SCHEMA_VERSION
+    ):
+        return False
+    entries = manifest.get("sqlite_databases")
+    if not isinstance(entries, list):
+        return False
+
+    seen_paths: set[str] = set()
+    users: list[dict[str, Any]] = []
+    conversations: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        kind = entry.get("kind")
+        if kind not in {"users", "conversation_history"}:
+            return False
+        component = entry.get("component")
+        backup_path_value = entry.get("backup_path")
+        if not isinstance(backup_path_value, str) or backup_path_value in seen_paths:
+            return False
+        seen_paths.add(backup_path_value)
+        try:
+            database = _manifest_component_path(
+                backup_root,
+                backup_path_value,
+                fallback=backup_root / "__missing_sqlite_database__",
+            )
+            relative = _manifest_relative_path(entry.get("relative_path"))
+        except BackupError:
+            return False
+        if not _sqlite_manifest_file_is_valid(database, entry):
+            return False
+        if kind == "users":
+            if component not in {"data", "users_db"}:
+                return False
+            users.append(entry)
+        else:
+            if (
+                component != "workspace_data"
+                or relative.name != "conversations.db"
+                or len(relative.parts) < 2
+                or entry.get("workspace_id") != relative.parts[0]
+            ):
+                return False
+            conversations.append(entry)
+
+    if len(users) > 1:
+        return False
+    users_database = users[0] if users else None
+    if not _users_database_summary_matches(manifest, users_database):
+        return False
+    if not _conversation_database_summary_matches(manifest, conversations):
+        return False
+    return True
+
+
+def _sqlite_manifest_file_is_valid(database: Path, entry: dict[str, Any]) -> bool:
+    """Validate one catalogued SQLite file step by step."""
+
+    if not database.is_file():
+        return False
+    expected_size = entry.get("size_bytes")
+    if not isinstance(expected_size, int) or expected_size < 0:
+        return False
+    expected_sha256 = entry.get("sha256")
+    if not isinstance(expected_sha256, str):
+        return False
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        return False
+    if database.stat().st_size != expected_size:
+        return False
+    if _sha256(database) != expected_sha256:
+        return False
+    if not _sqlite_integrity_ok(database):
+        return False
+    if entry.get("schema_version") != SQLITE_DATABASE_SCHEMA_VERSION:
+        return False
+    return _sqlite_schema_version(database) == SQLITE_DATABASE_SCHEMA_VERSION
+
+
+def _users_database_summary_matches(
+    manifest: dict[str, Any],
+    users_database: dict[str, Any] | None,
+) -> bool:
+    expected_size = users_database["size_bytes"] if users_database else 0
+    expected_hash = users_database["sha256"] if users_database else ""
+    expected_path = users_database["backup_path"] if users_database else ""
+    expected_separate = bool(
+        users_database and users_database["component"] == "users_db"
+    )
+
+    if manifest.get("users_database") != users_database:
+        return False
+    if bool(manifest.get("users_db_present")) != bool(users_database):
+        return False
+    if manifest.get("users_db_size_bytes") != expected_size:
+        return False
+    if manifest.get("users_db_sha256") != expected_hash:
+        return False
+    if manifest.get("users_db_backup_path") != expected_path:
+        return False
+    return bool(manifest.get("users_db_separate")) == expected_separate
+
+
+def _conversation_database_summary_matches(
+    manifest: dict[str, Any],
+    conversations: list[dict[str, Any]],
+) -> bool:
+    expected_size = sum(entry["size_bytes"] for entry in conversations)
+    expected_hash = _sqlite_catalog_sha256(conversations)
+
+    if manifest.get("conversation_databases") != conversations:
+        return False
+    if bool(manifest.get("conversation_db_present")) != bool(conversations):
+        return False
+    if manifest.get("conversation_db_count") != len(conversations):
+        return False
+    if manifest.get("conversation_db_size_bytes") != expected_size:
+        return False
+    if manifest.get("conversation_db_sha256") != expected_hash:
+        return False
+    return manifest.get("conversation_db_sha256_semantics") == "catalog_sha256"
+
+
+def _validate_restored_sqlite_databases(
+    manifest: dict[str, Any],
+    *,
+    workspace_data_root: Path,
+) -> None:
+    """Ensure every catalogued SQLite snapshot reached its live target."""
+
+    if (
+        manifest.get("sqlite_database_catalog_schema_version")
+        != SQLITE_CATALOG_SCHEMA_VERSION
+    ):
+        raise BackupError("Unsupported SQLite database catalog schema")
+    entries = manifest.get("sqlite_databases")
+    if not isinstance(entries, list):
+        raise BackupError("Invalid SQLite database catalog in backup manifest")
+    workspace_root = workspace_data_root.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BackupError("Invalid SQLite database entry in backup manifest")
+        kind = entry.get("kind")
+        if kind == "users":
+            database = _configured_users_db_path()
+        elif kind == "conversation_history":
+            relative = _manifest_relative_path(entry.get("relative_path"))
+            database = (workspace_data_root / relative).resolve()
+            try:
+                database.relative_to(workspace_root)
+            except ValueError as exc:
+                raise BackupError(
+                    "Restored conversation database escapes workspace root"
+                ) from exc
+        else:
+            raise BackupError("Unknown SQLite database kind in backup manifest")
+        if not _sqlite_manifest_file_is_valid(database, entry):
+            raise BackupError(
+                f"Restored SQLite database does not match the manifest: {database}"
+            )
 
 
 def _verify_manifest_directory(

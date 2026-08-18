@@ -288,9 +288,10 @@ one global ranking. A failure or unauthorized KB fails the whole request.
 | `stream_format` | string | no | `text` | `text` or `ndjson`; used only with `stream: true` |
 | `temperature` | number | no | runtime configuration | 0.0-1.0 |
 | `k` | integer | no | runtime configuration | 1-50 |
-| `persist_history` | boolean | no | `true` | When `true` and `turn_id` is present, persists the turn to the durable per-workspace history store; when `false` the turn stays in warm memory only |
+| `persist_history` | boolean | no | `false` | Opt in to durable per-workspace history. Requires both `conversation_id` and `turn_id`; when `false` the turn stays in warm memory only |
 | `turn_id` | string | no | | Stable id for the turn; reuse it on retries to get replayed results without regeneration. Pattern `^[A-Za-z0-9][A-Za-z0-9_-]*$`, max 80 chars. Required for `persist_history` |
 | `parent_turn_id` | string | no | | `turn_id` of the previous visible turn; enforces a linear chain. `null` for the first turn |
+| `regenerate_lost_result` | boolean | no | `false` | Explicitly regenerate the same `turn_id` after `volatile_result_lost`. This replaces the expired ready draft and must be a deliberate user action |
 
 When `agent_id` is present, the server resolves the agent's `provider_id`,
 `model_id`, `knowledge_base_ids`, and `prompt_ref`. Sending any explicit
@@ -390,14 +391,14 @@ curl -X POST http://127.0.0.1:5000/api/v1/query \
 
 `conversation_id` is returned only when present in the request. `sources` is the safe field for external clients: it never exposes local paths or admin download URLs. `usage` is reserved for future token/cost metrics when the provider exposes them uniformly.
 
-When `persist_history` is `true` (the default), the response carries two extra fields describing the durable history outcome:
+When `persist_history` is `true`, the response carries two extra fields describing the durable history outcome:
 
 | Field | Type | Values | Meaning |
 |---|---|---|---|
 | `history_status` | string | `saved`, `not_requested`, `disabled`, `client_turn_id_required`, `error` | Outcome of the durable turn. `saved` = persisted; `not_requested` = `persist_history` was false; `disabled` = history feature flag off; `client_turn_id_required` = `turn_id` missing, so memory was updated but nothing persisted; `error` = persistence failed |
 | `history_saved` | boolean | `true`/`false` | Convenience boolean: `true` only when `history_status` is `saved` |
 
-A retry that sends the same `turn_id` with an identical request fingerprint returns the previously persisted result with `replayed: true` (NDJSON `meta`/`done` events) without calling the provider again. A retry with the same `turn_id` but a different fingerprint returns `409 turn_id_conflict`.
+A retry that sends the same `turn_id` with an identical request fingerprint returns the previously persisted result with `replayed: true` (NDJSON `meta`/`done` events) without calling the provider again. A retry with the same `turn_id` but a different fingerprint returns `409 turn_id_conflict`. If a durable ready marker survives but its temporary payload has expired, the API returns `409 volatile_result_lost`; regeneration is allowed only by resending the same request with `regenerate_lost_result: true`.
 
 ### Streaming
 

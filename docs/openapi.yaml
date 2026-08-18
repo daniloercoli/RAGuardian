@@ -1953,11 +1953,12 @@ components:
           description: Number of retrieved chunks.
         persist_history:
           type: boolean
-          default: true
+          default: false
           description: |
-            When `true` and `turn_id` is present, persists the turn to the
-            durable per-workspace SQLite history store. When `false`, the turn
-            stays in warm memory only and `history_status` is `not_requested`.
+            Opt in to the durable per-workspace SQLite history store. Both
+            `conversation_id` and `turn_id` are required. When `false`, the
+            turn stays in warm memory only and `history_status` is
+            `not_requested`.
         turn_id:
           type: string
           minLength: 1
@@ -1975,6 +1976,13 @@ components:
           description: |
             `turn_id` of the previous visible turn; enforces a linear chain.
             Omit (or send `null`) for the first turn of a conversation.
+        regenerate_lost_result:
+          type: boolean
+          default: false
+          description: |
+            Explicit recovery for `volatile_result_lost`. When true, the
+            server replaces the expired ready draft and regenerates the same
+            `turn_id`. Never set this automatically on an ordinary retry.
       additionalProperties: false
     ClientContext:
       type: object

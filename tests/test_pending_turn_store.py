@@ -16,9 +16,12 @@ from __future__ import annotations
 import time
 
 from app.utils.pending_turn_store import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES,
     DEFAULT_TTL_SECONDS,
     PendingTurnResult,
     PendingTurnResultStore,
+    RedisPendingTurnResultStore,
 )
 
 
@@ -90,6 +93,32 @@ class TestPutAndGet:
         snapshot = store.get("ws:default", "turn-1")
         assert snapshot.result == {"answer": "second"}
 
+    def test_stale_lease_cannot_overwrite_new_owner_payload(self):
+        store = PendingTurnResultStore()
+        assert _put(
+            store,
+            lease_token="new-owner",
+            result={"answer": "new"},
+        ) is True
+        assert _put(
+            store,
+            lease_token="stale-owner",
+            result={"answer": "stale"},
+        ) is True
+
+        assert store.get(
+            "ws:default", "turn-1", lease_token="new-owner"
+        ).result == {"answer": "new"}
+        assert store.get(
+            "ws:default", "turn-1", lease_token="stale-owner"
+        ).result == {"answer": "stale"}
+        assert store.delete_if_lease(
+            "ws:default", "turn-1", "stale-owner"
+        ) is True
+        assert store.get(
+            "ws:default", "turn-1", lease_token="new-owner"
+        ).result == {"answer": "new"}
+
     def test_entries_are_keyed_by_scope_and_turn(self):
         store = PendingTurnResultStore()
         _put(store, scope_key="ws:a", turn_id="t1", result={"a": 1})
@@ -103,6 +132,80 @@ class TestPutAndGet:
 
     def test_default_ttl_constant(self):
         assert DEFAULT_TTL_SECONDS == 6 * 60 * 60
+
+    def test_default_payload_and_store_limits_are_bounded(self):
+        assert DEFAULT_MAX_PAYLOAD_BYTES == 2 * 1024 * 1024
+        assert DEFAULT_MAX_TOTAL_BYTES == 64 * 1024 * 1024
+
+    def test_put_rejects_unserializable_result(self):
+        store = PendingTurnResultStore()
+
+        assert _put(store, result={"bad": object()}) is False
+        assert store.get("ws:default", "turn-1") is None
+
+    def test_put_rejects_oversized_payload_without_replacing_existing(self):
+        store = PendingTurnResultStore(
+            max_payload_bytes=300,
+            max_total_bytes=1_000,
+        )
+        assert _put(store, result={"answer": "small"}) is True
+
+        assert _put(store, result={"answer": "x" * 1_000}) is False
+        assert store.get("ws:default", "turn-1").result == {
+            "answer": "small"
+        }
+
+    def test_result_is_detached_from_mutable_caller_payload(self):
+        store = PendingTurnResultStore()
+        result = {"answer": "staged", "sources": []}
+        assert _put(store, result=result) is True
+
+        result["answer"] = "mutated"
+        result["sources"].append({"source": "huge" * 10_000})
+
+        assert store.get("ws:default", "turn-1").result == {
+            "answer": "staged",
+            "sources": [],
+        }
+
+    def test_total_quota_rejects_new_entry_and_delete_reclaims_capacity(self):
+        store = PendingTurnResultStore(
+            max_payload_bytes=1_000,
+            max_total_bytes=320,
+        )
+        assert _put(
+            store,
+            scope_key="ws:a",
+            turn_id="t1",
+            result={"answer": "a" * 80},
+        ) is True
+        assert _put(
+            store,
+            scope_key="ws:b",
+            turn_id="t2",
+            result={"answer": "b" * 80},
+        ) is False
+        assert store.get("ws:a", "t1") is not None
+        assert store.get("ws:b", "t2") is None
+
+        assert store.delete("ws:a", "t1") is True
+        assert _put(
+            store,
+            scope_key="ws:b",
+            turn_id="t2",
+            result={"answer": "b" * 80},
+        ) is True
+
+    def test_overwrite_accounts_for_replaced_payload_only_once(self):
+        store = PendingTurnResultStore(
+            max_payload_bytes=1_000,
+            max_total_bytes=260,
+        )
+        assert _put(store, result={"answer": "a" * 80}) is True
+        assert _put(store, result={"answer": "b" * 80}) is True
+        assert store.get("ws:default", "turn-1").result == {
+            "answer": "b" * 80
+        }
 
 
 class TestTtlExpiry:
@@ -163,6 +266,19 @@ class TestDelete:
         assert store.get("ws:a", "t1") is None
         assert store.get("ws:b", "t1") is not None
 
+    def test_delete_if_lease_preserves_new_owner_payload(self):
+        store = PendingTurnResultStore()
+        _put(store, lease_token="new-owner")
+
+        assert store.delete_if_lease(
+            "ws:default", "turn-1", "stale-owner"
+        ) is False
+        assert store.get("ws:default", "turn-1").lease_token == "new-owner"
+        assert store.delete_if_lease(
+            "ws:default", "turn-1", "new-owner"
+        ) is True
+        assert store.get("ws:default", "turn-1") is None
+
 
 class TestClearByPrefix:
     def test_clear_by_prefix_removes_matching_entries(self):
@@ -188,6 +304,25 @@ class TestClearByPrefix:
         assert store.get("ws-a:default", "turn-1") is not None
 
 
+class TestClearScope:
+    def test_clear_scope_removes_only_exact_scope(self):
+        store = PendingTurnResultStore()
+        _put(store, scope_key="ws:default:conv-1", turn_id="t1")
+        _put(store, scope_key="ws:default:conv-1", turn_id="t2")
+        _put(store, scope_key="ws:default:conv-10", turn_id="t1")
+
+        assert store.clear_scope("ws:default:conv-1") == 2
+        assert store.get("ws:default:conv-1", "t1") is None
+        assert store.get("ws:default:conv-1", "t2") is None
+        assert store.get("ws:default:conv-10", "t1") is not None
+
+    def test_clear_scope_rejects_empty(self):
+        store = PendingTurnResultStore()
+        _put(store)
+        assert store.clear_scope("") == 0
+        assert store.get("ws:default", "turn-1") is not None
+
+
 class TestClearAll:
     def test_clear_all_wipes_everything(self):
         store = PendingTurnResultStore()
@@ -201,6 +336,144 @@ class TestClearAll:
         store = PendingTurnResultStore()
         store.clear_all()
         assert store.get("ws:default", "turn-1") is None
+
+
+class _QuotaRedis:
+    """Small Redis double implementing the pending-store Lua contracts."""
+
+    def __init__(self):
+        self.values = {}
+        self.indexes = {}
+        self.eval_calls = 0
+
+    def eval(self, _script, key_count, *arguments):
+        self.eval_calls += 1
+        keys = arguments[:key_count]
+        argv = arguments[key_count:]
+        if len(argv) == 3:
+            value_key, index_key, turn_index_key = keys
+            index = self.indexes.setdefault(index_key, set())
+            encoded, _ttl, max_total_bytes = argv
+            index.intersection_update(self.values)
+            current_total = sum(len(self.values[key]) for key in index)
+            previous_size = len(self.values[value_key]) if value_key in index else 0
+            if current_total - previous_size + len(encoded) > int(max_total_bytes):
+                return 0
+            self.values[value_key] = encoded
+            index.add(value_key)
+            self.indexes.setdefault(turn_index_key, set()).add(value_key)
+            return 1
+
+        if len(argv) == 1:
+            value_key, index_key, turn_index_key = keys
+            index = self.indexes.setdefault(index_key, set())
+            raw = self.values.get(value_key)
+            if raw is None:
+                return 0
+            import json
+
+            payload = json.loads(raw.decode("utf-8"))
+            if payload.get("lease_token") != argv[0]:
+                return 0
+            removed = int(value_key in self.values)
+            self.values.pop(value_key, None)
+            index.discard(value_key)
+            self.indexes.setdefault(turn_index_key, set()).discard(value_key)
+            return removed
+
+        index_key, turn_index_key = keys
+        index = self.indexes.setdefault(index_key, set())
+        members = set(self.indexes.get(turn_index_key, set()))
+        removed = 0
+        for value_key in members:
+            removed += int(value_key in self.values)
+            self.values.pop(value_key, None)
+            index.discard(value_key)
+        self.indexes.pop(turn_index_key, None)
+        return removed
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def smembers(self, key):
+        return set(self.indexes.get(key, set()))
+
+    def delete(self, key):
+        return int(self.values.pop(key, None) is not None)
+
+    def srem(self, key, member):
+        existed = member in self.indexes.get(key, set())
+        self.indexes.setdefault(key, set()).discard(member)
+        return int(existed)
+
+
+class TestRedisQuotas:
+    def test_redis_stale_lease_cannot_clobber_new_owner(self):
+        redis = _QuotaRedis()
+        store = RedisPendingTurnResultStore(
+            redis_client=redis,
+            key_prefix="test:pending",
+        )
+
+        assert _put(
+            store,
+            lease_token="new-owner",
+            result={"answer": "new"},
+        ) is True
+        assert _put(
+            store,
+            lease_token="stale-owner",
+            result={"answer": "stale"},
+        ) is True
+        assert store.delete_if_lease(
+            "ws:default", "turn-1", "stale-owner"
+        ) is True
+        assert store.get(
+            "ws:default", "turn-1", lease_token="new-owner"
+        ).result == {"answer": "new"}
+
+    def test_redis_rejects_oversized_payload_before_writing(self):
+        redis = _QuotaRedis()
+        store = RedisPendingTurnResultStore(
+            redis_client=redis,
+            key_prefix="test:pending",
+            max_payload_bytes=200,
+            max_total_bytes=1_000,
+        )
+
+        assert _put(store, result={"answer": "x" * 500}) is False
+        assert redis.eval_calls == 0
+        assert store.get("ws:default", "turn-1") is None
+
+    def test_redis_total_quota_is_shared_across_scopes(self):
+        redis = _QuotaRedis()
+        store = RedisPendingTurnResultStore(
+            redis_client=redis,
+            key_prefix="test:pending",
+            max_payload_bytes=1_000,
+            max_total_bytes=320,
+        )
+
+        assert _put(
+            store,
+            scope_key="ws:a",
+            turn_id="t1",
+            result={"answer": "a" * 80},
+        ) is True
+        assert _put(
+            store,
+            scope_key="ws:b",
+            turn_id="t2",
+            result={"answer": "b" * 80},
+        ) is False
+
+        assert store.delete("ws:a", "t1") is True
+        assert _put(
+            store,
+            scope_key="ws:b",
+            turn_id="t2",
+            result={"answer": "b" * 80},
+        ) is True
 
 
 class TestSingletonHelpers:
@@ -251,4 +524,33 @@ class TestSingletonHelpers:
 
         reset_pending_turn_store()
         assert pending_turn_store_backend() == "memory"
+        reset_pending_turn_store()
+
+    def test_pending_turn_ttl_is_configurable_from_environment(self, monkeypatch):
+        from app.utils.pending_turn_store import (
+            get_pending_turn_store,
+            reset_pending_turn_store,
+        )
+
+        reset_pending_turn_store()
+        monkeypatch.setenv("RAG_PENDING_TURN_RESULT_TTL_SECONDS", "17")
+        store = get_pending_turn_store()
+        assert store.ttl_seconds == 17
+        reset_pending_turn_store()
+
+    def test_pending_turn_quotas_are_configurable_from_environment(
+        self,
+        monkeypatch,
+    ):
+        from app.utils.pending_turn_store import (
+            get_pending_turn_store,
+            reset_pending_turn_store,
+        )
+
+        reset_pending_turn_store()
+        monkeypatch.setenv("RAG_PENDING_TURN_RESULT_MAX_PAYLOAD_BYTES", "1234")
+        monkeypatch.setenv("RAG_PENDING_TURN_RESULT_MAX_TOTAL_BYTES", "5678")
+        store = get_pending_turn_store()
+        assert store.max_payload_bytes == 1234
+        assert store.max_total_bytes == 5678
         reset_pending_turn_store()

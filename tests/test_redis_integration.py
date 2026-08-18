@@ -62,7 +62,7 @@ def test_real_redis_state_backends(monkeypatch):
         conversations.append_turn("conversation-1", user="Question", assistant="Answer")
         assert "Question" in conversations.render_for_prompt("conversation-1")
         assert client.get("rag-integration-test:conversation:conversation-1").startswith(
-            b'{"schema_version":2'
+            b'{"schema_version":1'
         )
 
         jobs = RedisJobStore(redis_client=client)

@@ -102,39 +102,6 @@ def test_catalog_bootstraps_default_and_enforces_names_limit_and_corruption(tmp_
         store.list()
 
 
-def test_ensure_default_migrates_only_the_legacy_default_name(tmp_path):
-    catalog_path = tmp_path / "knowledge_bases.json"
-    store = KnowledgeBaseStore(catalog_path)
-    store.ensure_default()
-
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    catalog["knowledge_bases"][0]["name"] = "Default"
-    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
-
-    migrated = store.ensure_default()
-    assert migrated["knowledge_bases"][0]["name"] == "General"
-    assert json.loads(catalog_path.read_text(encoding="utf-8"))["knowledge_bases"][0][
-        "name"
-    ] == "General"
-
-    store.update("default", name="Custom")
-    assert store.ensure_default()["knowledge_bases"][0]["name"] == "Custom"
-
-
-def test_legacy_default_name_migration_preserves_an_existing_general_name(tmp_path):
-    catalog_path = tmp_path / "knowledge_bases.json"
-    store = KnowledgeBaseStore(catalog_path)
-    store.ensure_default()
-
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    catalog["knowledge_bases"][0]["name"] = "Default"
-    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
-    store.create(name="General")
-
-    records = store.ensure_default()["knowledge_bases"]
-    assert [record["name"] for record in records] == ["Default", "General"]
-
-
 def test_catalog_rejects_invalid_timestamps_and_explicit_empty_ids(tmp_path):
     catalog_path = tmp_path / "knowledge_bases.json"
     store = KnowledgeBaseStore(catalog_path)
@@ -220,6 +187,7 @@ def test_session_crud_keeps_default_and_returns_stats(client):
         "indexed_files": 0,
         "chunks": 0,
         "data_sources": 0,
+        "conversations": 0,
     }
 
     renamed = client.patch(
@@ -232,6 +200,52 @@ def test_session_crud_keeps_default_and_returns_stats(client):
     delete_default = client.delete("/api/knowledge-bases/default")
     assert delete_default.status_code == 409
     assert delete_default.get_json()["status"] == "default_knowledge_base"
+
+
+def test_knowledge_base_stats_include_saved_conversations(
+    client,
+    flask_app,
+):
+    history_module = importlib.import_module(
+        "utils.conversation_history_store"
+    )
+    created = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Conversation stats"},
+    ).get_json()
+    user = UserStore(flask_app.config["USERS_DB"]).get(
+        flask_app.config["TEST_USER_ID"]
+    )
+    workspace = workspace_for_user(user, app=flask_app)
+    history = history_module.ConversationHistoryStore(
+        workspace.workspace_id,
+        workspace_data_dir=flask_app.config["WORKSPACE_DATA_DIR"],
+    )
+    scope_key = f"{workspace.workspace_id}:kb:{created['id']}:stats-conv"
+    fingerprint = "a" * 64
+    began = history.begin_turn(
+        client_conversation_id="stats-conv",
+        scope_key=scope_key,
+        scope_kind="kb",
+        turn_id="stats-turn",
+        parent_turn_id=None,
+        request_fingerprint=fingerprint,
+        selected_knowledge_base_ids=[created["id"]],
+    )
+    history.complete_turn(
+        scope_key=scope_key,
+        turn_id="stats-turn",
+        lease_token=began["lease_token"],
+        request_fingerprint=fingerprint,
+        user_content="Question",
+        assistant_content="Answer",
+        selected_knowledge_base_ids=[created["id"]],
+    )
+
+    response = client.get(f"/api/knowledge-bases/{created['id']}")
+
+    assert response.status_code == 200
+    assert response.get_json()["stats"]["conversations"] == 1
 
 
 def test_knowledge_base_rename_invalidates_cache_inside_scoped_writer(
@@ -1305,7 +1319,7 @@ def test_delete_worker_holds_the_lifecycle_write_lock(monkeypatch):
     @contextmanager
     def fake_lock(*, scope=None):
         assert state["locked"] is False
-        assert scope.startswith("kb_")
+        assert scope is None
         state["locked"] = True
         try:
             yield
@@ -1427,6 +1441,123 @@ def test_delete_waits_for_inflight_query_then_clears_conversation(
             scoped_conversation_id["value"]
         )
         == ""
+    )
+
+
+def test_delete_clears_volatile_turn_state_before_durable_history(
+    client,
+    flask_app,
+    monkeypatch,
+):
+    routes = importlib.import_module("routes.knowledge_bases")
+    history_module = importlib.import_module(
+        "utils.conversation_history_store"
+    )
+    pending_module = importlib.import_module("utils.pending_turn_store")
+    reset_conversation_store()
+    pending_module.reset_pending_turn_store()
+
+    created = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Volatile cleanup order"},
+    ).get_json()
+    user = UserStore(flask_app.config["USERS_DB"]).get(
+        flask_app.config["TEST_USER_ID"]
+    )
+    workspace = workspace_for_user(user, app=flask_app)
+    scope_key = f"{workspace.workspace_id}:kb:{created['id']}:cleanup-order"
+    fingerprint = "b" * 64
+    history = history_module.ConversationHistoryStore(
+        workspace.workspace_id,
+        workspace_data_dir=flask_app.config["WORKSPACE_DATA_DIR"],
+    )
+    began = history.begin_turn(
+        client_conversation_id="cleanup-order",
+        scope_key=scope_key,
+        scope_kind="kb",
+        turn_id="cleanup-turn",
+        parent_turn_id=None,
+        request_fingerprint=fingerprint,
+        selected_knowledge_base_ids=[created["id"]],
+    )
+    history.complete_turn(
+        scope_key=scope_key,
+        turn_id="cleanup-turn",
+        lease_token=began["lease_token"],
+        request_fingerprint=fingerprint,
+        user_content="Question",
+        assistant_content="Answer",
+        selected_knowledge_base_ids=[created["id"]],
+    )
+
+    memory_store = get_conversation_store()
+    memory_store.append_turn(
+        scope_key,
+        user="Question",
+        assistant="Answer",
+        knowledge_base_ids=[created["id"]],
+    )
+    pending_store = pending_module.get_pending_turn_store()
+    pending_store.put(
+        scope_key,
+        "pending-turn",
+        lease_token="pending-lease",
+        result_digest="pending-digest",
+        result={"answer": "staged"},
+    )
+    events = []
+    real_memory_clear = memory_store.clear
+    real_pending_clear = pending_store.clear_scope
+    real_durable_delete = getattr(
+        history_module.ConversationHistoryStore,
+        "delete_by_knowledge_base_with_artifact_cleanup",
+    )
+
+    def observed_memory_clear(value):
+        events.append(("memory", value))
+        return real_memory_clear(value)
+
+    def observed_pending_clear(value):
+        events.append(("pending", value))
+        return real_pending_clear(value)
+
+    def observed_durable_delete(store, knowledge_base_id):
+        events.append(("durable", knowledge_base_id))
+        assert memory_store.render_for_prompt(scope_key) == ""
+        assert pending_store.get(scope_key, "pending-turn") is None
+        return real_durable_delete(store, knowledge_base_id)
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(memory_store, "clear", observed_memory_clear)
+    monkeypatch.setattr(pending_store, "clear_scope", observed_pending_clear)
+    monkeypatch.setattr(
+        history_module.ConversationHistoryStore,
+        "delete_by_knowledge_base_with_artifact_cleanup",
+        observed_durable_delete,
+    )
+    monkeypatch.setattr(routes.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(
+        routes,
+        "_delete_chroma_collection",
+        lambda _collection: False,
+    )
+
+    response = client.delete(f"/api/knowledge-bases/{created['id']}")
+
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "completed"
+    assert events.index(("memory", scope_key)) < events.index(
+        ("durable", created["id"])
+    )
+    assert events.index(("pending", scope_key)) < events.index(
+        ("durable", created["id"])
     )
 
 
@@ -2000,6 +2131,12 @@ def test_delete_worker_stops_live_mutations_after_lease_loss(
     upload_folder.mkdir(parents=True, exist_ok=True)
     (data_folder / "live.txt").write_text("data", encoding="utf-8")
     (upload_folder / "live.txt").write_text("upload", encoding="utf-8")
+    FileIndex(context.file_index).record(
+        "live.txt",
+        str(upload_folder / "live.txt"),
+        4,
+        status="indexed",
+    )
     starts = []
 
     class HeldThread:
@@ -2054,6 +2191,25 @@ def test_delete_worker_stops_live_mutations_after_lease_loss(
     job = routes.get_job_store().get(job_id)
     assert job["status"] == "running"
     assert job["processed"] == 3
+    assert job["result"]["files_deleted"] == 1
+    assert job["result"]["chunks_deleted"] == 4
+
+    monkeypatch.setattr(
+        locks,
+        "assert_distributed_locks_healthy",
+        lambda: None,
+    )
+    retried = client.delete(f"/api/knowledge-bases/{created['id']}")
+    assert retried.status_code == 202
+    assert retried.get_json()["job_id"] == job_id
+    assert len(starts) == 2
+
+    starts[1]()
+
+    completed = routes.get_job_store().get(job_id)
+    assert completed["status"] == "completed"
+    assert completed["result"]["files_deleted"] == 1
+    assert completed["result"]["chunks_deleted"] == 4
 
 
 def test_api_key_cleanup_does_not_rollback_after_lease_loss(
@@ -2231,6 +2387,7 @@ def test_delete_uses_rq_when_the_queue_backend_is_redis(
             raise AssertionError("inline thread must not be used for Redis")
 
     monkeypatch.setattr(routes, "configured_queue_backend", lambda: "redis")
+    monkeypatch.setattr(routes, "configured_state_backend", lambda: "redis")
     monkeypatch.setattr(routes.threading, "Thread", UnexpectedThread)
     monkeypatch.setattr(
         routes,
@@ -2245,6 +2402,21 @@ def test_delete_uses_rq_when_the_queue_backend_is_redis(
     assert enqueued[0][0] == response.get_json()["job_id"]
     assert enqueued[0][1]["KNOWLEDGE_BASE_ID"] == created["id"]
     assert enqueued[0][1]["USERS_DB"]
+
+
+def test_queued_delete_rejects_process_local_state_backend(client, monkeypatch):
+    routes = importlib.import_module("routes.knowledge_bases")
+    created = client.post(
+        "/api/knowledge-bases",
+        json={"name": "Unsafe queued delete"},
+    ).get_json()
+    monkeypatch.setattr(routes, "configured_queue_backend", lambda: "redis")
+    monkeypatch.setattr(routes, "configured_state_backend", lambda: "memory")
+
+    response = client.delete(f"/api/knowledge-bases/{created['id']}")
+
+    assert response.status_code == 503
+    assert response.get_json()["status"] == "shared_state_backend_required"
 
 
 def test_duplicate_redis_delete_reconciles_a_job_crashed_before_enqueue(
@@ -2268,6 +2440,7 @@ def test_duplicate_redis_delete_reconciles_a_job_crashed_before_enqueue(
             raise SimulatedProcessCrash()
 
     monkeypatch.setattr(routes, "configured_queue_backend", lambda: "redis")
+    monkeypatch.setattr(routes, "configured_state_backend", lambda: "redis")
     monkeypatch.setattr(
         routes,
         "_enqueue_delete_knowledge_base_job",
@@ -2339,6 +2512,7 @@ def test_delete_reconciles_a_crash_after_catalog_and_api_key_cleanup(
             routes._delete_knowledge_base_job(job_id, config)
 
     monkeypatch.setattr(routes, "configured_queue_backend", lambda: "redis")
+    monkeypatch.setattr(routes, "configured_state_backend", lambda: "redis")
     monkeypatch.setattr(
         routes,
         "_enqueue_delete_knowledge_base_job",

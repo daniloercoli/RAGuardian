@@ -11,7 +11,6 @@ from pathlib import Path
 from flask import jsonify, render_template, request
 
 from utils.auth import (
-    current_user,
     require_api_any_scope,
     require_api_scope,
     require_login,
@@ -30,7 +29,11 @@ from utils.knowledge_base_store import (
     validate_knowledge_base_name,
 )
 from utils.settings_store import SettingsStore
-from utils.state_backend import configured_queue_backend, redis_connection
+from utils.state_backend import (
+    configured_queue_backend,
+    configured_state_backend,
+    redis_connection,
+)
 from utils.workspace import (
     _delete_chroma_collection,
     collection_for_knowledge_base,
@@ -43,6 +46,15 @@ from utils.workspace import (
 _inline_delete_workers: set[str] = set()
 _inline_delete_workers_lock = threading.Lock()
 log = logging.getLogger(__name__)
+
+
+def _nonnegative_int(value) -> int:
+    """Parse a destructive-operation counter without allowing negatives."""
+
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def register_knowledge_base_routes(app) -> None:
@@ -256,6 +268,15 @@ def _update_response(app, knowledge_base_id: str, *, public: bool):
 
 def _delete_response(app, knowledge_base_id: str, *, public: bool):
     knowledge_base_id = validate_knowledge_base_id(knowledge_base_id)
+    if (
+        configured_queue_backend() == "redis"
+        and configured_state_backend() != "redis"
+    ):
+        raise KnowledgeBaseValidationError(
+            "L'eliminazione in coda richiede uno state backend Redis condiviso",
+            code="shared_state_backend_required",
+            status_code=503,
+        )
     requester_api_key_id = ""
     api_key_allowed = True
     if public:
@@ -578,6 +599,7 @@ def _delete_runtime_config(
         }
     runtime["KNOWLEDGE_BASES_FILE"] = workspace.knowledge_bases_file
     runtime["USERS_DB"] = app.config["USERS_DB"]
+    runtime["WORKSPACE_DATA_DIR"] = app.config["WORKSPACE_DATA_DIR"]
     return runtime
 
 
@@ -590,7 +612,11 @@ def _delete_knowledge_base_job(job_id: str, config: dict) -> None:
             lifecycle_write_lock,
         )
 
-        with lifecycle_write_lock(scope=config["CHROMA_COLLECTION"]):
+        # A hard delete mutates workspace-global state too (settings, API
+        # keys, durable conversations and the KB catalog), so a collection-
+        # scoped gate is not sufficient.  The global writer also waits for
+        # every in-flight scoped reader before destructive cleanup starts.
+        with lifecycle_write_lock():
             with index_write_lock():
                 _run_delete_knowledge_base_job(job_id, config)
     except DistributedLockLeaseLostError:
@@ -626,6 +652,7 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
     workspace_id = config["WORKSPACE_ID"]
     result = {
         "collections_deleted": 0,
+        "conversations_deleted": 0,
         "chunks_deleted": 0,
         "files_deleted": 0,
         "data_sources_deleted": 0,
@@ -633,9 +660,24 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
         "api_keys_updated": 0,
         "api_keys_disabled": 0,
     }
+    result_counter_names = tuple(result)
+
+    def retain_result_count(name: str, value) -> None:
+        """Keep destructive counters monotonic across idempotent retries."""
+        previous = _nonnegative_int(result.get(name))
+        observed = _nonnegative_int(value)
+        result[name] = max(previous, observed)
+
+    def add_result_count(name: str, value) -> None:
+        """Accumulate newly removed, distinct resources on a resumed job."""
+        previous = _nonnegative_int(result.get(name))
+        added = _nonnegative_int(value)
+        result[name] = previous + added
 
     def update_job(**patch) -> None:
         assert_distributed_locks_healthy()
+        if isinstance(patch.get("result"), dict):
+            patch["result"] = dict(patch["result"])
         job_store.update(job_id, **patch)
         assert_distributed_locks_healthy()
 
@@ -670,7 +712,7 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
         workspace = workspace_from_config(config)
         store = knowledge_base_store(workspace)
         record = store.get(knowledge_base_id)
-        processed = max(0, int(job.get("processed") or 0))
+        processed = _nonnegative_int(job.get("processed"))
         if record is None and processed < 5:
             raise RuntimeError(
                 "Knowledge base assente prima del cleanup finale"
@@ -687,6 +729,8 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
         stored_result = job.get("result")
         if isinstance(stored_result, dict):
             result.update(stored_result)
+        for counter_name in result_counter_names:
+            retain_result_count(counter_name, result[counter_name])
         from utils.secret_store import SecretStore
 
         secret_store = SecretStore(
@@ -696,10 +740,13 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
         secret_owner = f"{workspace_id}:{knowledge_base_id}"
 
         if record is None:
-            # Compatibility with jobs created before catalog removal became
-            # the last checkpoint: resume only idempotent final cleanup.
+            # The current job may have stopped after its final catalog
+            # checkpoint; resume only the idempotent cleanup.
             assert_distributed_locks_healthy()
-            result["secrets_deleted"] += secret_store.delete_owner(secret_owner)
+            add_result_count(
+                "secrets_deleted",
+                secret_store.delete_owner(secret_owner),
+            )
             assert_distributed_locks_healthy()
             checkpoint = {"result": result}
             if processed < 5:
@@ -707,9 +754,10 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             update_job(**checkpoint)
         else:
             entries = _file_entries(config["FILE_INDEX"])
-            result["files_deleted"] = len(entries)
-            result["chunks_deleted"] = sum(
-                max(0, int(entry.get("chunks") or 0)) for entry in entries
+            retain_result_count("files_deleted", len(entries))
+            retain_result_count(
+                "chunks_deleted",
+                sum(_nonnegative_int(entry.get("chunks")) for entry in entries),
             )
 
             settings_store = SettingsStore(config["SETTINGS_FILE"])
@@ -738,15 +786,21 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             assert_distributed_locks_healthy()
             settings_store.mutate(remove_data_sources)
             assert_distributed_locks_healthy()
-            result["data_sources_deleted"] = len(removed_sources)
+            retain_result_count("data_sources_deleted", len(removed_sources))
+            update_job(result=result)
             for ref in removed_secret_refs:
                 assert_distributed_locks_healthy()
-                result["secrets_deleted"] += int(
-                    secret_store.delete_secret(ref)
+                add_result_count(
+                    "secrets_deleted",
+                    secret_store.delete_secret(ref),
                 )
                 assert_distributed_locks_healthy()
+                update_job(result=result)
             assert_distributed_locks_healthy()
-            result["secrets_deleted"] += secret_store.delete_owner(secret_owner)
+            add_result_count(
+                "secrets_deleted",
+                secret_store.delete_owner(secret_owner),
+            )
             assert_distributed_locks_healthy()
             update_job(
                 processed=max(processed, 2),
@@ -754,11 +808,12 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             )
 
             assert_distributed_locks_healthy()
-            result["collections_deleted"] = int(
-                _delete_chroma_collection(config["CHROMA_COLLECTION"])
+            retain_result_count(
+                "collections_deleted",
+                _delete_chroma_collection(config["CHROMA_COLLECTION"]),
             )
             assert_distributed_locks_healthy()
-            update_job(processed=max(processed, 3))
+            update_job(processed=max(processed, 3), result=result)
 
             data_folder = Path(config["FILE_INDEX"]).parent
             upload_folder = Path(config["UPLOAD_FOLDER"])
@@ -778,13 +833,79 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             clear_cache_for_collection(config["CHROMA_COLLECTION"])
             assert_distributed_locks_healthy()
             from utils.conversation_memory import get_conversation_store
+            from utils.pending_turn_store import get_pending_turn_store
 
-            assert_distributed_locks_healthy()
-            get_conversation_store().clear_by_knowledge_base(
+            memory_store = get_conversation_store()
+            pending_store = get_pending_turn_store()
+            workspace_data_root = Path(
+                config.get("WORKSPACE_DATA_DIR")
+                or os.getenv("RAG_WORKSPACE_DATA_DIR", "app/data/workspaces")
+            )
+            history_db = workspace_data_root / workspace_id / "conversations.db"
+            history_store = None
+            if history_db.exists():
+                from utils.conversation_history_store import ConversationHistoryStore
+
+                history_store = ConversationHistoryStore(
+                    workspace_id,
+                    workspace_data_dir=workspace_data_root,
+                )
+                history_scope_keys = history_store.scope_keys_by_knowledge_base(
+                    knowledge_base_id
+                )
+                for scope_key in history_scope_keys:
+                    memory_store.clear(scope_key)
+                    pending_store.clear_scope(scope_key)
+
+            # Volatile state must disappear first.  If the worker stops after
+            # the durable cascade, the deleted rows can no longer provide the
+            # scope keys needed by a retry to clear staged results safely.
+            pending_store.clear_by_prefix(
+                f"{workspace_id}:kb:{knowledge_base_id}:"
+            )
+            memory_store.clear_by_knowledge_base(
                 workspace_id,
                 knowledge_base_id,
             )
             assert_distributed_locks_healthy()
+            if history_store is not None:
+                deleted_conversations, artifact_plan = (
+                    history_store.delete_by_knowledge_base_with_artifact_cleanup(
+                        knowledge_base_id
+                    )
+                )
+                retain_result_count(
+                    "conversations_deleted",
+                    deleted_conversations,
+                )
+                assert_distributed_locks_healthy()
+                # Persist the destructive count immediately; later retries
+                # will observe zero after the idempotent durable cascade.
+                update_job(result=result)
+                if artifact_plan.safe:
+                    from utils.conversation_artifacts import (
+                        cleanup_workspace_artifacts,
+                    )
+
+                    # The cleanup plan was checkpointed in the same SQLite
+                    # transaction as the cascade. A crash or filesystem error
+                    # can therefore be retried after the relations are gone.
+                    cleanup_workspace_artifacts(
+                        config["WORKSPACE_UPLOAD_FOLDER"],
+                        artifact_plan.exclusive,
+                        strict=True,
+                    )
+                    history_store.complete_artifact_cleanup(
+                        f"knowledge-base:{knowledge_base_id}"
+                    )
+                    assert_distributed_locks_healthy()
+                elif deleted_conversations:
+                    log.warning(
+                        "Skipping unsafe Code Interpreter artifact cleanup "
+                        "for knowledge base %s",
+                        knowledge_base_id,
+                    )
+
             job_store.clear_by_knowledge_base(
                 workspace_id,
                 knowledge_base_id,
@@ -814,8 +935,8 @@ def _run_delete_knowledge_base_job(job_id: str, config: dict) -> None:
             lease_check=assert_distributed_locks_healthy,
         )
         assert_distributed_locks_healthy()
-        result["api_keys_updated"] = key_result["updated"]
-        result["api_keys_disabled"] = key_result["disabled"]
+        retain_result_count("api_keys_updated", key_result["updated"])
+        retain_result_count("api_keys_disabled", key_result["disabled"])
         update_job(
             processed=max(processed, 6),
             result=result,
@@ -894,6 +1015,15 @@ def _with_stats(workspace, record: dict) -> dict:
         if (source.get("knowledge_base_id") or DEFAULT_KNOWLEDGE_BASE_ID)
         == record["id"]
     )
+    conversations = 0
+    history_db = Path(workspace.data_folder) / "conversations.db"
+    if history_db.exists():
+        from utils.conversation_history_store import ConversationHistoryStore
+
+        conversations = ConversationHistoryStore(
+            workspace.workspace_id,
+            workspace_data_dir=Path(workspace.data_folder).parent,
+        ).count_by_knowledge_base(record["id"])
     return {
         **record,
         "stats": {
@@ -903,6 +1033,7 @@ def _with_stats(workspace, record: dict) -> dict:
             ),
             "chunks": sum(max(0, int(entry.get("chunks") or 0)) for entry in entries),
             "data_sources": data_sources,
+            "conversations": conversations,
         },
     }
 

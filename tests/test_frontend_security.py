@@ -42,11 +42,43 @@ def test_chat_ask_button_recovers_from_stalled_streams():
     assert "createAskTimeout" in script
     assert "controller.abort()" in script
     assert "askTimeout.clear()" in script
-    assert "postAsk(body, askTimeout)" in script
-    assert "renderStreamingResponse(response, messageDiv, askTimeout)" in script
-    assert "renderCodeInterpreterStream(response, messageDiv, askTimeout)" in script
+    assert "postAsk(turnRequest.body, askTimeout)" in script
+    assert "await renderStreamingResponse(" in script
+    assert "await renderCodeInterpreterStream(" in script
     assert script.count("reader.cancel().catch") >= 2
     assert "formatConnectionError" in script
+
+
+def test_interrupted_stream_keeps_exact_turn_request_for_explicit_retry():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert "let retryableTurnRequest = null;" in script
+    assert "async function executeTurnRequest(turnRequest, isRetry = false)" in script
+    assert "currentTurnId = turnRequest.body.turn_id;" in script
+    assert "retryableTurnRequest = turnRequest;" in script
+    assert "await executeTurnRequest(turnRequest, true);" in script
+    assert "postAsk(turnRequest.body, askTimeout)" in script
+    assert "Retry this turn" in script
+    assert "Regenerate and replace draft" in script
+    assert "regenerate_lost_result: true" in script
+    assert 'activeConversationHistoryState = "draft";' in script
+    assert "historyStateBeforeSend" not in script
+    assert "activeConversationHistoryState = historyStateBeforeSend" not in script
+
+
+def test_rag_and_code_interpreter_require_a_terminal_ndjson_event():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert script.count("terminalType: null") == 2
+    assert script.count('state.terminalType = "done";') == 2
+    assert script.count('state.terminalType = "error";') == 2
+    assert script.count("return streamTerminalType(state);") >= 6
+    assert "function streamTerminalType(state)" in script
+    assert 'terminalType === "done" || terminalType === "error"' in script
+    assert 'terminalType === "volatile_result_lost"' in script
+    assert "The response ended before the server confirmed completion." in script
+    assert 'clearTurnRetryUi(turnRequest.messageDiv);' in script
+    assert 'retryableTurnRequest = null;' in script
 
 
 def test_multi_kb_chat_fails_closed_and_waits_for_recovery():
@@ -171,6 +203,60 @@ def test_configuration_link_warns_before_leaving_a_started_conversation():
     assert 'configurationLink.setAttribute("aria-disabled", String(isBusy))' in script
 
 
+def test_conversation_history_uses_safe_dom_and_complete_pagination():
+    template = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert 'data-history-status="active"' in template
+    assert 'data-history-status="archived"' in template
+    assert 'id="historyLoadMore"' in template
+    assert "status: requestedStatus" in script
+    assert "page: String(targetPage)" in script
+    assert "historyHasNext = Boolean(data.pagination && data.pagination.has_next)" in script
+    assert "loadRemainingHistoryForSearch" in script
+    assert "before_sequence: String(cursor)" in script
+    assert "renderOlderMessagesControl" in script
+    assert "historyList.replaceChildren()" in script
+    assert "title.textContent = titleText" in script
+    assert "item.setAttribute(\"aria-label\", `Conversation: ${titleText}`)" in script
+    assert "historyList.innerHTML = filteredHistory.map" not in script
+    assert "conversationLoadAbortController.abort()" in script
+    assert "historyListAbortController.abort()" in script
+
+
+def test_conversation_resume_restores_durable_state_and_sources():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert "fetch(`/api/conversations/${encodedId}`, {signal})" in script
+    assert "restoreConversationConfiguration(record, signal)" in script
+    assert "restoreConversationModel(record, warnings)" in script
+    assert "restoreConversationKnowledgeBases(record, warnings)" in script
+    assert "restoreConversationPrompt(record, warnings)" in script
+    assert "fetch(`/api/agents/${encodeURIComponent(agentId)}`, {signal})" in script
+    assert 'activeConversationArchived = record.status === "archived"' in script
+    assert "Unarchive this conversation before continuing" in script
+    assert "activeConversationArchived = !isArchived" in script
+    assert "if (isCurrent) clearChat()" in script
+    assert "renderPersistedSources(message.sources)" in script
+    assert "appendSources(preferredSources(event.context, event.sources))" in script
+    assert "Array.isArray(context) && context.length > 0" in script
+    assert "safeHistorySourceUrl" in script
+    assert '["http:", "https:"].includes(url.protocol)' in script
+
+
+def test_turn_continuity_advances_only_after_durable_history_save():
+    script = (ROOT / "app/static/script.js").read_text(encoding="utf-8")
+
+    assert "event && event.history_saved === true" in script
+    assert "if (historySaved && currentTurnId)" in script
+    assert script.count("lastTurnId = currentTurnId;") == 1
+    assert script.count("applyHistoryOutcome(event);") == 2
+    assert 'String(data.code || data.status || "").toLowerCase()' in script
+    assert 'code === "continuity_error"' in script
+    assert 'code === "turn_id_conflict"' in script
+    assert 'data,\n            "expected_parent_turn_id"' in script
+
+
 def test_agents_page_has_start_chat_navigation():
     agents_js = (ROOT / "app/static/agents.js").read_text(encoding="utf-8")
     assert 'data-action="start">Start chat' in agents_js
@@ -205,6 +291,16 @@ def test_default_knowledge_base_uses_a_dedicated_tag_style():
     assert 'class="default-kb-tag"' in knowledge_bases_js
     assert ".default-kb-tag {" in stylesheet
     assert ".default-kb-tag::before" in stylesheet
+
+
+def test_knowledge_base_delete_warns_about_saved_conversations():
+    knowledge_bases_js = (
+        ROOT / "app/static/knowledge_bases.js"
+    ).read_text(encoding="utf-8")
+
+    assert "<dt>Conversations</dt>" in knowledge_bases_js
+    assert "item.stats.conversations" in knowledge_bases_js
+    assert "saved conversations will also be permanently deleted" in knowledge_bases_js
 
 
 def test_agents_description_maxlength_matches_limit():

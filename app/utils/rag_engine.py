@@ -5,6 +5,7 @@ import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Generator, List, Optional
+from urllib.parse import unquote, urlsplit
 
 from config import Config
 from utils import RAG_LOGGER as log
@@ -68,6 +69,7 @@ def query_rag(
     conversation_knowledge_base_ids: Optional[list[str]] = None,
     conversation_prompt_context: Optional[str] = None,
     conversation_retrieval_context: Optional[str] = None,
+    append_conversation_turn: bool = True,
 ):
     if stream:
         return query_rag_stream(
@@ -89,6 +91,7 @@ def query_rag(
             conversation_knowledge_base_ids=conversation_knowledge_base_ids,
             conversation_prompt_context=conversation_prompt_context,
             conversation_retrieval_context=conversation_retrieval_context,
+            append_conversation_turn=append_conversation_turn,
         )
     return query_rag_non_stream(
         query,
@@ -109,6 +112,7 @@ def query_rag(
         conversation_knowledge_base_ids=conversation_knowledge_base_ids,
         conversation_prompt_context=conversation_prompt_context,
         conversation_retrieval_context=conversation_retrieval_context,
+        append_conversation_turn=append_conversation_turn,
     )
 
 
@@ -131,6 +135,7 @@ def query_rag_non_stream(
     conversation_knowledge_base_ids: Optional[list[str]] = None,
     conversation_prompt_context: Optional[str] = None,
     conversation_retrieval_context: Optional[str] = None,
+    append_conversation_turn: bool = True,
 ) -> Dict[str, object]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -178,16 +183,17 @@ def query_rag_non_stream(
             custom_system_prompt=custom_system_prompt,
         )
     )
-    _append_conversation_turn(
-        conversation_id,
-        query=query,
-        answer=answer,
-        provider=provider_id,
-        model=selected_model,
-        temperature=effective_temperature,
-        settings=settings,
-        knowledge_base_ids=conversation_knowledge_base_ids,
-    )
+    if append_conversation_turn:
+        _append_conversation_turn(
+            conversation_id,
+            query=query,
+            answer=answer,
+            provider=provider_id,
+            model=selected_model,
+            temperature=effective_temperature,
+            settings=settings,
+            knowledge_base_ids=conversation_knowledge_base_ids,
+        )
     result = {
         "answer": answer,
         "model": selected_model,
@@ -288,6 +294,7 @@ def query_rag_stream(
     conversation_knowledge_base_ids: Optional[list[str]] = None,
     conversation_prompt_context: Optional[str] = None,
     conversation_retrieval_context: Optional[str] = None,
+    append_conversation_turn: bool = True,
 ) -> Generator[str, None, None]:
     settings = _load_settings(settings_path)
     rag = settings["rag"]
@@ -334,16 +341,17 @@ def query_rag_stream(
         answer_parts.append(chunk)
         yield chunk
 
-    _append_conversation_turn(
-        conversation_id,
-        query=query,
-        answer="".join(answer_parts),
-        provider=provider_id,
-        model=selected_model,
-        temperature=effective_temperature,
-        settings=settings,
-        knowledge_base_ids=conversation_knowledge_base_ids,
-    )
+    if append_conversation_turn:
+        _append_conversation_turn(
+            conversation_id,
+            query=query,
+            answer="".join(answer_parts),
+            provider=provider_id,
+            model=selected_model,
+            temperature=effective_temperature,
+            settings=settings,
+            knowledge_base_ids=conversation_knowledge_base_ids,
+        )
 
 
 def query_rag_stream_events(
@@ -365,6 +373,7 @@ def query_rag_stream_events(
     conversation_knowledge_base_ids: Optional[list[str]] = None,
     conversation_prompt_context: Optional[str] = None,
     conversation_retrieval_context: Optional[str] = None,
+    append_conversation_turn: bool = True,
 ) -> Generator[Dict[str, object], None, None]:
     try:
         settings = _load_settings(settings_path)
@@ -449,16 +458,17 @@ def query_rag_stream_events(
         if conversation_id:
             done_event["conversation_id"] = conversation_id
         yield done_event
-        _append_conversation_turn(
-            conversation_id,
-            query=query,
-            answer="".join(answer_parts),
-            provider=provider_id,
-            model=selected_model,
-            temperature=effective_temperature,
-            settings=settings,
-            knowledge_base_ids=conversation_knowledge_base_ids,
-        )
+        if append_conversation_turn:
+            _append_conversation_turn(
+                conversation_id,
+                query=query,
+                answer="".join(answer_parts),
+                provider=provider_id,
+                model=selected_model,
+                temperature=effective_temperature,
+                settings=settings,
+                knowledge_base_ids=conversation_knowledge_base_ids,
+            )
     except Exception as e:
         log.error(f"Errore streaming RAG: {e}")
         yield {
@@ -790,9 +800,6 @@ def _get_context(
     cache_namespace = conversation_id or "stateless"
     if use_cache and settings["rag"]["enable_cache"]:
         cached_results = _cache.get(cache_query, k, model, namespace=cache_namespace)
-
-    cache_hit = bool(cached_results)
-    is_cached_or_enabled = cached_results is not None or (use_cache and settings["rag"]["enable_cache"])
 
     if cached_results:
         elapsed = time.time() - retrieval_start
@@ -1246,7 +1253,7 @@ def _serialize_context(
     for doc in (context_docs or []):
         entry = {
             "text": doc.page_content,
-            "metadata": doc.metadata,
+            "metadata": _public_document_metadata(doc.metadata),
         }
         if include_downloads:
             knowledge_base_id = str(
@@ -1268,8 +1275,10 @@ def _serialize_sources(context_docs) -> List[dict]:
 def _source_payload(doc) -> dict:
     metadata = dict(doc.metadata or {})
     source = str(metadata.get("source") or "")
-    filename = os.path.basename(source) if source else "document"
-    source_type = metadata.get("source_type") or _source_type_from_filename(filename)
+    filename = _public_source_name(source) if source else "document"
+    source_type = _public_metadata_scalar(metadata.get("source_type"))
+    if not isinstance(source_type, str) or not source_type:
+        source_type = _source_type_from_filename(filename)
     payload = {
         "filename": filename,
         "source_type": source_type,
@@ -1278,17 +1287,128 @@ def _source_payload(doc) -> dict:
     for key in (
         "knowledge_base_id",
         "knowledge_base_name",
-        "knowledge_base_origins",
     ):
         if metadata.get(key) is not None:
-            payload[key] = metadata[key]
+            payload[key] = _public_metadata_scalar(metadata[key])
+    if metadata.get("knowledge_base_origins") is not None:
+        payload["knowledge_base_origins"] = _public_knowledge_base_origins(
+            metadata["knowledge_base_origins"]
+        )
     for key in ("chunk_id", "page", "page_number"):
         if metadata.get(key) is not None:
             public_key = "page" if key == "page_number" else key
-            payload[public_key] = metadata[key]
+            scalar = _public_metadata_scalar(metadata[key])
+            if scalar is not None:
+                payload[public_key] = scalar
     if metadata.get("reranker_score") is not None:
-        payload["score"] = metadata["reranker_score"]
+        score = _public_metadata_scalar(metadata["reranker_score"])
+        if score is not None:
+            payload["score"] = score
     return payload
+
+
+_PUBLIC_DOCUMENT_METADATA_KEYS = {
+    "attachment_id",
+    "chunk_id",
+    "chunk_index",
+    "document_id",
+    "end_time",
+    "filename",
+    "heading",
+    "knowledge_base_id",
+    "knowledge_base_name",
+    "local_rank",
+    "page",
+    "page_number",
+    "reranker_score",
+    "rrf_score",
+    "score",
+    "section",
+    "source_id",
+    "source_type",
+    "start_time",
+    "temporary_attachment",
+}
+
+_PUBLIC_ORIGIN_METADATA_KEYS = {
+    "chunk_id",
+    "document_id",
+    "knowledge_base_id",
+    "knowledge_base_name",
+    "local_rank",
+    "page",
+    "page_number",
+    "rrf_score",
+}
+
+
+def _public_document_metadata(value: object) -> dict:
+    """Build public metadata from an allowlist, never from recursive copying.
+
+    Connector metadata may contain credentials, internal URLs, prompts and
+    local paths.  Only fields required by the query UI/API are exposed.
+    """
+
+    metadata = value if isinstance(value, dict) else {}
+    public = {}
+    source = metadata.get("source")
+    if source:
+        public["source"] = _public_source_reference(source)
+    for key in _PUBLIC_DOCUMENT_METADATA_KEYS:
+        if metadata.get(key) is not None:
+            scalar = _public_metadata_scalar(metadata[key])
+            if scalar is not None:
+                public[key] = scalar
+    if metadata.get("knowledge_base_origins") is not None:
+        public["knowledge_base_origins"] = _public_knowledge_base_origins(
+            metadata["knowledge_base_origins"]
+        )
+    return public
+
+
+def _public_knowledge_base_origins(value: object) -> list[dict]:
+    origins = []
+    if not isinstance(value, (list, tuple)):
+        return origins
+    for raw_origin in value:
+        if not isinstance(raw_origin, dict):
+            continue
+        origin = {}
+        if raw_origin.get("source"):
+            origin["source"] = _public_source_reference(raw_origin["source"])
+        for key in _PUBLIC_ORIGIN_METADATA_KEYS:
+            if raw_origin.get(key) is not None:
+                scalar = _public_metadata_scalar(raw_origin[key])
+                if scalar is not None:
+                    origin[key] = scalar
+        origins.append(origin)
+    return origins
+
+
+def _public_metadata_scalar(value: object):
+    if isinstance(value, os.PathLike):
+        return _public_source_reference(os.fspath(value))
+    if isinstance(value, str):
+        return value[:1024]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return None
+
+
+def _public_source_reference(value: object) -> str:
+    """Reduce local paths and remote URLs to a non-sensitive public name."""
+
+    return _public_source_name(os.fspath(value) if isinstance(value, os.PathLike) else str(value or ""))
+
+
+def _public_source_name(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/").rstrip("/")
+    if not normalized:
+        return "document"
+    parsed = urlsplit(normalized)
+    if parsed.scheme.lower() in {"http", "https", "file"}:
+        normalized = unquote(parsed.path).rstrip("/")
+    return normalized.rsplit("/", 1)[-1] or "document"
 
 
 def _source_type_from_filename(filename: str) -> str:
@@ -1340,7 +1460,6 @@ def _get_download_url(file_index: FileIndex, doc) -> Optional[str]:
         if entry.get("status") != "indexed":
             continue
         
-        entry_source_id = entry.get("metadata", {}).get("index_profile", {})
         entry_doc_id = entry.get("metadata", {}).get("document_id", "")
         entry_source_id_full = entry.get("metadata", {}).get("source_id", "")
         

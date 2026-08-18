@@ -82,7 +82,7 @@ Valid scopes:
 Scopes and the `knowledge_base_ids` allowlist are both enforced. `kb_manage`
 and `agent_manage` do not grant query or ingest by themselves. Keys with
 `query`, `ingest`, or `agent_manage` require at least one allowed KB so Agent
-CRUD can enforce the same boundary. Existing keys migrate to `["default"]`.
+CRUD can enforce the same boundary.
 Deleting a KB removes it from every allowlist; keys left without a target are
 disabled rather than reassigned.
 
@@ -139,7 +139,7 @@ The usage log is:
 ## Security Notes
 
 - The raw key value is revealed only in the current admin response and is never stored in the Flask session cookie.
-- Existing plaintext keys are migrated to hashes automatically at application startup.
+- Only hashed keys created by the current version are supported.
 - Keys are masked in the UI as `sk-abc...xyz`.
 - Disabled keys remain in the store for audit trails.
 - Expiration validation runs on every request before the key is accepted for authentication.

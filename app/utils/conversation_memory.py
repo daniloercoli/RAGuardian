@@ -23,6 +23,7 @@ CONVERSATION_RECENT_TURNS_TO_KEEP = 4
 CONVERSATION_MAX_STORED_MESSAGE_CHARS = 6000
 CONVERSATION_TTL_SECONDS = 6 * 60 * 60
 CONVERSATION_MAX_ITEMS = 100
+CONVERSATION_STATE_SCHEMA_VERSION = 1
 log = logging.getLogger(__name__)
 
 
@@ -30,6 +31,7 @@ log = logging.getLogger(__name__)
 class ConversationTurn:
     user: str
     assistant: str
+    assistant_sequence: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,17 @@ class ConversationSummaryJob:
     turns_to_summarize: list[ConversationTurn]
     recent_turns: list[ConversationTurn]
     version: int
+
+    @property
+    def through_sequence(self) -> Optional[int]:
+        if not self.turns_to_summarize:
+            return None
+        highest_sequence = 0
+        for turn in self.turns_to_summarize:
+            if turn.assistant_sequence is None:
+                return None
+            highest_sequence = max(highest_sequence, int(turn.assistant_sequence))
+        return highest_sequence
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,7 @@ class ConversationSnapshot:
 @dataclass
 class ConversationState:
     summary: str = ""
+    summary_through_sequence: int = 0
     turns: list[ConversationTurn] = field(default_factory=list)
     knowledge_base_ids: set[str] = field(default_factory=set)
     created_at: float = field(default_factory=time.time)
@@ -128,6 +142,7 @@ class ConversationMemoryStore:
         user: str,
         assistant: str,
         knowledge_base_ids=None,
+        assistant_sequence: Optional[int] = None,
     ) -> Optional[ConversationSummaryJob]:
         if not conversation_id:
             return None
@@ -135,18 +150,24 @@ class ConversationMemoryStore:
         turn = ConversationTurn(
             user=_clamp_text(user, CONVERSATION_MAX_STORED_MESSAGE_CHARS),
             assistant=_clamp_text(assistant, CONVERSATION_MAX_STORED_MESSAGE_CHARS),
+            assistant_sequence=assistant_sequence,
         )
 
         with self._lock:
             state = self._get_state(conversation_id, create=True)
-            state.turns.append(turn)
+            added = _insert_turn_by_sequence(state, turn)
+            previous_kb_ids = set(state.knowledge_base_ids)
             state.knowledge_base_ids.update(
                 str(value) for value in (knowledge_base_ids or ()) if value
             )
             state.updated_at = time.time()
-            state.version += 1
+            if added or state.knowledge_base_ids != previous_kb_ids:
+                state.version += 1
             self._conversations.move_to_end(conversation_id)
             self._evict_if_needed()
+
+            if not added:
+                return None
 
             if _state_size(state) <= self.summary_threshold_chars:
                 return None
@@ -170,6 +191,7 @@ class ConversationMemoryStore:
         user: str,
         assistant: str,
         knowledge_base_ids=None,
+        assistant_sequence: Optional[int] = None,
     ) -> Optional[ConversationSummaryJob]:
         """Idempotent append: skip if the last turn already matches ``user``.
 
@@ -193,6 +215,7 @@ class ConversationMemoryStore:
             user=user,
             assistant=assistant,
             knowledge_base_ids=knowledge_base_ids,
+            assistant_sequence=assistant_sequence,
         )
 
     def hydrate_if_absent(
@@ -203,6 +226,7 @@ class ConversationMemoryStore:
         turns: list[ConversationTurn],
         knowledge_base_ids=None,
         version: Optional[int] = None,
+        through_sequence: int = 0,
     ) -> bool:
         """Populate warm memory from durable history if no state exists yet.
 
@@ -220,6 +244,7 @@ class ConversationMemoryStore:
 
             state = self._get_state(conversation_id, create=True)
             state.summary = _clamp_text(summary or "", self.summary_max_chars)
+            state.summary_through_sequence = max(0, int(through_sequence or 0))
             state.turns = list(turns or [])
             state.knowledge_base_ids = {
                 str(value) for value in (knowledge_base_ids or ()) if value
@@ -230,6 +255,55 @@ class ConversationMemoryStore:
             self._evict_if_needed()
             return True
 
+    def replace_from_durable(
+        self,
+        conversation_id: Optional[str],
+        *,
+        summary: str,
+        turns: list[ConversationTurn],
+        knowledge_base_ids=None,
+        version: Optional[int] = None,
+        through_sequence: int = 0,
+    ) -> bool:
+        """Atomically replace stale warm state with a durable snapshot."""
+
+        if not conversation_id:
+            return False
+        durable_max = _durable_state_sequence(turns, through_sequence)
+        with self._lock:
+            existing = self._get_state(conversation_id, create=False)
+            if existing and _conversation_state_sequence(existing) > durable_max:
+                return False
+            created_at = existing.created_at if existing else time.time()
+            durable_kb_ids = {
+                str(value) for value in (knowledge_base_ids or ()) if value
+            }
+            self._conversations[conversation_id] = ConversationState(
+                summary=_clamp_text(summary or "", self.summary_max_chars),
+                summary_through_sequence=max(0, int(through_sequence or 0)),
+                turns=list(turns or []),
+                knowledge_base_ids=durable_kb_ids,
+                created_at=created_at,
+                updated_at=time.time(),
+                version=int(version) if version is not None else len(turns or []),
+            )
+            self._conversations.move_to_end(conversation_id)
+            self._evict_if_needed()
+            return True
+
+    def durable_state_is_current(
+        self,
+        conversation_id: Optional[str],
+        assistant_sequence: int,
+    ) -> bool:
+        """Return whether every durable assistant sequence is represented."""
+
+        if not conversation_id:
+            return False
+        with self._lock:
+            state = self._get_state(conversation_id, create=False)
+            return _state_covers_sequence(state, assistant_sequence)
+
     def apply_summary(self, job: ConversationSummaryJob, summary: str) -> bool:
         with self._lock:
             state = self._get_state(job.conversation_id, create=False)
@@ -238,6 +312,8 @@ class ConversationMemoryStore:
 
             state.summary = _clamp_text(summary.strip(), self.summary_max_chars)
             state.turns = list(job.recent_turns)
+            if job.through_sequence is not None:
+                state.summary_through_sequence = job.through_sequence
             state.updated_at = time.time()
             state.version += 1
             self._conversations.move_to_end(job.conversation_id)
@@ -293,12 +369,12 @@ class ConversationMemoryStore:
         workspace_id: str,
         knowledge_base_id: str,
     ) -> int:
-        legacy_prefix = f"{workspace_id}:kb:{knowledge_base_id}:"
+        single_kb_prefix = f"{workspace_id}:kb:{knowledge_base_id}:"
         with self._lock:
             to_remove = [
                 conversation_id
                 for conversation_id, state in self._conversations.items()
-                if conversation_id.startswith(legacy_prefix)
+                if conversation_id.startswith(single_kb_prefix)
                 or (
                     conversation_id.startswith(f"{workspace_id}:multi-chat:")
                     and knowledge_base_id in state.knowledge_base_ids
@@ -393,6 +469,7 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         user: str,
         assistant: str,
         knowledge_base_ids=None,
+        assistant_sequence: Optional[int] = None,
     ) -> Optional[ConversationSummaryJob]:
         if not conversation_id:
             return None
@@ -400,17 +477,23 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         turn = ConversationTurn(
             user=_clamp_text(user, CONVERSATION_MAX_STORED_MESSAGE_CHARS),
             assistant=_clamp_text(assistant, CONVERSATION_MAX_STORED_MESSAGE_CHARS),
+            assistant_sequence=assistant_sequence,
         )
 
         with self._redis_lock(conversation_id):
             state = self._load_state(conversation_id) or ConversationState()
-            state.turns.append(turn)
+            added = _insert_turn_by_sequence(state, turn)
+            previous_kb_ids = set(state.knowledge_base_ids)
             state.knowledge_base_ids.update(
                 str(value) for value in (knowledge_base_ids or ()) if value
             )
             state.updated_at = time.time()
-            state.version += 1
-            self._save_state(conversation_id, state)
+            if added or state.knowledge_base_ids != previous_kb_ids:
+                state.version += 1
+                self._save_state(conversation_id, state)
+
+            if not added:
+                return None
 
             if _state_size(state) <= self.summary_threshold_chars:
                 return None
@@ -435,6 +518,8 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
 
             state.summary = _clamp_text(summary.strip(), self.summary_max_chars)
             state.turns = list(job.recent_turns)
+            if job.through_sequence is not None:
+                state.summary_through_sequence = job.through_sequence
             state.updated_at = time.time()
             state.version += 1
             self._save_state(job.conversation_id, state)
@@ -447,6 +532,7 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         user: str,
         assistant: str,
         knowledge_base_ids=None,
+        assistant_sequence: Optional[int] = None,
     ) -> Optional[ConversationSummaryJob]:
         if not conversation_id:
             return None
@@ -461,6 +547,7 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
             user=user,
             assistant=assistant,
             knowledge_base_ids=knowledge_base_ids,
+            assistant_sequence=assistant_sequence,
         )
 
     def hydrate_if_absent(
@@ -471,6 +558,7 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         turns: list[ConversationTurn],
         knowledge_base_ids=None,
         version: Optional[int] = None,
+        through_sequence: int = 0,
     ) -> bool:
         if not conversation_id:
             return False
@@ -482,6 +570,7 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
 
             state = ConversationState()
             state.summary = _clamp_text(summary or "", self.summary_max_chars)
+            state.summary_through_sequence = max(0, int(through_sequence or 0))
             state.turns = list(turns or [])
             state.knowledge_base_ids = {
                 str(value) for value in (knowledge_base_ids or ()) if value
@@ -490,6 +579,51 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
             state.updated_at = time.time()
             self._save_state(conversation_id, state)
             return True
+
+    def replace_from_durable(
+        self,
+        conversation_id: Optional[str],
+        *,
+        summary: str,
+        turns: list[ConversationTurn],
+        knowledge_base_ids=None,
+        version: Optional[int] = None,
+        through_sequence: int = 0,
+    ) -> bool:
+        if not conversation_id:
+            return False
+        durable_max = _durable_state_sequence(turns, through_sequence)
+        with self._redis_lock(conversation_id):
+            existing = self._load_state(conversation_id)
+            if existing and _conversation_state_sequence(existing) > durable_max:
+                return False
+            durable_kb_ids = {
+                str(value) for value in (knowledge_base_ids or ()) if value
+            }
+            state = ConversationState(
+                summary=_clamp_text(summary or "", self.summary_max_chars),
+                summary_through_sequence=max(0, int(through_sequence or 0)),
+                turns=list(turns or []),
+                knowledge_base_ids=durable_kb_ids,
+                created_at=existing.created_at if existing else time.time(),
+                updated_at=time.time(),
+                version=int(version) if version is not None else len(turns or []),
+            )
+            self._save_state(conversation_id, state)
+            return True
+
+    def durable_state_is_current(
+        self,
+        conversation_id: Optional[str],
+        assistant_sequence: int,
+    ) -> bool:
+        if not conversation_id:
+            return False
+        with self._redis_lock(conversation_id):
+            return _state_covers_sequence(
+                self._load_state(conversation_id),
+                assistant_sequence,
+            )
 
     def clear(self, conversation_id: Optional[str]) -> bool:
         if not conversation_id:
@@ -583,9 +717,9 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
         ):
             decoded = key.decode("utf-8") if isinstance(key, bytes) else str(key)
             conversation_ids.add(decoded[len(membership_prefix) :])
-        legacy_prefix = f"{workspace_id}:kb:{knowledge_base_id}:"
+        single_kb_prefix = f"{workspace_id}:kb:{knowledge_base_id}:"
         for key in self._redis.scan_iter(
-            match=f"{self._key_prefix}:{legacy_prefix}*",
+            match=f"{self._key_prefix}:{single_kb_prefix}*",
             count=200,
         ):
             decoded = key.decode("utf-8") if isinstance(key, bytes) else str(key)
@@ -613,12 +747,34 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
             return None
         try:
             payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            if int(payload.get("schema_version") or 0) != (
+                CONVERSATION_STATE_SCHEMA_VERSION
+            ):
+                knowledge_base_ids = {
+                    str(value)
+                    for value in payload.get("knowledge_base_ids", [])
+                    if value
+                }
+                self._redis.delete(self._state_key(conversation_id))
+                self._remove_memberships(
+                    conversation_id,
+                    knowledge_base_ids,
+                )
+                return None
             state = ConversationState(
                 summary=str(payload.get("summary") or ""),
+                summary_through_sequence=int(
+                    payload.get("summary_through_sequence") or 0
+                ),
                 turns=[
                     ConversationTurn(
                         user=str(turn.get("user") or ""),
                         assistant=str(turn.get("assistant") or ""),
+                        assistant_sequence=(
+                            int(turn["assistant_sequence"])
+                            if turn.get("assistant_sequence") is not None
+                            else None
+                        ),
                     )
                     for turn in payload.get("turns", [])
                     if isinstance(turn, dict)
@@ -646,10 +802,15 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
 
     def _save_state(self, conversation_id: str, state: ConversationState) -> None:
         payload = {
-            "schema_version": 2,
+            "schema_version": CONVERSATION_STATE_SCHEMA_VERSION,
             "summary": state.summary,
+            "summary_through_sequence": state.summary_through_sequence,
             "turns": [
-                {"user": turn.user, "assistant": turn.assistant}
+                {
+                    "user": turn.user,
+                    "assistant": turn.assistant,
+                    "assistant_sequence": turn.assistant_sequence,
+                }
                 for turn in state.turns
             ],
             "knowledge_base_ids": sorted(state.knowledge_base_ids),
@@ -657,25 +818,26 @@ class RedisConversationMemoryStore(ConversationMemoryStore):
             "updated_at": state.updated_at,
             "version": state.version,
         }
+        workspace_id = conversation_id.split(":", 1)[0]
+        # Publish every discovery marker before the state. If Redis fails
+        # midway, callers see the write failure and no new state can exist
+        # without a marker that KB deletion can find. Extra orphan markers are
+        # harmless and are removed by the existing cleanup paths.
+        for knowledge_base_id in state.knowledge_base_ids:
+            self._redis.setex(
+                self._membership_key(
+                    workspace_id,
+                    knowledge_base_id,
+                    conversation_id,
+                ),
+                self.ttl_seconds,
+                b"1",
+            )
         self._redis.setex(
             self._state_key(conversation_id),
             self.ttl_seconds,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         )
-        workspace_id = conversation_id.split(":", 1)[0]
-        for knowledge_base_id in state.knowledge_base_ids:
-            try:
-                self._redis.setex(
-                    self._membership_key(
-                        workspace_id,
-                        knowledge_base_id,
-                        conversation_id,
-                    ),
-                    self.ttl_seconds,
-                    b"1",
-                )
-            except Exception:
-                log.warning("Unable to update Redis KB conversation membership")
 
     def _membership_workspace_prefix(self, workspace_id: str) -> str:
         return (
@@ -778,6 +940,73 @@ def _render_state(state: ConversationState) -> str:
 
 def _state_size(state: ConversationState) -> int:
     return len(_render_state(state))
+
+
+def _durable_state_sequence(
+    turns: list[ConversationTurn],
+    through_sequence: int,
+) -> int:
+    highest_sequence = max(0, int(through_sequence or 0))
+    for turn in turns or []:
+        if turn.assistant_sequence is None:
+            continue
+        highest_sequence = max(highest_sequence, int(turn.assistant_sequence))
+    return highest_sequence
+
+
+def _conversation_state_sequence(state: ConversationState) -> int:
+    return _durable_state_sequence(
+        state.turns,
+        state.summary_through_sequence,
+    )
+
+
+def _insert_turn_by_sequence(
+    state: ConversationState,
+    turn: ConversationTurn,
+) -> bool:
+    """Insert a durable turn in sequence order and suppress exact replays."""
+
+    sequence = turn.assistant_sequence
+    if sequence is None:
+        state.turns.append(turn)
+        return True
+    sequence = int(sequence)
+    if sequence <= int(state.summary_through_sequence or 0):
+        return False
+    for index, existing in enumerate(state.turns):
+        existing_sequence = existing.assistant_sequence
+        if existing_sequence is None:
+            continue
+        existing_sequence = int(existing_sequence)
+        if existing_sequence == sequence:
+            return False
+        if existing_sequence > sequence:
+            state.turns.insert(index, turn)
+            return True
+    state.turns.append(turn)
+    return True
+
+
+def _state_covers_sequence(
+    state: Optional[ConversationState],
+    assistant_sequence: int,
+) -> bool:
+    if state is None:
+        return False
+    target = max(0, int(assistant_sequence or 0))
+    if target == 0:
+        return True
+    through = max(0, int(state.summary_through_sequence or 0))
+    present = {
+        int(turn.assistant_sequence)
+        for turn in state.turns
+        if turn.assistant_sequence is not None
+    }
+    for sequence in range(2, target + 1, 2):
+        if sequence > through and sequence not in present:
+            return False
+    return True
 
 
 def _trim_left(value: str, max_chars: int) -> str:

@@ -119,8 +119,8 @@ Users can:
 
 Each workspace starts with a `default` KB. It is renameable but cannot be
 deleted. Up to `RAG_MAX_KNOWLEDGE_BASES` additional KBs may be created
-(default: 20). The default retains the legacy file index, upload root, and
-`documents_<workspace_id>` collection without reindexing.
+(default: 20). A clean installation creates its default file index, upload
+root, and `documents_<workspace_id>` collection directly.
 
 Additional KBs use isolated `knowledge_bases/<kb_id>/files.json`,
 `__knowledge_bases__/<kb_id>/` upload roots, and deterministic hashed Chroma
@@ -128,9 +128,8 @@ collections. `KnowledgeBaseContext` includes `KNOWLEDGE_BASE_ID`,
 `KNOWLEDGE_BASE_NAME`, and `WORKSPACE_UPLOAD_FOLDER` alongside the existing
 runtime fields.
 
-API keys contain a `knowledge_base_ids` allowlist. Existing keys migrate to
-`["default"]`; newly created KBs are not added to unrelated keys. A well-formed
-but unauthorized KB returns 404.
+API keys contain a `knowledge_base_ids` allowlist. Newly created KBs are not
+added to unrelated keys. A well-formed but unauthorized KB returns 404.
 
 Default conversation memory remains
 `<workspace_id>:<conversation_id>`. Secondary KBs use
@@ -145,21 +144,11 @@ is cleared if any remembered KB is deleted, inactive, or no longer authorized.
 Federated retrieval supports up to `RAG_MAX_QUERY_KNOWLEDGE_BASES` KBs
 (default 5) and does not require reindexing.
 
-## Migration and rollout
+## Development rollout
 
-Existing workspaces keep their legacy paths and Chroma collections. Run a
-verified full backup first, then inspect the idempotent migration report:
-
-```bash
-python3 scripts/migrate_knowledge_bases.py --dry-run
-python3 scripts/migrate_knowledge_bases.py --apply
-```
-
-Use `--workspace-root` and `--max-additional` when the
-deployment uses non-default paths. The script creates only the `default`
-catalog record, marks legacy data sources as default,
-and never moves files, copies collections, or regenerates embeddings. A
-corrupt catalog is reported and left untouched.
+The current development release assumes empty local storage. Catalogs,
+indexes and SQLite databases from previous versions are not upgraded; remove
+or relocate them before starting this version.
 
 Backups include the KB catalog schema, per-workspace KB inventory, storage
 presence, collection presence, and document/chunk counts. Restore validates

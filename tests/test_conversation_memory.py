@@ -2,7 +2,10 @@ import json
 import time
 from fnmatch import fnmatchcase
 
-from app.utils.conversation_memory import ConversationMemoryStore, RedisConversationMemoryStore
+from app.utils.conversation_memory import (
+    ConversationMemoryStore,
+    RedisConversationMemoryStore,
+)
 
 
 def test_conversation_memory_returns_summary_job_after_threshold():
@@ -63,9 +66,29 @@ def test_redis_conversation_memory_uses_shared_backend():
     assert "Riassunto Redis." in prompt_context
     assert "Seconda domanda" in prompt_context
     stored = redis.data["test:conversation:conv-12345678"]
-    assert stored.startswith(b'{"schema_version":2')
+    assert stored.startswith(b'{"schema_version":1')
     assert store.clear(conversation_id) is True
     assert store.render_for_prompt(conversation_id) == ""
+
+
+def test_redis_conversation_memory_discards_incompatible_schema():
+    redis = FakeRedis()
+    conversation_id = "workspace-a:conversation-old"
+    state_key = f"test:conversation:{conversation_id}"
+    redis.data[state_key] = json.dumps(
+        {
+            "schema_version": 2,
+            "turns": [{"user": "old", "assistant": "state"}],
+            "knowledge_base_ids": [],
+        }
+    ).encode("utf-8")
+    store = RedisConversationMemoryStore(
+        redis_client=redis,
+        key_prefix="test:conversation",
+    )
+
+    assert store.render_for_prompt(conversation_id) == ""
+    assert state_key not in redis.data
 
 
 def test_conversation_memory_clear_by_prefix_is_workspace_scoped():
@@ -131,6 +154,44 @@ def test_conversation_snapshot_is_immutable_after_a_concurrent_append():
     assert "Risposta successiva" in store.snapshot(
         conversation_id
     ).prompt_context
+
+
+def test_durable_turns_are_ordered_deduplicated_and_gap_checked():
+    store = ConversationMemoryStore()
+    conversation_id = "workspace-a:multi-chat:ordered"
+
+    store.append_turn(
+        conversation_id,
+        user="Terza domanda",
+        assistant="Terza risposta",
+        assistant_sequence=6,
+    )
+    assert store.durable_state_is_current(conversation_id, 6) is False
+
+    store.append_turn(
+        conversation_id,
+        user="Prima domanda",
+        assistant="Prima risposta",
+        assistant_sequence=2,
+    )
+    store.append_turn(
+        conversation_id,
+        user="Seconda domanda",
+        assistant="Seconda risposta",
+        assistant_sequence=4,
+    )
+    store.append_turn(
+        conversation_id,
+        user="Duplicato",
+        assistant="Non deve comparire",
+        assistant_sequence=4,
+    )
+
+    prompt = store.render_for_prompt(conversation_id)
+    assert prompt.index("Prima domanda") < prompt.index("Seconda domanda")
+    assert prompt.index("Seconda domanda") < prompt.index("Terza domanda")
+    assert "Duplicato" not in prompt
+    assert store.durable_state_is_current(conversation_id, 6) is True
 
 
 def test_conversation_clear_if_version_removes_only_the_current_state():

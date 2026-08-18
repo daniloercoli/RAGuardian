@@ -301,13 +301,13 @@ class TestBackupLifecycle:
         finally:
             bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
 
-    def test_backup_manifest_includes_conversation_db_fields(
+    def test_backup_snapshots_every_workspace_conversation_database(
         self,
         tmp_path,
         tmp_backup_dir,
         tmp_chroma_dir,
     ):
-        """Backup manifest records conversation_history.db presence, size and hash."""
+        """Committed WAL rows from every per-workspace DB reach the snapshot."""
         import sqlite3
 
         import app.utils.vector_store.backup_manager as bm
@@ -318,19 +318,24 @@ class TestBackupLifecycle:
         workspace_data_dir.mkdir(parents=True)
         upload_dir = tmp_path / "uploads"
         upload_dir.mkdir()
-
-        db_file = workspace_data_dir / "conversation_history.db"
-        conn = sqlite3.connect(str(db_file))
-        conn.execute(
-            "CREATE TABLE conversations (id TEXT PRIMARY KEY, scope_key TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO conversations VALUES (?, ?)",
-            ("conv-1", "ws:default:conv-1"),
-        )
-        conn.commit()
-        conn.close()
-        expected_size = db_file.stat().st_size
+        live_connections = []
+        for workspace_id in ("alice", "bob"):
+            workspace_dir = workspace_data_dir / workspace_id
+            workspace_dir.mkdir()
+            db_file = workspace_dir / "conversations.db"
+            conn = sqlite3.connect(str(db_file))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("PRAGMA user_version = 1")
+            conn.execute(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, scope_key TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO conversations VALUES (?, ?)",
+                (f"conv-{workspace_id}", f"ws:{workspace_id}:default"),
+            )
+            conn.commit()
+            live_connections.append(conn)
 
         bm.BACKUP_DIR = tmp_backup_dir
         bm.CHROMA_DIR = tmp_chroma_dir
@@ -345,13 +350,36 @@ class TestBackupLifecycle:
                 )
             )
             assert manifest["conversation_db_present"] is True
-            assert manifest["conversation_db_size_bytes"] == expected_size
-            assert len(manifest["conversation_db_sha256"]) == 64
-            assert all(
-                c in "0123456789abcdef"
-                for c in manifest["conversation_db_sha256"]
+            assert manifest["conversation_db_count"] == 2
+            assert {
+                entry["workspace_id"]
+                for entry in manifest["conversation_databases"]
+            } == {"alice", "bob"}
+            assert manifest["conversation_db_size_bytes"] == sum(
+                entry["size_bytes"]
+                for entry in manifest["conversation_databases"]
             )
+            assert len(manifest["conversation_db_sha256"]) == 64
+            assert manifest["conversation_db_sha256_semantics"] == (
+                "catalog_sha256"
+            )
+            backup_root = tmp_backup_dir / backup_id
+            for entry in manifest["conversation_databases"]:
+                snapshot = backup_root / entry["backup_path"]
+                assert not Path(f"{snapshot}-wal").exists()
+                assert not Path(f"{snapshot}-shm").exists()
+                with sqlite3.connect(
+                    f"{snapshot.resolve().as_uri()}?mode=ro&immutable=1",
+                    uri=True,
+                ) as snapshot_conn:
+                    row = snapshot_conn.execute(
+                        "SELECT id FROM conversations"
+                    ).fetchone()
+                assert row == (f"conv-{entry['workspace_id']}",)
+            assert verify_backup(backup_id)["sqlite_databases_ok"] is True
         finally:
+            for conn in live_connections:
+                conn.close()
             bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
 
     def test_backup_manifest_conversation_db_absent_when_missing(
@@ -383,8 +411,139 @@ class TestBackupLifecycle:
                 )
             )
             assert manifest["conversation_db_present"] is False
+            assert manifest["conversation_db_count"] == 0
             assert manifest["conversation_db_size_bytes"] == 0
             assert manifest["conversation_db_sha256"] == ""
+            assert manifest["conversation_databases"] == []
+        finally:
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
+
+    def test_backup_snapshots_users_database_and_verifies_catalog(
+        self,
+        tmp_path,
+        tmp_backup_dir,
+        tmp_chroma_dir,
+    ):
+        import sqlite3
+
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        (data_dir / "workspaces").mkdir(parents=True)
+        upload_dir = tmp_path / "uploads"
+        upload_dir.mkdir()
+        users_db = data_dir / "users.db"
+        conn = sqlite3.connect(str(users_db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT)")
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "INSERT INTO users VALUES (?, ?)",
+            ("user-1", "owner@example.com"),
+        )
+        conn.commit()
+
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+
+        try:
+            backup_id = create_backup()["id"]
+            backup_root = tmp_backup_dir / backup_id
+            manifest = json.loads(
+                (backup_root / "manifest.json").read_text(encoding="utf-8")
+            )
+            users_entry = manifest["users_database"]
+            snapshot = backup_root / users_entry["backup_path"]
+
+            assert manifest["users_db_present"] is True
+            assert users_entry["kind"] == "users"
+            assert users_entry["component"] == "data"
+            assert manifest["users_db_size_bytes"] == snapshot.stat().st_size
+            assert manifest["users_db_sha256"] == _sha256(snapshot)
+            assert not Path(f"{snapshot}-wal").exists()
+            assert not Path(f"{snapshot}-shm").exists()
+            with sqlite3.connect(
+                f"{snapshot.resolve().as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            ) as snapshot_conn:
+                assert snapshot_conn.execute(
+                    "SELECT email FROM users WHERE id = 'user-1'"
+                ).fetchone() == ("owner@example.com",)
+            assert verify_backup(backup_id)["sqlite_databases_ok"] is True
+
+            manifest["users_database"]["sha256"] = "0" * 64
+            (backup_root / "manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            verification = verify_backup(backup_id)
+            assert verification["status"] == "mismatch"
+            assert verification["sqlite_databases_ok"] is False
+        finally:
+            conn.close()
+            bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
+
+    def test_restore_replaces_configured_external_users_database(
+        self,
+        monkeypatch,
+        tmp_path,
+        tmp_backup_dir,
+        tmp_chroma_dir,
+    ):
+        import sqlite3
+
+        import app.utils.vector_store.backup_manager as bm
+
+        original = (bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR)
+        data_dir = tmp_path / "data"
+        (data_dir / "workspaces").mkdir(parents=True)
+        upload_dir = tmp_path / "uploads"
+        upload_dir.mkdir()
+        users_db = tmp_path / "private" / "users.db"
+        users_db.parent.mkdir()
+        with sqlite3.connect(str(users_db)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT)")
+            conn.execute("PRAGMA user_version = 1")
+            conn.execute(
+                "INSERT INTO users VALUES (?, ?)",
+                ("user-1", "backup@example.com"),
+            )
+
+        bm.BACKUP_DIR = tmp_backup_dir
+        bm.CHROMA_DIR = tmp_chroma_dir
+        bm.DATA_DIR = data_dir
+        bm.UPLOAD_DIR = upload_dir
+        monkeypatch.setenv("RAG_USERS_DB", str(users_db))
+
+        try:
+            backup_id = create_backup()["id"]
+            manifest = json.loads(
+                (tmp_backup_dir / backup_id / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert manifest["users_db_separate"] is True
+            assert manifest["users_db_backup_path"] == "users_db/users.db"
+
+            with sqlite3.connect(str(users_db)) as conn:
+                conn.execute(
+                    "UPDATE users SET email = ? WHERE id = ?",
+                    ("live@example.com", "user-1"),
+                )
+
+            restored = restore_backup(backup_id)
+
+            assert restored["status"] == "success"
+            with sqlite3.connect(str(users_db)) as conn:
+                assert conn.execute(
+                    "SELECT email FROM users WHERE id = 'user-1'"
+                ).fetchone() == ("backup@example.com",)
+            assert list(users_db.parent.glob("users.db.bak.*"))
         finally:
             bm.BACKUP_DIR, bm.CHROMA_DIR, bm.DATA_DIR, bm.UPLOAD_DIR = original
 

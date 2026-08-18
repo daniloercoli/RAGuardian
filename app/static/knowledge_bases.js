@@ -80,6 +80,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 <div><dt>Indexed</dt><dd>${Number(item.stats.indexed_files || 0)}</dd></div>
                 <div><dt>Chunks</dt><dd>${Number(item.stats.chunks || 0)}</dd></div>
                 <div><dt>Sources</dt><dd>${Number(item.stats.data_sources || 0)}</dd></div>
+                <div><dt>Conversations</dt><dd>${Number(item.stats.conversations || 0)}</dd></div>
             </dl>
             ${item.delete_error ? `<p class="notice error">${escapeHtml(item.delete_error)}</p>` : ""}
             <div class="table-actions">
@@ -129,8 +130,12 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
         card.querySelector('[data-action="delete"]').addEventListener("click", async () => {
+            const conversations = Math.max(0, Number(item.stats.conversations || 0));
+            const conversationWarning = conversations === 1
+                ? "1 saved conversation will also be permanently deleted."
+                : `${conversations} saved conversations will also be permanently deleted.`;
             const confirmation = window.prompt(
-                `Type "${item.name}" to permanently delete this knowledge base.`
+                `Type "${item.name}" to permanently delete this knowledge base.\n\n${conversationWarning}`
             );
             if (confirmation !== item.name) return;
             const progress = card.querySelector("[data-delete-progress]");

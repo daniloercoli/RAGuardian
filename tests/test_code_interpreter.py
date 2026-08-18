@@ -90,6 +90,24 @@ def test_code_interpreter_auto_builds_missing_image(tmp_path):
     assert calls[0]["dockerfile"] == "Dockerfile.code-interpreter"
 
 
+def test_normalised_result_returns_safe_run_id(tmp_path):
+    interpreter = CodeInterpreter(
+        {"upload_folder": str(tmp_path), "auto_build": False}
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chart.png").write_bytes(b"png")
+
+    result = interpreter._normalise_result(
+        {"success": True, "text": "ok", "images": ["chart.png"]},
+        "a1b2c3d4e5f6",
+        output_dir,
+    )
+
+    assert result["run_id"] == "a1b2c3d4e5f6"
+    assert result["images"] == ["/code_pics/a1b2c3d4e5f6_chart.png"]
+
+
 @pytest.mark.skipif(
     os.getenv("RAG_DOCKER_INTEGRATION") != "1",
     reason="Set RAG_DOCKER_INTEGRATION=1 to run the real Docker sandbox test",

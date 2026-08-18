@@ -143,7 +143,7 @@ def test_settings_store_normalizes_embedding_model_for_provider(tmp_path):
     assert settings["rag"]["embedding_model"] == "Qwen3-Embedding-8B"
 
 
-def test_settings_store_migrates_legacy_lowercase_regolo_embedding_model(tmp_path):
+def test_settings_store_normalizes_regolo_embedding_model_casing(tmp_path):
     store = SettingsStore(str(tmp_path / "settings.json"))
 
     settings = store.update(
@@ -162,7 +162,7 @@ def test_public_view_masks_secrets(tmp_path):
     store = SettingsStore(str(tmp_path / "settings.json"))
     store.update(
         {
-            "auth": {"api_keys": [{"name": "client", "key": "secret-key-1234", "can_upload": True}]},
+            "auth": {"api_keys": [{"name": "client", "key": "secret-key-1234", "scopes": ["query", "ingest"]}]},
             "custom_providers": [
                 {
                     "id": "custom",
@@ -253,7 +253,7 @@ def test_public_view_masks_secrets(tmp_path):
     assert public["ocr"]["api_key"] == "ocr-...1234"
 
 
-def test_api_key_scopes_backfill_from_can_upload(tmp_path):
+def test_api_key_scopes_require_current_scope_field(tmp_path):
     store = SettingsStore(str(tmp_path / "settings.json"))
     settings = store.update(
         {
@@ -269,8 +269,8 @@ def test_api_key_scopes_backfill_from_can_upload(tmp_path):
 
     keys = {item["name"]: item for item in settings["auth"]["api_keys"]}
     assert keys["reader"]["scopes"] == ["query"]
-    assert keys["uploader"]["scopes"] == ["query", "ingest"]
-    assert keys["uploader"]["can_upload"] is True
+    assert keys["uploader"]["scopes"] == ["query"]
+    assert keys["uploader"]["can_upload"] is False
     assert keys["speech"]["scopes"] == ["speech"]
 
 

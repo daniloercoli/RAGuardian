@@ -159,7 +159,11 @@ class CodeInterpreter:
                 wait_result = container.wait(timeout=self.timeout)
             except requests.exceptions.ReadTimeout:
                 container.kill()
-                return {"success": False, "error": "Execution timed out"}
+                return {
+                    "success": False,
+                    "error": "Execution timed out",
+                    "run_id": run_id,
+                }
 
             status_code = int(wait_result.get("StatusCode", 1))
             if status_code != 0:
@@ -171,6 +175,7 @@ class CodeInterpreter:
                 return {
                     "success": False,
                     "error": logs.strip()[:8192] or "Execution failed",
+                    "run_id": run_id,
                 }
         except docker.errors.ImageNotFound:
             return {
@@ -180,6 +185,7 @@ class CodeInterpreter:
                     "Esegui: docker build -f Dockerfile.code-interpreter "
                     "-t code-interpreter:latest . oppure abilita CODE_INTERPRETER_AUTO_BUILD=1."
                 ),
+                "run_id": run_id,
             }
         except docker.errors.DockerException as exc:
             log.error("Docker unavailable for code interpreter: %s", exc)
@@ -190,10 +196,11 @@ class CodeInterpreter:
                     "Verifica che il daemon sia attivo e che l'immagine "
                     "code-interpreter:latest sia stata creata."
                 ),
+                "run_id": run_id,
             }
         except Exception as exc:
             log.error("Code interpreter error: %s", exc)
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc), "run_id": run_id}
         finally:
             if container is not None:
                 try:
@@ -204,7 +211,11 @@ class CodeInterpreter:
         # Parse result.json from output directory
         raw = self._read_result(output_dir)
         if raw is None:
-            return {"success": False, "error": "Execution produced no result"}
+            return {
+                "success": False,
+                "error": "Execution produced no result",
+                "run_id": run_id,
+            }
         return self._normalise_result(raw, run_id, output_dir)
 
     def _ensure_image(self, client) -> None:
@@ -276,6 +287,7 @@ class CodeInterpreter:
             "text": text_out,
             "error": raw.get("error", ""),
             "images": url_images,
+            "run_id": run_id,
         }
 
 

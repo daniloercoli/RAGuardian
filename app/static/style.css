@@ -1874,13 +1874,17 @@ button.secondary:hover:not(:disabled) {
     white-space: nowrap;
 }
 
-.source-card-header a {
+.source-card-header a,
+.source-card-header strong {
     color: #1d4ed8;
     font-weight: 800;
-    text-decoration: none;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.source-card-header a {
+    text-decoration: none;
 }
 
 .source-card-header span {
@@ -3032,6 +3036,30 @@ tbody tr:hover td {
     font-size: 14px;
 }
 
+.history-drawer-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    padding: 0 18px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.history-filter-button {
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface-subtle);
+    color: #667085;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.history-filter-button[aria-pressed="true"] {
+    border-color: #2563eb;
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
 .history-list {
     flex: 1;
     overflow-y: auto;
@@ -3078,11 +3106,6 @@ tbody tr:hover td {
     display: flex;
     justify-content: space-between;
     align-items: center;
-}
-
-.history-item-actions {
-    display: flex;
-    gap: 8px;
 }
 
 .history-item-actions {
@@ -3151,6 +3174,26 @@ tbody tr:hover td {
     width: 100%;
 }
 
+.history-load-older {
+    position: sticky;
+    z-index: 2;
+    top: 0;
+    display: flex;
+    justify-content: center;
+    padding: 8px;
+    background: linear-gradient(#ffffff 75%, rgba(255, 255, 255, 0));
+}
+
+.history-load-older button {
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #ffffff;
+    color: #344054;
+    font-size: 12px;
+    font-weight: 700;
+}
+
 .history-status {
     position: fixed;
     bottom: 20px;
@@ -3169,10 +3212,6 @@ tbody tr:hover td {
 
 .history-status:not([hidden]):not(:empty) {
     opacity: 1;
-}
-
-#toggleHistoryDrawer {
-    display: none;
 }
 
 /* Responsive */

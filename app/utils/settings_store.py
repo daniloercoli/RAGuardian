@@ -874,8 +874,6 @@ def _normalize_api_scopes(item: Dict[str, Any]) -> List[str]:
 
     if not scopes:
         scopes = ["query"]
-        if _as_bool(item.get("can_upload"), False):
-            scopes.append("ingest")
 
     return scopes
 

@@ -74,6 +74,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const lastTurnStorageKey = "ragLastTurnId";
     let lastTurnId = loadLastTurnId();
     let currentTurnId = null;
+    let retryableTurnRequest = null;
+    let activeHistoryId = null;
+    let activeConversationArchived = false;
+    let activeConversationHistoryState = lastTurnId ? "saved" : "empty";
 
     function loadLastTurnId() {
         try {
@@ -101,6 +105,34 @@ document.addEventListener("DOMContentLoaded", () => {
         lastTurnId = null;
         currentTurnId = null;
         persistLastTurnId(null);
+    }
+
+    function applyHistoryOutcome(event) {
+        const historySaved = Boolean(event && event.history_saved === true);
+
+        if (historySaved && currentTurnId) {
+            lastTurnId = currentTurnId;
+            persistLastTurnId(lastTurnId);
+            activeConversationHistoryState = "saved";
+        } else if (event && event.type === "done") {
+            const historyStatus = String(event.history_status || "error");
+            const volatileStatuses = new Set([
+                "disabled",
+                "not_requested",
+                "client_turn_id_required"
+            ]);
+            activeConversationHistoryState = volatileStatuses.has(historyStatus)
+                ? "volatile"
+                : "draft";
+            if (activeConversationHistoryState === "draft") {
+                showHistoryStatus(
+                    "This reply was not saved. Start a new chat before continuing.",
+                    8000
+                );
+            }
+        }
+        currentTurnId = null;
+        return historySaved;
     }
 
     function setControlLabel(button, label) {
@@ -181,7 +213,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 configurationLink,
                 {
                     title: "Open configuration?",
-                    description: "This conversation is not saved. If you open Configuration, you won’t be able to return to it.",
+                    description: activeConversationHistoryState === "saved"
+                        ? "This conversation is saved and will remain available in History."
+                        : "This conversation has unsaved messages that may not be available after opening Configuration.",
                     confirmLabel: "Open configuration"
                 }
             );
@@ -406,6 +440,19 @@ document.addEventListener("DOMContentLoaded", () => {
     async function sendMessage() {
         const query = userInput.value.trim();
         if (!query) return;
+        if (activeConversationArchived) {
+            showHistoryStatus("Unarchive this conversation before continuing", 4000);
+            return;
+        }
+        if (activeConversationHistoryState === "draft") {
+            showHistoryStatus(
+                retryableTurnRequest
+                    ? "Retry the interrupted turn or start a new chat before continuing."
+                    : "The previous reply was not saved. Start a new chat before continuing.",
+                6000
+            );
+            return;
+        }
         if (agentSelectionBlocked) {
             appendMessage(
                 "**Select an available Agent or None before sending.**",
@@ -421,100 +468,203 @@ document.addEventListener("DOMContentLoaded", () => {
         appendMessage(query, "user-message");
         userInput.value = "";
         resizeInput();
+        const selected = modelSelect.selectedOptions[0];
+        const useCodeInterpreter = codeInterpreterEnabled && uploadedFiles.length > 0;
+        const attachments = uploadedFiles.map(file => ({
+            id: file.id,
+            file_id: file.id,
+            name: file.name,
+            type: file.type
+        }));
+        const body = applyQueryConfiguration({
+            query,
+            conversation_id: conversationId,
+            stream: true,
+            stream_format: "ndjson",
+            use_code_interpreter: useCodeInterpreter
+        }, selected);
+        if (attachments.length > 0) {
+            body.attached_files = attachments;
+        }
+
+        const turnRequest = {
+            body,
+            useCodeInterpreter,
+            messageDiv: appendBotMessage(
+                useCodeInterpreter ? "Preparing analysis..." : ""
+            )
+        };
+        retryableTurnRequest = turnRequest;
+        await executeTurnRequest(turnRequest);
+    }
+
+    async function executeTurnRequest(turnRequest, isRetry = false) {
+        if (!turnRequest || !turnRequest.body || busy) return;
+
+        activeConversationHistoryState = "pending";
+        currentTurnId = turnRequest.body.turn_id;
+        clearTurnRetryUi(turnRequest.messageDiv);
+        if (isRetry && turnRequest.useCodeInterpreter) {
+            renderBotAnswer(turnRequest.messageDiv, "_Retrying analysis..._");
+        }
         setBusy(true);
-        let askTimeout = null;
+        const askTimeout = createAskTimeout();
+        let terminalOutcome = false;
 
         try {
-            const selected = modelSelect.selectedOptions[0];
-            askTimeout = createAskTimeout();
-
-            // Code interpreter mode
-            if (codeInterpreterEnabled && uploadedFiles.length > 0) {
-                const ciBody = applyQueryConfiguration({
-                    query,
-                    conversation_id: conversationId,
-                    stream: true,
-                    stream_format: "ndjson",
-                    use_code_interpreter: true,
-                    attached_files: uploadedFiles.map(f => ({
-                        id: f.id,
-                        file_id: f.id,
-                        name: f.name,
-                        type: f.type
-                    }))
-                }, selected);
-                const response = await postAsk(ciBody, askTimeout);
-                if (!response.ok) {
-                    const data = await readErrorPayload(response);
-                    reconcileTurnIdFromError(data);
-                    const messageDiv = appendBotMessage(
-                        formatError(data, response.statusText)
-                    );
-                    if (agentActive && selectedAgentId) {
-                        await revalidateActiveAgent();
-                    }
-                    await handleUnavailableKnowledgeBase(data, messageDiv);
-                } else {
-                    const messageDiv = appendBotMessage("Preparing analysis...");
-                    await renderCodeInterpreterStream(response, messageDiv, askTimeout);
-                }
-                // Clear uploaded files after sending
-                uploadedFiles.length = 0;
-                renderAttachedFiles();
-                return;
-            }
-
-            const body = applyQueryConfiguration({
-                query,
-                conversation_id: conversationId,
-                stream: true,
-                stream_format: "ndjson",
-                use_code_interpreter: false
-            }, selected);
-            if (uploadedFiles.length > 0) {
-                body.attached_files = uploadedFiles.map(f => ({
-                    id: f.id,
-                    file_id: f.id,
-                    name: f.name,
-                    type: f.type
-                }));
-            }
-
-            const response = await postAsk(body, askTimeout);
-
+            const response = await postAsk(turnRequest.body, askTimeout);
             if (!response.ok) {
                 const data = await readErrorPayload(response);
+                const errorCode = turnErrorCode(data);
+                const lostVolatileResult = errorCode === "volatile_result_lost";
+                terminalOutcome = false;
+                if (!lostVolatileResult && !isRetryableTurnError(response, data)) {
+                    terminalOutcome = true;
+                }
                 reconcileTurnIdFromError(data);
-                const messageDiv = appendBotMessage(
+                renderBotAnswer(
+                    turnRequest.messageDiv,
                     formatError(data, response.statusText)
                 );
                 if (agentActive && selectedAgentId) {
                     await revalidateActiveAgent();
                 }
-                await handleUnavailableKnowledgeBase(data, messageDiv);
+                await handleUnavailableKnowledgeBase(data, turnRequest.messageDiv);
+                if (lostVolatileResult) {
+                    prepareLostResultRecovery(turnRequest);
+                    markTurnRetryable(
+                        turnRequest,
+                        "The saved draft expired. Regenerate this turn explicitly; the previous draft will be replaced.",
+                        "Regenerate and replace draft"
+                    );
+                } else if (!terminalOutcome) {
+                    markTurnRetryable(
+                        turnRequest,
+                        "The server has not finalized this turn. Retry with the same request."
+                    );
+                }
             } else {
-                const messageDiv = appendBotMessage("");
-                await renderStreamingResponse(response, messageDiv, askTimeout);
-                if (uploadedFiles.length > 0) {
+                const terminalType = turnRequest.useCodeInterpreter
+                    ? await renderCodeInterpreterStream(
+                        response,
+                        turnRequest.messageDiv,
+                        askTimeout
+                    )
+                    : await renderStreamingResponse(
+                        response,
+                        turnRequest.messageDiv,
+                        askTimeout
+                    );
+                const lostVolatileResult = terminalType === "volatile_result_lost";
+                terminalOutcome = false;
+                if (
+                    !lostVolatileResult
+                    && (terminalType === "done" || terminalType === "error")
+                ) {
+                    terminalOutcome = true;
+                }
+                if (
+                    terminalType === "done"
+                    && activeConversationHistoryState === "draft"
+                ) {
+                    terminalOutcome = false;
+                    markTurnRetryable(
+                        turnRequest,
+                        "The reply was received but history was not committed. Retry this exact turn."
+                    );
+                } else if (lostVolatileResult) {
+                    prepareLostResultRecovery(turnRequest);
+                    markTurnRetryable(
+                        turnRequest,
+                        "The saved draft expired. Regenerate this turn explicitly; the previous draft will be replaced.",
+                        "Regenerate and replace draft"
+                    );
+                } else if (!terminalOutcome) {
+                    markTurnRetryable(
+                        turnRequest,
+                        "The response ended before the server confirmed completion."
+                    );
+                }
+            }
+        } catch (error) {
+            if (!terminalOutcome) {
+                renderBotAnswer(turnRequest.messageDiv, formatConnectionError(error));
+                markTurnRetryable(
+                    turnRequest,
+                    "The server did not confirm this turn. Retry with the same request."
+                );
+            }
+        } finally {
+            askTimeout.clear();
+            if (terminalOutcome) {
+                if (retryableTurnRequest === turnRequest) {
+                    retryableTurnRequest = null;
+                }
+                clearTurnRetryUi(turnRequest.messageDiv);
+                currentTurnId = null;
+                if (turnRequest.body.attached_files) {
                     uploadedFiles.length = 0;
                     renderAttachedFiles();
                 }
             }
-        } catch (error) {
-            appendMessage(formatConnectionError(error), "bot-message");
-        } finally {
-            if (askTimeout) askTimeout.clear();
             setBusy(false);
             userInput.focus();
         }
     }
 
+    function prepareLostResultRecovery(turnRequest) {
+        turnRequest.body = {
+            ...turnRequest.body,
+            regenerate_lost_result: true
+        };
+    }
+
+    function markTurnRetryable(turnRequest, message, actionLabel = "Retry this turn") {
+        retryableTurnRequest = turnRequest;
+        currentTurnId = turnRequest.body.turn_id;
+        activeConversationHistoryState = "draft";
+        clearTurnRetryUi(turnRequest.messageDiv);
+
+        const status = document.createElement("p");
+        status.className = "turn-retry-status";
+        status.textContent = String(message || "The request was interrupted.");
+        turnRequest.messageDiv.appendChild(status);
+
+        const action = document.createElement("button");
+        action.type = "button";
+        action.className = "turn-retry-action";
+        action.textContent = actionLabel;
+        action.addEventListener("click", retryPendingTurn);
+        turnRequest.messageDiv.appendChild(action);
+        showHistoryStatus(
+            "This turn was not confirmed. Retry it or start a new chat before continuing.",
+            8000
+        );
+    }
+
+    function clearTurnRetryUi(messageDiv) {
+        if (!messageDiv) return;
+        messageDiv.querySelectorAll(".turn-retry-status, .turn-retry-action")
+            .forEach(element => element.remove());
+    }
+
+    async function retryPendingTurn() {
+        if (busy || !retryableTurnRequest) return;
+        const turnRequest = retryableTurnRequest;
+        // Transport retries reuse the exact request.  The only allowed
+        // mutation is the explicit recovery flag set after a lost staged
+        // result; the idempotency key and fingerprint inputs stay unchanged.
+        await executeTurnRequest(turnRequest, true);
+    }
+
     function applyQueryConfiguration(body, selectedModel) {
         body.persist_history = true;
         body.parent_turn_id = lastTurnId || undefined;
-        body.turn_id = (window.crypto && typeof window.crypto.randomUUID === "function")
-            ? window.crypto.randomUUID()
-            : `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+        if (window.crypto && typeof window.crypto.randomUUID === "function") {
+            body.turn_id = window.crypto.randomUUID();
+        } else {
+            body.turn_id = `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+        }
         currentTurnId = body.turn_id;
         if (agentActive && selectedAgentId) {
             body.agent_id = selectedAgentId;
@@ -532,9 +682,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const messageDiv = appendBotMessage("");
         const result = data.result || {};
         renderCodeInterpreterPayload(messageDiv, data.code || "", result);
-        if (data.context) {
-            appendSources(data.context);
-        }
+        appendSources(preferredSources(data.context, data.sources));
     }
 
     async function renderCodeInterpreterStream(response, messageDiv, timeout) {
@@ -542,12 +690,14 @@ document.addEventListener("DOMContentLoaded", () => {
             code: "",
             result: null,
             hasError: false,
+            terminalType: null,
+            retryableError: false,
             status: "Preparing analysis...",
             recoveryPromise: null
         };
 
         const onEvent = (event) => {
-            if (!event || state.hasError) return;
+            if (!event || state.terminalType) return;
             if (event.type === "meta") {
                 updateConversationId(event.conversation_id);
                 state.status = "Generating Python...";
@@ -561,18 +711,20 @@ document.addEventListener("DOMContentLoaded", () => {
                 state.status = "";
                 renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
             } else if (event.type === "done") {
+                state.terminalType = "done";
                 updateConversationId(event.conversation_id);
                 state.code = event.code || state.code;
                 state.result = event.result || state.result || {};
                 state.status = "";
                 renderCodeInterpreterPayload(messageDiv, state.code, state.result, state.status);
-                appendSources(event.context);
-                if (currentTurnId) {
-                    lastTurnId = currentTurnId;
-                    persistLastTurnId(lastTurnId);
-                }
+                appendSources(preferredSources(event.context, event.sources));
+                applyHistoryOutcome(event);
             } else if (event.type === "error") {
                 state.hasError = true;
+                state.terminalType = "error";
+                state.retryableError = isRetryableStreamError(event);
+                state.errorCode = turnErrorCode(event);
+                reconcileTurnIdFromError(event);
                 renderBotAnswer(messageDiv, formatError(event, "Code interpreter interrupted"));
                 state.recoveryPromise = handleUnavailableKnowledgeBase(
                     event,
@@ -585,7 +737,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const text = await response.text();
             parseNdjsonLines(text, onEvent);
             await waitForKnowledgeBaseRecovery(state);
-            return;
+            return streamTerminalType(state);
         }
 
         const reader = response.body.getReader();
@@ -599,15 +751,16 @@ document.addEventListener("DOMContentLoaded", () => {
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
             parseNdjsonLines(lines.join("\n"), onEvent);
-            if (state.hasError) {
+            if (state.terminalType) {
                 reader.cancel().catch(() => {});
                 await waitForKnowledgeBaseRecovery(state);
-                return;
+                return streamTerminalType(state);
             }
         }
         buffer += decoder.decode();
         parseNdjsonLines(buffer, onEvent);
         await waitForKnowledgeBaseRecovery(state);
+        return streamTerminalType(state);
     }
 
     function renderCodeInterpreterPayload(messageDiv, code, result, statusText) {
@@ -703,14 +856,50 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function isRetryableTurnError(response, data) {
+        const code = turnErrorCode(data);
+        if ([
+            "turn_generating",
+            "turn_in_progress",
+            "timeout",
+            "rate_limited"
+        ].includes(code)) {
+            return true;
+        }
+        const statusCode = Number(response && response.status) || 0;
+        return statusCode === 408
+            || statusCode === 425
+            || statusCode === 429
+            || statusCode >= 500;
+    }
+
+    function turnErrorCode(data) {
+        return String(
+            (data && (data.code || data.status)) || ""
+        ).toLowerCase();
+    }
+
     function reconcileTurnIdFromError(data) {
         if (!data || typeof data !== "object") return;
-        const expected = data.expected_parent_turn_id;
-        if (typeof expected === "string" && expected) {
-            lastTurnId = expected;
-            persistLastTurnId(lastTurnId);
-        } else if (data.code === "turn_id_conflict" || data.code === "continuity_error") {
+        activeConversationHistoryState = lastTurnId ? "saved" : "empty";
+        const code = String(data.code || data.status || "").toLowerCase();
+        const hasExpectedParent = Object.prototype.hasOwnProperty.call(
+            data,
+            "expected_parent_turn_id"
+        );
+        if (hasExpectedParent) {
+            const expected = data.expected_parent_turn_id;
+            if (typeof expected === "string" && expected) {
+                lastTurnId = expected;
+                persistLastTurnId(lastTurnId);
+            } else if (expected === null) {
+                resetLastTurnId();
+            }
+        } else if (code === "continuity_error") {
             resetLastTurnId();
+        }
+        if (code === "continuity_error" || code === "turn_id_conflict") {
+            currentTurnId = null;
         }
     }
 
@@ -718,6 +907,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const state = {
             answerText: "",
             hasError: false,
+            terminalType: null,
+            retryableError: false,
             recoveryPromise: null
         };
 
@@ -725,7 +916,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const text = await response.text();
             parseNdjsonLines(text, (event) => handleStreamEvent(event, state, messageDiv));
             await waitForKnowledgeBaseRecovery(state);
-            return;
+            return streamTerminalType(state);
         }
 
         const reader = response.body.getReader();
@@ -741,16 +932,17 @@ document.addEventListener("DOMContentLoaded", () => {
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
             parseNdjsonLines(lines.join("\n"), (event) => handleStreamEvent(event, state, messageDiv));
-            if (state.hasError) {
+            if (state.terminalType) {
                 reader.cancel().catch(() => {});
                 await waitForKnowledgeBaseRecovery(state);
-                return;
+                return streamTerminalType(state);
             }
         }
 
         buffer += decoder.decode();
         parseNdjsonLines(buffer, (event) => handleStreamEvent(event, state, messageDiv));
         await waitForKnowledgeBaseRecovery(state);
+        return streamTerminalType(state);
     }
 
     function parseNdjsonLines(text, onEvent) {
@@ -767,7 +959,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function handleStreamEvent(event, state, messageDiv) {
-        if (!event || state.hasError) return;
+        if (!event || state.terminalType) return;
 
         if (event.type === "token") {
             state.answerText += event.text || "";
@@ -775,16 +967,18 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (event.type === "meta") {
             updateConversationId(event.conversation_id);
         } else if (event.type === "done") {
+            state.terminalType = "done";
             updateConversationId(event.conversation_id);
             state.answerText = event.answer || state.answerText;
             renderBotAnswer(messageDiv, state.answerText);
-            appendSources(event.context);
-            if (currentTurnId) {
-                lastTurnId = currentTurnId;
-                persistLastTurnId(lastTurnId);
-            }
+            appendSources(preferredSources(event.context, event.sources));
+            applyHistoryOutcome(event);
         } else if (event.type === "error") {
             state.hasError = true;
+            state.terminalType = "error";
+            state.retryableError = isRetryableStreamError(event);
+            state.errorCode = turnErrorCode(event);
+            reconcileTurnIdFromError(event);
             renderBotAnswer(messageDiv, formatError(event, "Streaming interrupted"));
             state.recoveryPromise = handleUnavailableKnowledgeBase(
                 event,
@@ -800,6 +994,33 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (error) {
             console.warn("Unable to refresh knowledge bases after stream failure", error);
         }
+    }
+
+    function isRetryableStreamError(event) {
+        const code = String(
+            (event && (event.code || event.status)) || ""
+        ).toLowerCase();
+        const terminalCodes = new Set([
+            "turn_id_conflict",
+            "continuity_error",
+            "volatile_result_lost",
+            "conversation_archived",
+            "knowledge_base_not_found",
+            "knowledge_base_deleting",
+            "knowledge_base_delete_failed",
+            "validation_error"
+        ]);
+        return !terminalCodes.has(code);
+    }
+
+    function streamTerminalType(state) {
+        if (state && state.errorCode === "volatile_result_lost") {
+            return "volatile_result_lost";
+        }
+        if (state && state.terminalType === "error" && state.retryableError) {
+            return null;
+        }
+        return state ? state.terminalType : null;
     }
 
     function appendMessage(message, className) {
@@ -857,9 +1078,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const seenUrls = new Set();
         const uniqueSources = contextData.filter(ctx => {
-            if (!ctx.download_url) return false;
             const metadata = ctx.metadata || {};
-            const sourceKey = `${metadata.knowledge_base_id || ""}:${ctx.download_url}`;
+            const sourceKey = [
+                metadata.knowledge_base_id || ctx.knowledge_base_id || "",
+                ctx.download_url || ctx.url || ctx.filename || ctx.title || "",
+                metadata.chunk_id ?? ctx.chunk_id ?? "",
+                metadata.page ?? ctx.page ?? ""
+            ].join(":");
             if (seenUrls.has(sourceKey)) return false;
             seenUrls.add(sourceKey);
             return true;
@@ -886,6 +1111,13 @@ document.addEventListener("DOMContentLoaded", () => {
         chatbox.scrollTop = chatbox.scrollHeight;
     }
 
+    function preferredSources(context, storedSources) {
+        if (Array.isArray(context) && context.length > 0) {
+            return context;
+        }
+        return storedSources;
+    }
+
     function renderSourceCard(ctx) {
         const card = document.createElement("article");
         card.className = "source-card";
@@ -893,22 +1125,29 @@ document.addEventListener("DOMContentLoaded", () => {
         const header = document.createElement("div");
         header.className = "source-card-header";
 
-        const link = document.createElement("a");
-        link.href = ctx.download_url;
+        const safeUrl = safeHistorySourceUrl(ctx.download_url || ctx.url);
+        const link = document.createElement(safeUrl ? "a" : "strong");
+        if (safeUrl) {
+            link.href = safeUrl;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+        }
         link.textContent = sourceFilename(ctx);
-        link.target = "_blank";
 
         const meta = document.createElement("span");
         meta.textContent = sourceMeta(ctx);
 
         const identity = document.createElement("div");
         identity.className = "source-card-identity";
-        const knowledgeBaseName = ctx.metadata && ctx.metadata.knowledge_base_name;
+        const knowledgeBaseName = (ctx.metadata && ctx.metadata.knowledge_base_name)
+            || ctx.knowledge_base_name;
         if (knowledgeBaseName) {
             const badge = document.createElement("span");
             badge.className = "source-kb-badge";
             badge.textContent = knowledgeBaseName;
-            const origins = ctx.metadata.knowledge_base_origins || [];
+            const origins = (ctx.metadata && ctx.metadata.knowledge_base_origins)
+                || ctx.knowledge_base_origins
+                || [];
             if (origins.length > 1) {
                 badge.title = `Also found in ${origins.length - 1} other knowledge base(s)`;
             }
@@ -918,13 +1157,16 @@ document.addEventListener("DOMContentLoaded", () => {
         header.append(identity, meta);
 
         const snippet = document.createElement("p");
-        snippet.textContent = sourceSnippet(ctx.text || "");
+        snippet.textContent = sourceSnippet(ctx.text || ctx.snippet || "");
 
         card.append(header, snippet);
         return card;
     }
 
     function sourceFilename(ctx) {
+        if (ctx.filename || ctx.title || ctx.name) {
+            return String(ctx.filename || ctx.title || ctx.name).split(/[\\/]/).pop();
+        }
         if (ctx.download_url) {
             try {
                 const url = new URL(ctx.download_url, window.location.origin);
@@ -938,7 +1180,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function sourceMeta(ctx) {
-        const metadata = ctx.metadata || {};
+        const metadata = ctx.metadata || ctx || {};
         const parts = [];
         if (metadata.page !== undefined) {
             parts.push(`p. ${metadata.page}`);
@@ -950,6 +1192,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         if (metadata.reranker_score !== undefined) {
             parts.push(`score ${Number(metadata.reranker_score).toFixed(2)}`);
+        } else if (metadata.score !== undefined && Number.isFinite(Number(metadata.score))) {
+            parts.push(`score ${Number(metadata.score).toFixed(2)}`);
         }
         return parts.join(" | ") || "retrieved source";
     }
@@ -998,18 +1242,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function formatConnectionError(error) {
         if (error && error.name === "AbortError") {
-            return "**Request timed out.**\n\nThe response took too long, so the chat was unlocked. Please try again.";
+            return "**Request timed out.**\n\nThe server did not confirm the turn. Retry it with the same request.";
         }
         return `**Connection error:** ${error.message}`;
     }
 
     function clearChat(targetKnowledgeBaseIds = knowledgeBaseIds) {
         if (busy) return;
+        cancelConversationLoad();
+        retryableTurnRequest = null;
         const previousConversationId = conversationId;
         conversationId = createConversationId();
         persistConversationId(conversationId);
         clearServerConversation(previousConversationId, targetKnowledgeBaseIds);
         resetLastTurnId();
+        activeHistoryId = null;
+        activeConversationArchived = false;
+        activeConversationHistoryState = "empty";
         chatbox.replaceChildren();
         clearUploadedFiles();
         if (emptyState) {
@@ -1034,7 +1283,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         if (newChatModalDescription) {
             newChatModalDescription.textContent = options.description
-                || "This conversation is not saved. If you start a new chat, you won’t be able to return to it.";
+                || conversationResetDescription();
         }
         if (confirmNewChatButton) {
             confirmNewChatButton.textContent = options.confirmLabel || "Start new chat";
@@ -1043,6 +1292,13 @@ document.addEventListener("DOMContentLoaded", () => {
         conversationResetTrigger = trigger || document.activeElement;
         newChatModal.hidden = false;
         if (keepConversationButton) keepConversationButton.focus();
+    }
+
+    function conversationResetDescription() {
+        if (activeConversationHistoryState === "saved") {
+            return "This conversation is saved and will remain available in History.";
+        }
+        return "This conversation has unsaved messages. If you continue, those messages may not be available in History.";
     }
 
     function closeConversationResetModal() {
@@ -1895,255 +2151,728 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (e) {/* noop */}
     }
 
-// History drawer
+    // Conversation history drawer and paging state.
     const historyToggle = document.getElementById("historyToggle");
     const historyDrawer = document.getElementById("historyDrawer");
     const closeHistoryDrawer = document.getElementById("closeHistoryDrawer");
-    const toggleHistoryDrawer = document.getElementById("toggleHistoryDrawer");
     const searchHistoryInput = document.getElementById("searchHistoryInput");
     const historyList = document.getElementById("historyList");
     const historyEmptyState = document.getElementById("historyEmptyState");
-    
+    const historyEmptyMessage = document.getElementById("historyEmptyMessage");
+    const historyLoadMore = document.getElementById("historyLoadMore");
+    const historyFilterButtons = [
+        ...document.querySelectorAll("[data-history-status]")
+    ];
+    const HISTORY_PAGE_SIZE = 20;
+    const HISTORY_MESSAGE_PAGE_SIZE = 50;
+
     let conversationHistory = [];
     let filteredHistory = [];
+    let historyStatusFilter = "active";
+    let historyPage = 0;
+    let historyHasNext = false;
     let historyActionInProgress = false;
-    
-    if (historyToggle) {
-        historyToggle.addEventListener("click", openHistoryDrawer);
-    }
+    let lastFocusedElement = null;
+    let drawerOpenVersion = 0;
+    let historyListRequestVersion = 0;
+    let historyListAbortController = null;
+    let historySearchVersion = 0;
+    let conversationLoadVersion = 0;
+    let conversationLoadAbortController = null;
+    let olderMessagesAbortController = null;
+    let activeMessageHistoryId = null;
+    let activeMessageCursor = null;
+    let loadedMessageSequences = new Set();
+    let olderMessagesLoading = false;
+
+    if (historyToggle) historyToggle.addEventListener("click", openHistoryDrawer);
     if (closeHistoryDrawer) {
-        closeHistoryDrawer.addEventListener("click", closeHistoryDrawerHandler);
+        closeHistoryDrawer.addEventListener("click", () => closeHistoryDrawerHandler());
     }
-    if (toggleHistoryDrawer) {
-        toggleHistoryDrawer.addEventListener("click", openHistoryDrawer);
+    if (historyLoadMore) {
+        historyLoadMore.addEventListener("click", () => {
+            loadConversationHistory({reset: false});
+        });
     }
     if (searchHistoryInput) {
-        searchHistoryInput.addEventListener("input", filterHistory);
+        searchHistoryInput.addEventListener("input", () => {
+            filterHistory();
+            if (searchHistoryInput.value.trim() && historyHasNext) {
+                loadRemainingHistoryForSearch();
+            }
+        });
     }
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && historyDrawer && !historyDrawer.hidden) {
+    historyFilterButtons.forEach(button => {
+        button.addEventListener("click", () => {
+            const nextStatus = button.dataset.historyStatus;
+            if (!nextStatus || nextStatus === historyStatusFilter) return;
+            historyStatusFilter = nextStatus;
+            historySearchVersion += 1;
+            historyFilterButtons.forEach(candidate => {
+                const selected = candidate.dataset.historyStatus === historyStatusFilter;
+                candidate.setAttribute("aria-pressed", selected ? "true" : "false");
+            });
+            if (searchHistoryInput) searchHistoryInput.value = "";
+            loadConversationHistory({reset: true});
+        });
+    });
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && historyDrawer && !historyDrawer.hidden) {
             closeHistoryDrawerHandler();
         }
     });
-    
-    let lastFocusedElement = null;
-    
+
     async function openHistoryDrawer() {
         if (!historyDrawer) return;
-        lastFocusedElement = document.activeElement;
+        const openVersion = ++drawerOpenVersion;
+        if (historyDrawer.hidden) lastFocusedElement = document.activeElement;
         historyDrawer.hidden = false;
-        await loadConversationHistory();
-        renderHistoryList();
-        if (searchHistoryInput) {
-            searchHistoryInput.focus();
-        }
+        if (historyToggle) historyToggle.setAttribute("aria-expanded", "true");
         document.addEventListener("keydown", handleDrawerKeydown);
+        await loadConversationHistory({reset: true});
+        if (openVersion !== drawerOpenVersion || historyDrawer.hidden) return;
+        if (searchHistoryInput && searchHistoryInput.value.trim() && historyHasNext) {
+            await loadRemainingHistoryForSearch();
+            if (openVersion !== drawerOpenVersion || historyDrawer.hidden) return;
+        }
+        if (searchHistoryInput) searchHistoryInput.focus();
     }
-    
-    function closeHistoryDrawerHandler() {
+
+    function closeHistoryDrawerHandler({cancelConversation = true} = {}) {
         if (!historyDrawer) return;
+        drawerOpenVersion += 1;
         historyDrawer.hidden = true;
+        if (historyToggle) historyToggle.setAttribute("aria-expanded", "false");
+        if (historyListAbortController) historyListAbortController.abort();
+        if (cancelConversation) cancelConversationLoad();
         document.removeEventListener("keydown", handleDrawerKeydown);
         if (lastFocusedElement) {
             lastFocusedElement.focus();
             lastFocusedElement = null;
         }
     }
-    
-    function handleDrawerKeydown(e) {
-        if (!historyDrawer || historyDrawer.hidden) return;
-        if (e.key !== "Tab") return;
-        
-        const focusableElements = historyDrawer.querySelectorAll(
-            'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-        );
+
+    function handleDrawerKeydown(event) {
+        if (!historyDrawer || historyDrawer.hidden || event.key !== "Tab") return;
+        const focusableElements = [...historyDrawer.querySelectorAll(
+            'button:not([disabled]):not([hidden]), [href], input:not([disabled]), '
+            + 'select:not([disabled]), textarea:not([disabled]), '
+            + '[tabindex]:not([tabindex="-1"])'
+        )].filter(element => !element.hidden);
+        if (focusableElements.length === 0) return;
         const firstElement = focusableElements[0];
         const lastElement = focusableElements[focusableElements.length - 1];
-        
-        if (e.shiftKey && document.activeElement === firstElement) {
-            e.preventDefault();
+        if (event.shiftKey && document.activeElement === firstElement) {
+            event.preventDefault();
             lastElement.focus();
-        } else if (!e.shiftKey && document.activeElement === lastElement) {
-            e.preventDefault();
+        } else if (!event.shiftKey && document.activeElement === lastElement) {
+            event.preventDefault();
             firstElement.focus();
         }
     }
-    
-    async function loadConversationHistory() {
+
+    function renderHistoryNotice(className, message) {
         if (!historyList) return;
-        historyList.innerHTML = '<div class="history-loading">Loading...</div>';
-        try {
-            const response = await fetch("/api/conversations?status=active");
-            if (!response.ok) {
-                conversationHistory = [];
-                filteredHistory = [];
-                historyList.innerHTML = "";
-                if (historyEmptyState) historyEmptyState.hidden = false;
-                return;
-            }
-            const data = await response.json();
-            conversationHistory = data.conversations || [];
-            filteredHistory = [...conversationHistory];
-            historyList.innerHTML = "";
-        } catch (error) {
-            console.error("Failed to load conversation history:", error);
+        const notice = document.createElement("div");
+        notice.className = className;
+        notice.textContent = message;
+        historyList.replaceChildren(notice);
+    }
+
+    async function loadConversationHistory({reset = true} = {}) {
+        if (!historyList) return false;
+        if (historyListAbortController) historyListAbortController.abort();
+        historyListAbortController = new AbortController();
+        const requestVersion = ++historyListRequestVersion;
+        const requestedStatus = historyStatusFilter;
+        const targetPage = reset ? 1 : historyPage + 1;
+        if (reset) {
+            historyPage = 0;
+            historyHasNext = false;
             conversationHistory = [];
             filteredHistory = [];
-            historyList.innerHTML = '<div class="history-error">Failed to load conversations</div>';
+            renderHistoryNotice("history-loading", "Loading...");
+        }
+        updateHistoryLoadMoreButton(true);
+        try {
+            const query = new URLSearchParams({
+                status: requestedStatus,
+                page: String(targetPage),
+                per_page: String(HISTORY_PAGE_SIZE)
+            });
+            const response = await fetch(`/api/conversations?${query}`, {
+                signal: historyListAbortController.signal
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (requestVersion !== historyListRequestVersion
+                || requestedStatus !== historyStatusFilter) return false;
+
+            const received = Array.isArray(data.conversations) ? data.conversations : [];
+            if (reset) {
+                conversationHistory = received;
+            } else {
+                const knownIds = new Set(conversationHistory.map(item => item.id));
+                conversationHistory.push(...received.filter(item => !knownIds.has(item.id)));
+            }
+            historyPage = targetPage;
+            historyHasNext = Boolean(data.pagination && data.pagination.has_next);
+            applyHistoryFilter();
+            updateHistoryLoadMoreButton(false);
+            return true;
+        } catch (error) {
+            if (error.name === "AbortError") return false;
+            console.error("Failed to load conversation history:", error);
+            if (requestVersion !== historyListRequestVersion) return false;
+            if (reset) {
+                conversationHistory = [];
+                filteredHistory = [];
+                renderHistoryNotice("history-error", "Failed to load conversations");
+                if (historyEmptyState) historyEmptyState.hidden = true;
+            }
+            updateHistoryLoadMoreButton(false);
+            return false;
         }
     }
-    
+
     function filterHistory() {
-        const query = (searchHistoryInput?.value || "").toLowerCase().trim();
-        if (!query) {
-            filteredHistory = [...conversationHistory];
-        } else {
-            filteredHistory = conversationHistory.filter(conv => 
-                (conv.title || "").toLowerCase().includes(query)
-            );
-        }
-        renderHistoryList();
+        historySearchVersion += 1;
+        applyHistoryFilter();
     }
-    
+
+    function applyHistoryFilter() {
+        const query = String(searchHistoryInput && searchHistoryInput.value || "")
+            .toLocaleLowerCase().trim();
+        filteredHistory = query
+            ? conversationHistory.filter(conv => String(conv.title || "")
+                .toLocaleLowerCase().includes(query))
+            : [...conversationHistory];
+        renderHistoryList();
+        updateHistoryLoadMoreButton(false);
+    }
+
+    async function loadRemainingHistoryForSearch() {
+        const searchVersion = ++historySearchVersion;
+        const requestedStatus = historyStatusFilter;
+        const query = String(searchHistoryInput && searchHistoryInput.value || "").trim();
+        while (query && historyHasNext
+            && searchVersion === historySearchVersion
+            && requestedStatus === historyStatusFilter) {
+            const loaded = await loadConversationHistory({reset: false});
+            if (!loaded) break;
+        }
+    }
+
+    function updateHistoryLoadMoreButton(loading) {
+        if (!historyLoadMore) return;
+        const searching = Boolean(searchHistoryInput && searchHistoryInput.value.trim());
+        historyLoadMore.hidden = searching || (!historyHasNext && !loading);
+        historyLoadMore.disabled = loading;
+        historyLoadMore.textContent = loading ? "Loading..." : "Load more";
+    }
+
     function renderHistoryList() {
         if (!historyList) return;
-        
+        historyList.replaceChildren();
         if (filteredHistory.length === 0) {
-            historyList.innerHTML = "";
+            if (historyEmptyMessage) {
+                const kind = historyStatusFilter === "archived" ? "archived" : "active";
+                historyEmptyMessage.textContent = searchHistoryInput && searchHistoryInput.value.trim()
+                    ? `No matching ${kind} conversations`
+                    : `No ${kind} conversations yet`;
+            }
             if (historyEmptyState) historyEmptyState.hidden = false;
             return;
         }
-        
         if (historyEmptyState) historyEmptyState.hidden = true;
-        
-        historyList.innerHTML = filteredHistory.map(conv => {
-            const date = new Date(conv.updated_at * 1000).toLocaleString("it-IT");
-            const isArchived = conv.status === "archived";
-            const archivedClass = isArchived ? "archived" : "";
-            const archiveText = isArchived ? "Unarchive" : "Archive";
-            return `
-                <div class="history-item" data-id="${conv.id}" role="listitem" tabindex="0" aria-label="Conversation: ${escapeHtml(conv.title || "Untitled")}">
-                    <h4 class="history-item-title">${escapeHtml(conv.title || "Untitled")}</h4>
-                    <div class="history-item-meta">
-                        <span>${date}</span>
-                        <div class="history-item-actions">
-                            <button type="button" class="rename-btn" data-id="${conv.id}" aria-label="Rename conversation">Rename</button>
-                            <button type="button" class="archive-btn ${archivedClass}" data-id="${conv.id}" aria-label="${archiveText} conversation">${archiveText}</button>
-                            <button type="button" class="delete-btn" data-id="${conv.id}" aria-label="Delete conversation">Delete</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-        }).join("");
-        
-        historyList.querySelectorAll(".history-item").forEach(item => {
-            item.addEventListener("click", (e) => {
-                if (e.target.tagName === "BUTTON") return;
-                const id = item.dataset.id;
-                loadConversation(id);
-            });
-            item.addEventListener("keydown", (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    const id = item.dataset.id;
-                    loadConversation(id);
-                }
-            });
+        const fragment = document.createDocumentFragment();
+        filteredHistory.forEach(conv => fragment.appendChild(renderHistoryItem(conv)));
+        historyList.appendChild(fragment);
+    }
+
+    function renderHistoryItem(conv) {
+        const item = document.createElement("div");
+        item.className = "history-item";
+        item.dataset.id = String(conv.id || "");
+        item.setAttribute("role", "listitem");
+        item.tabIndex = 0;
+        const titleText = String(conv.title || "Untitled");
+        item.setAttribute("aria-label", `Conversation: ${titleText}`);
+
+        const title = document.createElement("h4");
+        title.className = "history-item-title";
+        title.textContent = titleText;
+        const meta = document.createElement("div");
+        meta.className = "history-item-meta";
+        const date = document.createElement("span");
+        const timestamp = Number(conv.updated_at) * 1000;
+        date.textContent = Number.isFinite(timestamp)
+            ? new Date(timestamp).toLocaleString("it-IT")
+            : "";
+        const actions = document.createElement("div");
+        actions.className = "history-item-actions";
+        const isArchived = conv.status === "archived";
+        actions.append(
+            historyActionButton("rename-btn", "Rename", "Rename conversation", () => {
+                openRenameModal(conv.id, titleText);
+            }),
+            historyActionButton(
+                `archive-btn${isArchived ? " archived" : ""}`,
+                isArchived ? "Unarchive" : "Archive",
+                `${isArchived ? "Unarchive" : "Archive"} conversation`,
+                () => toggleArchive(conv.id)
+            ),
+            historyActionButton("delete-btn", "Delete", "Delete conversation", () => {
+                deleteConversation(conv.id);
+            })
+        );
+        meta.append(date, actions);
+        item.append(title, meta);
+        item.addEventListener("click", event => {
+            if (event.target.closest("button")) return;
+            loadConversation(conv.id);
         });
-        
-        historyList.querySelectorAll(".rename-btn").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const id = btn.dataset.id;
-                const conv = conversationHistory.find(c => c.id === id);
-                if (conv) {
-                    openRenameModal(id, conv.title);
-                }
-            });
+        item.addEventListener("keydown", event => {
+            if (event.target !== item || (event.key !== "Enter" && event.key !== " ")) return;
+            event.preventDefault();
+            loadConversation(conv.id);
         });
-        
-        historyList.querySelectorAll(".archive-btn").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const id = btn.dataset.id;
-                toggleArchive(id);
-            });
+        return item;
+    }
+
+    function historyActionButton(className, textValue, label, handler) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = className;
+        button.textContent = textValue;
+        button.setAttribute("aria-label", label);
+        button.addEventListener("click", event => {
+            event.stopPropagation();
+            handler();
         });
-        
-        historyList.querySelectorAll(".delete-btn").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const id = btn.dataset.id;
-                deleteConversation(id);
-            });
-        });
+        return button;
     }
     
+    function cancelConversationLoad() {
+        conversationLoadVersion += 1;
+        if (conversationLoadAbortController) conversationLoadAbortController.abort();
+        if (olderMessagesAbortController) olderMessagesAbortController.abort();
+        conversationLoadAbortController = null;
+        olderMessagesAbortController = null;
+        activeMessageHistoryId = null;
+        activeMessageCursor = null;
+        loadedMessageSequences = new Set();
+        olderMessagesLoading = false;
+    }
+
     async function loadConversation(id) {
         if (busy) {
             showHistoryStatus("Please wait for the current response to complete", 3000);
             return;
         }
+        cancelConversationLoad();
+        conversationLoadAbortController = new AbortController();
+        const signal = conversationLoadAbortController.signal;
+        const loadVersion = conversationLoadVersion;
+        const historyId = String(id || "");
+        const previousConversationId = conversationId;
+        const previousKnowledgeBaseIds = [...knowledgeBaseIds];
+        showHistoryStatus("Loading conversation...", 10000);
         try {
-            const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages`);
-            if (!response.ok) {
-                showHistoryStatus("Failed to load conversation", 5000);
-                return;
+            const encodedId = encodeURIComponent(historyId);
+            const [recordResponse, messagesResponse] = await Promise.all([
+                fetch(`/api/conversations/${encodedId}`, {signal}),
+                fetch(
+                    `/api/conversations/${encodedId}/messages?limit=${HISTORY_MESSAGE_PAGE_SIZE}`,
+                    {signal}
+                )
+            ]);
+            if (!recordResponse.ok || !messagesResponse.ok) {
+                throw new Error(`HTTP ${recordResponse.status}/${messagesResponse.status}`);
             }
-            const data = await response.json();
+            const [record, messagePage] = await Promise.all([
+                recordResponse.json(),
+                messagesResponse.json()
+            ]);
+            if (loadVersion !== conversationLoadVersion) return;
 
-            // Release the warm server-side conversation for the previous chat so
-            // loading a conversation does not leak ephemeral state. This is best
-            // effort and intentionally not awaited (matches clearChat behaviour).
-            clearServerConversation(conversationId);
+            // Clear the previous warm context before adopting the restored one.
+            // Waiting prevents a late DELETE from clearing the newly hydrated chat.
+            if (previousConversationId
+                && previousConversationId !== record.client_conversation_id) {
+                await clearServerConversation(
+                    previousConversationId,
+                    previousKnowledgeBaseIds
+                );
+            }
+            if (loadVersion !== conversationLoadVersion) return;
 
-            // Restore conversation continuity: adopt the loaded conversation's IDs
-            // so subsequent messages continue the same thread instead of starting
-            // a fresh conversation. clearChat() must NOT be used here because it
-            // generates a brand-new conversationId and wipes lastTurnId.
-            const conv = conversationHistory.find(c => c.id === id) || {};
-            const nextConversationId = conv.client_conversation_id || conversationId;
-            const nextTurnId = conv.last_turn_id || null;
+            const warnings = await restoreConversationConfiguration(record, signal);
+            if (loadVersion !== conversationLoadVersion) return;
 
-            conversationId = nextConversationId;
+            conversationId = record.client_conversation_id || conversationId;
             persistConversationId(conversationId);
+            retryableTurnRequest = null;
             currentTurnId = null;
-            if (nextTurnId) {
-                lastTurnId = nextTurnId;
-                persistLastTurnId(nextTurnId);
+            activeHistoryId = historyId;
+            activeConversationArchived = record.status === "archived";
+            activeConversationHistoryState = "saved";
+            if (record.last_turn_id) {
+                lastTurnId = record.last_turn_id;
+                persistLastTurnId(lastTurnId);
             } else {
                 resetLastTurnId();
             }
 
-            chatbox.replaceChildren();
-            clearUploadedFiles();
-            if (emptyState) emptyState.hidden = true;
-
-            const messages = data.messages || [];
-            for (const msg of messages) {
-                if (msg.role === "user") {
-                    appendMessage(msg.content, "user-message");
-                } else if (msg.role === "assistant") {
-                    appendBotMessage(msg.content);
-                }
-            }
-
-            closeHistoryDrawerHandler();
-            showHistoryStatus("Conversation loaded");
+            renderConversationTranscript(
+                Array.isArray(messagePage.messages) ? messagePage.messages : [],
+                messagePage.next_cursor,
+                historyId
+            );
+            closeHistoryDrawerHandler({cancelConversation: false});
+            const archivedWarning = activeConversationArchived
+                ? " This conversation is archived; unarchive it to continue."
+                : "";
+            const configWarning = warnings.length > 0
+                ? ` ${warnings.join(" ")}`
+                : "";
+            showHistoryStatus(
+                `Conversation loaded.${archivedWarning}${configWarning}`,
+                archivedWarning || configWarning ? 8000 : 3000
+            );
         } catch (error) {
+            if (error.name === "AbortError") return;
             console.error("Failed to load conversation:", error);
             showHistoryStatus("Failed to load conversation", 5000);
         }
     }
+
+    async function restoreConversationConfiguration(record, signal) {
+        const warnings = [];
+        restoreConversationModel(record, warnings);
+        restoreConversationKnowledgeBases(record, warnings);
+        restoreConversationPrompt(record, warnings);
+
+        const agentId = String(record.agent_id || "").trim();
+        if (!agentId) {
+            switchToCustomChat();
+            updateChatStatus();
+            return warnings;
+        }
+        try {
+            const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, {signal});
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const agent = await response.json();
+            if (!agent.available) throw new Error("Agent unavailable");
+            const existingIndex = agentsCatalog.findIndex(item => item.id === agent.id);
+            if (existingIndex === -1) agentsCatalog.push(agent);
+            else agentsCatalog[existingIndex] = agent;
+            ensureAgentOption(agent);
+            selectedAgentId = agent.id;
+            agentSelectionBlocked = false;
+            if (agentSelect) agentSelect.value = agent.id;
+            persistSelectedAgent(agent.id);
+            applyAgentConfig(agent);
+            setAgentActive(true);
+        } catch (error) {
+            if (error.name === "AbortError") throw error;
+            switchToCustomChat();
+            warnings.push("Its saved Agent is no longer available; custom chat was restored.");
+        }
+        updateChatStatus();
+        return warnings;
+    }
+
+    function restoreConversationModel(record, warnings) {
+        const providerId = String(record.provider_id || "");
+        const modelId = String(record.model_id || "");
+        if (!providerId && !modelId) return;
+        const option = [...modelSelect.options].find(candidate =>
+            candidate.dataset.provider === providerId
+            && candidate.dataset.model === modelId
+        );
+        if (option) {
+            option.selected = true;
+        } else {
+            const fallback = [...modelSelect.options].find(
+                candidate => candidate.dataset.default === "true"
+            ) || modelSelect.options[0];
+            if (fallback) fallback.selected = true;
+            warnings.push("Its saved model is no longer available; the default was selected.");
+        }
+    }
+
+    function restoreConversationKnowledgeBases(record, warnings) {
+        const rawIds = Array.isArray(record.knowledge_base_ids)
+            ? record.knowledge_base_ids
+            : [];
+        const savedIds = rawIds.map(item => {
+            if (typeof item === "string") return item;
+            if (!item || typeof item !== "object") return "";
+            if (item.is_selected === false) return "";
+            return item.knowledge_base_id || item.id || "";
+        }).filter(Boolean);
+        const availableIds = new Set(knowledgeBaseCatalog.map(item => item.id));
+        const restoredIds = normalizeKnowledgeBaseIds(savedIds)
+            .filter(id => availableIds.has(id))
+            .slice(0, maxQueryKnowledgeBases);
+        const fallbackId = availableIds.has("default")
+            ? "default"
+            : (knowledgeBaseCatalog[0] && knowledgeBaseCatalog[0].id);
+        const nextIds = restoredIds.length > 0
+            ? restoredIds
+            : (fallbackId ? [fallbackId] : []);
+        if (nextIds.length > 0) {
+            knowledgeBaseIds = nextIds;
+            draftKnowledgeBaseIds = [...nextIds];
+            persistKnowledgeBaseIds(nextIds);
+            renderKnowledgeBaseSelection();
+            renderKnowledgeBaseOptions();
+        }
+        if (savedIds.length > 0 && restoredIds.length !== savedIds.length) {
+            warnings.push("One or more saved knowledge bases are no longer available.");
+        }
+    }
+
+    function restoreConversationPrompt(record, warnings) {
+        if (!promptSelect) return;
+        const promptRef = record.prompt_ref && typeof record.prompt_ref === "object"
+            ? record.prompt_ref
+            : {};
+        const promptId = String(promptRef.id || "");
+        const promptScope = String(promptRef.scope || "");
+        const target = promptId && promptScope ? `${promptScope}::${promptId}` : "";
+        const option = [...promptSelect.options].find(candidate => candidate.value === target);
+        if (option) {
+            option.selected = true;
+            systemPromptId = promptId;
+            systemPromptScope = promptScope;
+            persistPromptRef(systemPromptScope, systemPromptId);
+        } else {
+            promptSelect.value = "";
+            systemPromptId = "";
+            systemPromptScope = "";
+            persistPromptRef("", "");
+            if (promptId) warnings.push("Its saved system prompt is no longer available.");
+        }
+    }
+
+    function ensureAgentOption(agent) {
+        if (!agentSelect) return;
+        let option = [...agentSelect.options].find(candidate => candidate.value === agent.id);
+        if (!option) {
+            option = new Option(agent.name || agent.id, agent.id);
+            agentSelect.appendChild(option);
+        }
+        option.disabled = false;
+        option.textContent = agent.name || agent.id;
+    }
+
+    function renderConversationTranscript(messages, nextCursor, historyId) {
+        chatbox.replaceChildren();
+        clearUploadedFiles();
+        if (emptyState) emptyState.hidden = true;
+        activeMessageHistoryId = historyId;
+        activeMessageCursor = normalizeMessageCursor(nextCursor);
+        loadedMessageSequences = new Set();
+        const fragment = document.createDocumentFragment();
+        messages.forEach(message => {
+            const sequence = Number(message.sequence);
+            if (Number.isFinite(sequence)) loadedMessageSequences.add(sequence);
+            persistedMessageNodes(message).forEach(node => fragment.appendChild(node));
+        });
+        chatbox.appendChild(fragment);
+        renderOlderMessagesControl();
+        chatbox.scrollTop = chatbox.scrollHeight;
+    }
+
+    function persistedMessageNodes(message) {
+        const nodes = [];
+        if (!message || !["user", "assistant"].includes(message.role)) return nodes;
+        const messageDiv = document.createElement("div");
+        messageDiv.classList.add(
+            "message",
+            message.role === "user" ? "user-message" : "bot-message"
+        );
+        if (message.role === "assistant") {
+            const responsePayload = message.metadata
+                && message.metadata.response_payload
+                && typeof message.metadata.response_payload === "object"
+                ? message.metadata.response_payload
+                : null;
+            if (message.message_type === "code_interpreter" && responsePayload) {
+                renderCodeInterpreterPayload(
+                    messageDiv,
+                    responsePayload.code || "",
+                    responsePayload.result || {},
+                    ""
+                );
+            } else {
+                messageDiv.innerHTML = renderSafeMarkdown(message.content || "");
+                highlightCodeBlocks(messageDiv);
+            }
+        } else {
+            messageDiv.textContent = String(message.content || "");
+        }
+        nodes.push(messageDiv);
+        if (message.role === "assistant" && Array.isArray(message.sources)
+            && message.sources.length > 0) {
+            nodes.push(renderPersistedSources(message.sources));
+        }
+        return nodes;
+    }
+
+    function renderPersistedSources(sources) {
+        const details = document.createElement("details");
+        details.className = "context-sources";
+        const summary = document.createElement("summary");
+        summary.textContent = `Sources (${sources.length})`;
+        const list = document.createElement("div");
+        list.className = "source-card-list";
+        sources.forEach(source => list.appendChild(renderPersistedSourceCard(source)));
+        details.append(summary, list);
+        return details;
+    }
+
+    function renderPersistedSourceCard(source) {
+        const value = source && typeof source === "object" ? source : {};
+        const metadata = value.metadata && typeof value.metadata === "object"
+            ? value.metadata
+            : value;
+        const card = document.createElement("article");
+        card.className = "source-card";
+        const header = document.createElement("div");
+        header.className = "source-card-header";
+        const identity = document.createElement("div");
+        identity.className = "source-card-identity";
+        const kbName = metadata.knowledge_base_name;
+        if (kbName) {
+            const badge = document.createElement("span");
+            badge.className = "source-kb-badge";
+            badge.textContent = String(kbName);
+            identity.appendChild(badge);
+        }
+        const filename = String(
+            value.filename || value.title || value.name || metadata.source || "Document"
+        ).split(/[\\/]/).pop();
+        const safeUrl = safeHistorySourceUrl(value.download_url || value.url);
+        const sourceLabel = document.createElement(safeUrl ? "a" : "strong");
+        sourceLabel.textContent = filename || "Document";
+        if (safeUrl) {
+            sourceLabel.href = safeUrl;
+            sourceLabel.target = "_blank";
+            sourceLabel.rel = "noopener noreferrer";
+        }
+        identity.appendChild(sourceLabel);
+        const meta = document.createElement("span");
+        const metaParts = [];
+        if (metadata.page !== undefined) metaParts.push(`p. ${metadata.page}`);
+        if (metadata.chunk_id !== undefined) metaParts.push(`chunk ${metadata.chunk_id}`);
+        if (metadata.score !== undefined) {
+            const score = Number(metadata.score);
+            if (Number.isFinite(score)) metaParts.push(`score ${score.toFixed(2)}`);
+        }
+        meta.textContent = metaParts.join(" | ") || String(value.source_type || "saved source");
+        const snippet = document.createElement("p");
+        snippet.textContent = sourceSnippet(value.snippet || value.text || "");
+        header.append(identity, meta);
+        card.append(header, snippet);
+        return card;
+    }
+
+    function safeHistorySourceUrl(rawUrl) {
+        if (!rawUrl) return "";
+        try {
+            const url = new URL(String(rawUrl), window.location.origin);
+            return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+        } catch (error) {
+            return "";
+        }
+    }
+
+    function renderOlderMessagesControl() {
+        const existing = chatbox.querySelector(".history-load-older");
+        if (existing) existing.remove();
+        if (activeMessageCursor === null) return;
+        const wrapper = document.createElement("div");
+        wrapper.className = "history-load-older";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = olderMessagesLoading ? "Loading..." : "Load older messages";
+        button.disabled = olderMessagesLoading;
+        button.addEventListener("click", loadOlderMessages);
+        wrapper.appendChild(button);
+        chatbox.prepend(wrapper);
+    }
+
+    function normalizeMessageCursor(value) {
+        if (value === null || value === undefined) return null;
+        const cursor = Number(value);
+        return Number.isInteger(cursor) && cursor >= 0 ? cursor : null;
+    }
+
+    async function loadOlderMessages() {
+        if (olderMessagesLoading || activeMessageCursor === null
+            || !activeMessageHistoryId) return;
+        olderMessagesLoading = true;
+        renderOlderMessagesControl();
+        if (olderMessagesAbortController) olderMessagesAbortController.abort();
+        olderMessagesAbortController = new AbortController();
+        const signal = olderMessagesAbortController.signal;
+        const loadVersion = conversationLoadVersion;
+        const historyId = activeMessageHistoryId;
+        const cursor = activeMessageCursor;
+        try {
+            const query = new URLSearchParams({
+                limit: String(HISTORY_MESSAGE_PAGE_SIZE),
+                before_sequence: String(cursor)
+            });
+            const response = await fetch(
+                `/api/conversations/${encodeURIComponent(historyId)}/messages?${query}`,
+                {signal}
+            );
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (loadVersion !== conversationLoadVersion
+                || historyId !== activeMessageHistoryId) return;
+            const previousHeight = chatbox.scrollHeight;
+            const previousTop = chatbox.scrollTop;
+            const fragment = document.createDocumentFragment();
+            (Array.isArray(data.messages) ? data.messages : []).forEach(message => {
+                const sequence = Number(message.sequence);
+                if (Number.isFinite(sequence) && loadedMessageSequences.has(sequence)) return;
+                if (Number.isFinite(sequence)) loadedMessageSequences.add(sequence);
+                persistedMessageNodes(message).forEach(node => fragment.appendChild(node));
+            });
+            const control = chatbox.querySelector(".history-load-older");
+            if (control) control.after(fragment);
+            else chatbox.prepend(fragment);
+            activeMessageCursor = normalizeMessageCursor(data.next_cursor);
+            chatbox.scrollTop = previousTop + (chatbox.scrollHeight - previousHeight);
+        } catch (error) {
+            if (error.name !== "AbortError") {
+                console.error("Failed to load older messages:", error);
+                showHistoryStatus("Failed to load older messages", 5000);
+            }
+        } finally {
+            if (loadVersion === conversationLoadVersion
+                && historyId === activeMessageHistoryId) {
+                olderMessagesLoading = false;
+                renderOlderMessagesControl();
+            }
+        }
+    }
     
     async function toggleArchive(id) {
-        if (historyActionInProgress) return;
+        if (busy || historyActionInProgress) return;
         historyActionInProgress = true;
         try {
             const conv = conversationHistory.find(c => c.id === id);
             if (!conv) return;
 
             const isArchived = conv.status === "archived";
+            const isCurrent = id === activeHistoryId
+                || conv.client_conversation_id === conversationId;
             const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
@@ -2155,8 +2884,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            await loadConversationHistory();
-            renderHistoryList();
+            if (isCurrent) {
+                activeConversationArchived = !isArchived;
+            }
+            await loadConversationHistory({reset: true});
             const action = !isArchived ? "Archived" : "Unarchived";
             showHistoryStatus(`${action} conversation`);
         } catch (error) {
@@ -2168,10 +2899,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     
     async function deleteConversation(id) {
-        if (historyActionInProgress) return;
+        if (busy || historyActionInProgress) return;
         if (!confirm("Delete this conversation? This cannot be undone.")) return;
         historyActionInProgress = true;
         try {
+            const conv = conversationHistory.find(c => c.id === id) || {};
+            const isCurrent = id === activeHistoryId
+                || conv.client_conversation_id === conversationId;
             const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
                 method: "DELETE"
             });
@@ -2181,8 +2915,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            await loadConversationHistory();
-            renderHistoryList();
+            if (isCurrent) clearChat();
+            await loadConversationHistory({reset: true});
             showHistoryStatus("Conversation deleted");
         } catch (error) {
             console.error("Failed to delete conversation:", error);
@@ -2277,8 +3011,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            await loadConversationHistory();
-            renderHistoryList();
+            await loadConversationHistory({reset: true});
             closeRenameModal();
             showHistoryStatus("Conversation renamed");
         } catch (error) {

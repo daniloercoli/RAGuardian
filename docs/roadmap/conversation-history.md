@@ -8,10 +8,10 @@ le sezioni sotto indicano cosa è coperto e cosa resta futuro.
 
 ## Copertura attuale
 
-- Store durevole SQLite per workspace con migrazioni versionate (`PRAGMA user_version`), WAL, `BEGIN IMMEDIATE` e permessi `0600`.
+- Store durevole SQLite per workspace con schema fresh-install validato, WAL, `BEGIN IMMEDIATE` e permessi `0600`; gli schemi precedenti vengono rifiutati senza upgrade automatico.
 - `ConversationService` come livello di coordinamento tra store durevole, `PendingTurnResultStore` e `ConversationMemoryStore` (cache calda FIFO).
 - API di gestione session-auth: `GET /api/conversations`, `GET /api/conversations/<id>`, `GET /api/conversations/<id>/messages`, `PATCH /api/conversations/<id>`, `DELETE /api/conversations/<id>`.
-- Flag `persist_history` (default `true`) e `turn_id`/`parent_turn_id` su `POST /api/v1/query`; risposta arricchita con `history_status` e `history_saved`.
+- Flag `persist_history` e `turn_id`/`parent_turn_id`: default attivo per la UI session-auth `/ask`, opt-in (`false` di default) su `POST /api/v1/query`; risposta arricchita con `history_status` e `history_saved`.
 - Replay di turni completati/staged senza nuova chiamata al provider.
 - Drawer UI con ricerca, rinomina, archive/delete e caricamento progressivo del transcript.
 - Isolamento per workspace e risoluzione `history_id` UUID.
@@ -19,7 +19,6 @@ le sezioni sotto indicano cosa è coperto e cosa resta futuro.
 ## Ancora futuro
 
 - Retention automatica, quota per conversazione e backup/restore guidato.
-- Backfill dei turni precedenti al rilascio (non objetivo dichiarato).
 - Scope dedicati `history_read`/`history_manage` per accesso API key esterno (gli endpoint di gestione sono attualmente session-auth).
 
 ## Contesto
@@ -55,7 +54,7 @@ La memoria conversazionale attuale non è uno storico:
 
 ## Non-obiettivi
 
-- Nessun backfill fedele delle conversazioni precedenti al rilascio.
+- Nessun caricamento di database creati da versioni precedenti.
 - Nessun ORM: lo store usa `sqlite3` della standard library.
 - Nessuna modifica incompatibile agli endpoint v1 esistenti.
 - Nessun salvataggio di prompt risolti, segreti, path locali o contesto RAG
@@ -76,7 +75,7 @@ La memoria conversazionale attuale non è uno storico:
 | API esistenti | Il DELETE v1 continua a significare “clear memoria temporanea” |
 | Persistenza API query | Opt-in con `persist_history=true`; nessuna nuova conservazione silenziosa per i client esistenti |
 | API history esterna | Scope dedicati `history_read` e `history_manage`; nessun accesso implicito con il solo `query` |
-| Migrazione | Nessun backfill; lo storico parte dai nuovi turni post-rilascio |
+| Bootstrap | Storage locale vuoto; nessun upgrade automatico |
 
 ## Architettura
 
@@ -86,7 +85,7 @@ La memoria conversazionale attuale non è uno storico:
    Continua a gestire il contesto caldo, il summary rolling e il TTL.
 
 2. **ConversationHistoryStore**
-   Gestisce esclusivamente SQLite, transazioni, migrazioni, paginazione,
+   Gestisce esclusivamente SQLite, transazioni, validazione schema, paginazione,
    retention e cancellazione.
 
 3. **ConversationService**
@@ -173,7 +172,7 @@ payload, configurazione e risultato finale.
    `PendingTurnResultStore`, marcare la reservation `ready` e chiamare
    `ConversationService.complete_turn(...)`.
 8. Soltanto il payload restituito dal commit vincente viene aggiunto alla
-   memoria con `append_turn_once`. Se stage o commit falliscono, mostrare la
+   memoria con un append ordinato e deduplicato per `assistant_sequence`. Se stage o commit falliscono, mostrare la
    risposta come draft non salvata e bloccare il follow-up finché l'utente non
    ritenta o passa esplicitamente a una nuova chat volatile.
 9. Restituire la risposta con
@@ -226,7 +225,7 @@ La UI può allora offrire “Rigenera e sostituisci il draft” come azione espl
    `conversations.last_turn_id` in una sola transazione. Restituisce le
    rispettive `sequence`.
 4. Dopo il commit, il servizio rilegge il turno `complete` e usa quel payload
-   autorevole per `ConversationMemoryStore.append_turn_once`. Un worker che ha
+   autorevole per l'append sequence-aware della memoria. Un worker che ha
    perso la lease non esegue mai l'append; un retry non duplica il contesto.
 5. Se stage o commit falliscono, il draft non entra nella memoria della
    conversazione persistente. Il parent durevole rimane invariato, quindi non
@@ -478,7 +477,8 @@ Per ogni query con `scope_key`:
 
 1. Validare prima tutte le Knowledge Base richieste.
 2. Leggere lo snapshot dalla memoria temporanea.
-3. Se lo snapshot è vuoto, cercare la conversazione per `scope_key`.
+3. Se lo snapshot è vuoto o non copre tutte le sequence durevoli, cercare la
+   conversazione per `scope_key` e fare catch-up autorevole.
 4. Verificare nuovamente che tutte le KB persistenti siano attive e autorizzate.
 5. Caricare il `summary` e i messaggi con
    `sequence > summary_through_sequence`; se il cursore è incoerente, ignorare
@@ -486,8 +486,9 @@ Per ogni query con `scope_key`:
    sintetizza i messaggi vecchi e mantiene in memoria soltanto gli ultimi
    `CONVERSATION_RECENT_TURNS_TO_KEEP` turni: non carica mai un transcript
    illimitato.
-6. Chiamare `ConversationMemoryStore.hydrate_if_absent` con un'operazione
-   atomica per backend: `RLock` in-process e Lua o `WATCH/MULTI` su Redis.
+6. Chiamare `hydrate_if_absent` per uno stato assente oppure sostituire
+   atomicamente uno stato stale con lo snapshot durevole autorevole.
+   L'operazione usa `RLock` in-process e lock Redis per backend.
 7. Leggere un nuovo snapshot. Se un'altra richiesta aveva già creato lo stato,
    usare quello senza sovrascriverlo.
 8. Proseguire con retrieval e generazione.
@@ -602,8 +603,10 @@ client elimina il draft precedente e usa soltanto il nuovo risultato.
   o token temporanei; eventuali link vengono rigenerati dopo l'autorizzazione.
 - Markdown e metadati vengono sanificati nuovamente al rendering.
 - File SQLite e snapshot di backup hanno permessi `0600`.
-- Il pending result è namespaced per workspace, soggetto agli stessi limiti dei
-  messaggi, non viene loggato e segue TTL e protezioni del backend Redis.
+- Il pending result è namespaced per workspace, non viene loggato, segue TTL e
+  protezioni del backend Redis ed è limitato sia per payload sia per byte
+  complessivi (`RAG_PENDING_TURN_RESULT_MAX_PAYLOAD_BYTES` e
+  `RAG_PENDING_TURN_RESULT_MAX_TOTAL_BYTES`).
 - Il database contiene dati sensibili in chiaro: deployment e documentazione
   devono esplicitare protezione del volume e cifratura dei backup.
 - Limiti di input e quota vengono applicati prima della transazione.
@@ -716,7 +719,7 @@ schema e write path prima di mostrare Previous chats.
 
 | Fase | Scope | Deliverable |
 |---|---|---|
-| **0 — contratto** | Schema e semantica | Migrazioni `user_version`, identity `history_id/client_id/scope_key`, limiti, comportamento failure e compatibilità API |
+| **0 — contratto** | Schema e semantica | Schema fresh-install, identity `history_id/client_id/scope_key`, limiti e comportamento failure |
 | **1 — store e service** | Persistenza nascosta | `ConversationHistoryStore`, `ConversationService`, append atomico/idempotente, union/selezione KB, memoria indipendente, summary con cursore/CAS, feature flag |
 | **2 — integrazione** | Query e lifecycle | Hook non-stream/NDJSON/Code Interpreter, raw legacy senza history, hydration atomica, delete KB/workspace, snapshot backup, failure metrics |
 | **3 — API sessione** | Lettura e gestione | List/get/patch/delete, cursore messaggi, isolamento workspace, resume dopo TTL/restart |
@@ -736,7 +739,7 @@ schema e write path prima di mostrare Previous chats.
 | Mod | `app/app.py` per orchestrazione query, streaming e registrazione route |
 | Mod | `app/utils/rag_engine.py` per rimuovere l'append implicito dal motore |
 | Mod | `app/utils/workspace.py` per helper e lifecycle |
-| Mod | `app/utils/conversation_memory.py` per `append_turn_once` e `hydrate_if_absent` |
+| Mod | `app/utils/conversation_memory.py` per append sequence-aware, hydration e catch-up |
 | Mod | `app/utils/vector_store/backup_manager.py` per snapshot SQLite |
 | Mod | `app/templates/index.html` e `app/static/script.js` per Previous chats |
 | Mod | `integrations/wordpress/rag-client/` per inviare `persist_history`, `turn_id` e `parent_turn_id` solo quando il client abilita la history |

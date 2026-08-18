@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import logging
 import re
+from functools import wraps
 from typing import Optional
 
 from flask import jsonify, request
 from werkzeug.exceptions import BadRequest, NotFound
 
-from utils.auth import require_login
+from utils.auth import is_logged_in
 from utils.conversation_history_store import (
     ContinuityError,
     ConversationHistoryError,
@@ -42,20 +43,28 @@ _HISTORY_ID_RE = re.compile(
 )
 
 
+class ConversationApiBadRequest(BadRequest):
+    """Validation error limited to the conversation JSON API."""
+
+
+class ConversationApiNotFound(NotFound):
+    """Missing resource limited to the conversation JSON API."""
+
+
 def _is_valid_history_id(value: str) -> bool:
     return bool(_HISTORY_ID_RE.match(str(value or "")))
 
 
-def _parse_int(value: str, *, name: str, default: int, minimum: int, maximum: int) -> int:
+def _parse_int(value: str, *, name: str, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        raise BadRequest(f"{name} must be an integer")
+        raise ConversationApiBadRequest(f"{name} must be an integer")
     if parsed < minimum:
-        raise BadRequest(f"{name} must be >= {minimum}")
+        raise ConversationApiBadRequest(f"{name} must be >= {minimum}")
     if parsed > maximum:
         return maximum
-    return parsed if parsed != 0 or default != 0 else default
+    return parsed
 
 
 def _require_workspace():
@@ -64,7 +73,24 @@ def _require_workspace():
 
 
 def _generic_error(status: int, message: str = "Internal error"):
-    return jsonify({"error": message}), status
+    code = "server_error" if status >= 500 else "request_error"
+    return jsonify({"error": message, "status": code, "code": code}), status
+
+
+def _json_error(message: str, code: str) -> dict:
+    return {"error": message, "status": code, "code": code}
+
+
+def _require_login_json(view):
+    """Session auth for JSON endpoints without an HTML redirect fallback."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not is_logged_in():
+            return jsonify(_json_error("Autenticazione richiesta", "unauthorized")), 401
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 def _map_store_error(exc: ConversationHistoryError):
@@ -78,13 +104,13 @@ def _map_store_error(exc: ConversationHistoryError):
     - generic ConversationHistoryError -> 400
     """
     if isinstance(exc, ConversationNotFoundError):
-        return jsonify({"error": "Conversation not found", "code": exc.code}), 404
+        return jsonify(_json_error("Conversation not found", exc.code)), 404
     if isinstance(exc, TurnConflictError):
-        return jsonify({"error": str(exc), "code": exc.code}), 409
+        return jsonify(_json_error(str(exc), exc.code)), 409
     if isinstance(exc, TurnInProgressError):
-        resp = jsonify(
-            {"error": str(exc), "code": exc.code, "retry_after": exc.retry_after}
-        )
+        payload = _json_error(str(exc), exc.code)
+        payload["retry_after"] = exc.retry_after
+        resp = jsonify(payload)
         resp.headers["Retry-After"] = str(exc.retry_after)
         return resp, 409
     if isinstance(exc, ContinuityError):
@@ -92,6 +118,7 @@ def _map_store_error(exc: ConversationHistoryError):
             jsonify(
                 {
                     "error": str(exc),
+                    "status": exc.code,
                     "code": exc.code,
                     "expected_parent_turn_id": exc.expected_parent_turn_id,
                 }
@@ -99,31 +126,37 @@ def _map_store_error(exc: ConversationHistoryError):
             409,
         )
     if isinstance(exc, QuotaExceededError):
-        return jsonify({"error": str(exc), "code": exc.code}), 429
-    return jsonify({"error": str(exc), "code": exc.code}), 400
+        return jsonify(_json_error(str(exc), exc.code)), 429
+    return jsonify(_json_error(str(exc), exc.code)), 400
 
 
 def register_conversation_routes(app) -> None:
-    @app.errorhandler(BadRequest)
+    @app.errorhandler(ConversationApiBadRequest)
     def _conversations_bad_request(err):
-        return jsonify({"error": err.description or "Bad request"}), 400
+        return jsonify(
+            _json_error(err.description or "Bad request", "validation_error")
+        ), 400
 
-    @app.errorhandler(NotFound)
+    @app.errorhandler(ConversationApiNotFound)
     def _conversations_not_found(err):
-        return jsonify({"error": err.description or "Not found"}), 404
+        return jsonify(
+            _json_error(err.description or "Not found", "not_found")
+        ), 404
 
     @app.route("/api/conversations", methods=["GET"])
-    @require_login
+    @_require_login_json
     def conversations_list():
         """List conversations for current workspace with pagination."""
         workspace_id = _require_workspace()
         page = _parse_int(
-            request.args.get("page", "1"), name="page", default=1, minimum=1, maximum=10_000
+            request.args.get("page", "1"),
+            name="page",
+            minimum=1,
+            maximum=10_000,
         )
         per_page = _parse_int(
             request.args.get("per_page", "20"),
             name="per_page",
-            default=20,
             minimum=1,
             maximum=100,
         )
@@ -131,14 +164,15 @@ def register_conversation_routes(app) -> None:
         status_filter: Optional[str] = request.args.get("status")
         archived_param = request.args.get("archived")
         if status_filter not in {"active", "archived", None}:
-            raise BadRequest("status must be 'active' or 'archived'")
+            raise ConversationApiBadRequest("status must be 'active' or 'archived'")
         if archived_param is not None:
-            if archived_param.lower() not in {"true", "false"}:
-                raise BadRequest("archived must be 'true' or 'false'")
+            archived_value = archived_param.lower()
+            if archived_value not in {"true", "false"}:
+                raise ConversationApiBadRequest("archived must be 'true' or 'false'")
             if status_filter is None:
-                status_filter = "archived" if archived_param.lower() == "true" else "active"
+                status_filter = "archived" if archived_value == "true" else "active"
 
-        service = get_conversation_service_for_workspace(workspace_id)
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
             return jsonify(
                 {
@@ -166,15 +200,15 @@ def register_conversation_routes(app) -> None:
         return jsonify({"conversations": conversations, "pagination": pagination})
 
     @app.route("/api/conversations/<history_id>", methods=["GET"])
-    @require_login
+    @_require_login_json
     def conversations_get(history_id: str):
         """Get a specific conversation by history_id."""
         if not _is_valid_history_id(history_id):
-            raise BadRequest("history_id must be a UUID")
+            raise ConversationApiBadRequest("history_id must be a UUID")
         workspace_id = _require_workspace()
-        service = get_conversation_service_for_workspace(workspace_id)
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
-            raise NotFound("History disabled")
+            raise ConversationApiNotFound("History disabled")
 
         try:
             conversation = service.get_conversation_by_id(history_id)
@@ -184,17 +218,17 @@ def register_conversation_routes(app) -> None:
             logger.exception("conversations_get failed for %s", history_id)
             return _generic_error(500)
         if not conversation:
-            raise NotFound("Conversation not found")
+            raise ConversationApiNotFound("Conversation not found")
         return jsonify(conversation)
 
     @app.route("/api/conversations/<history_id>/messages", methods=["GET"])
-    @require_login
+    @_require_login_json
     def conversations_get_messages(history_id: str):
         """Get messages for a conversation with cursor pagination."""
         if not _is_valid_history_id(history_id):
-            raise BadRequest("history_id must be a UUID")
+            raise ConversationApiBadRequest("history_id must be a UUID")
         workspace_id = _require_workspace()
-        service = get_conversation_service_for_workspace(workspace_id)
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
             return jsonify({"messages": [], "next_cursor": None})
 
@@ -204,12 +238,15 @@ def register_conversation_routes(app) -> None:
             try:
                 before_sequence = int(before_sequence_arg)
             except ValueError:
-                raise BadRequest("before_sequence must be an integer")
+                raise ConversationApiBadRequest("before_sequence must be an integer")
             if before_sequence < 0:
-                raise BadRequest("before_sequence must be >= 0")
+                raise ConversationApiBadRequest("before_sequence must be >= 0")
 
         limit = _parse_int(
-            request.args.get("limit", "50"), name="limit", default=50, minimum=1, maximum=200
+            request.args.get("limit", "50"),
+            name="limit",
+            minimum=1,
+            maximum=200,
         )
 
         try:
@@ -232,35 +269,52 @@ def register_conversation_routes(app) -> None:
         )
 
     @app.route("/api/conversations/<history_id>", methods=["PATCH"])
-    @require_login
+    @_require_login_json
     def conversations_update(history_id: str):
         """Rename and/or archive/unarchive a conversation."""
         if not _is_valid_history_id(history_id):
-            raise BadRequest("history_id must be a UUID")
+            raise ConversationApiBadRequest("history_id must be a UUID")
         workspace_id = _require_workspace()
-        service = get_conversation_service_for_workspace(workspace_id)
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
-            raise NotFound("History disabled")
+            raise ConversationApiNotFound("History disabled")
 
-        data = request.get_json(silent=True) or {}
+        if not request.is_json:
+            raise ConversationApiBadRequest("Content-Type must be application/json")
+        try:
+            data = request.get_json(silent=False)
+        except BadRequest as exc:
+            raise ConversationApiBadRequest("Malformed JSON body") from exc
+        if not isinstance(data, dict):
+            raise ConversationApiBadRequest("JSON body must be an object")
+        unknown = sorted(set(data) - {"title", "archived"})
+        if unknown:
+            raise ConversationApiBadRequest(f"Unknown field: {unknown[0]}")
+
+        has_title = "title" in data
+        has_archived = "archived" in data
         title = data.get("title")
         archived = data.get("archived")
 
-        if title is not None:
-            title = str(title).strip()
+        if has_title:
+            if not isinstance(title, str):
+                raise ConversationApiBadRequest("title must be a string")
+            title = title.strip()
             if not title:
-                raise BadRequest("title cannot be empty")
+                raise ConversationApiBadRequest("title cannot be empty")
             if len(title) > TITLE_RENAME_MAX_LEN:
-                raise BadRequest(
+                raise ConversationApiBadRequest(
                     f"title must be <= {TITLE_RENAME_MAX_LEN} characters"
                 )
 
-        if archived is not None:
+        if has_archived:
             if not isinstance(archived, bool):
-                raise BadRequest("archived must be a boolean")
+                raise ConversationApiBadRequest("archived must be a boolean")
 
-        if title is None and archived is None:
-            raise BadRequest("Provide 'title' and/or 'archived' to update")
+        if not has_title and not has_archived:
+            raise ConversationApiBadRequest(
+                "Provide 'title' and/or 'archived' to update"
+            )
 
         try:
             conversation = service.update_conversation(
@@ -274,35 +328,39 @@ def register_conversation_routes(app) -> None:
             logger.exception("conversations_update failed for %s", history_id)
             return _generic_error(500)
         if not conversation:
-            raise NotFound("Conversation not found")
+            raise ConversationApiNotFound("Conversation not found")
         return jsonify(conversation)
 
     @app.route("/api/conversations/<history_id>", methods=["DELETE"])
-    @require_login
+    @_require_login_json
     def conversations_delete(history_id: str):
         """Hard delete a conversation."""
         if not _is_valid_history_id(history_id):
-            raise BadRequest("history_id must be a UUID")
-        workspace_id = _require_workspace()
-        service = get_conversation_service_for_workspace(workspace_id)
+            raise ConversationApiBadRequest("history_id must be a UUID")
+        workspace = workspace_from_request(app)
+        workspace_id = workspace.workspace_id
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
             return jsonify({"deleted": False})
 
         try:
-            deleted = service.delete_conversation(history_id)
+            deleted = service.delete_conversation(
+                history_id,
+                workspace_upload_folder=workspace.workspace_upload_folder,
+            )
         except ConversationHistoryError as exc:
             return _map_store_error(exc)
         except Exception:
             logger.exception("conversations_delete failed for %s", history_id)
             return _generic_error(500)
         if not deleted:
-            raise NotFound("Conversation not found")
+            raise ConversationApiNotFound("Conversation not found")
         return jsonify({"deleted": True})
 
     @app.route(
         "/api/conversations/<history_id>/reset-continuity", methods=["POST"]
     )
-    @require_login
+    @_require_login_json
     def conversations_reset_continuity(history_id: str):
         """Clean up expired turn leases and return the current parent turn id.
 
@@ -311,9 +369,9 @@ def register_conversation_routes(app) -> None:
         the ``parent_turn_id`` the next ``begin_turn`` should reference.
         """
         if not _is_valid_history_id(history_id):
-            raise BadRequest("history_id must be a UUID")
+            raise ConversationApiBadRequest("history_id must be a UUID")
         workspace_id = _require_workspace()
-        service = get_conversation_service_for_workspace(workspace_id)
+        service = get_conversation_service_for_workspace(workspace_id, app=app)
         if not service.enabled:
             return jsonify(
                 {"parent_turn_id": None, "cleaned_up_leases": 0}

@@ -43,12 +43,17 @@ FINGERPRINT = "a" * 64
 OTHER_FINGERPRINT = "b" * 64
 
 
-def _make_history_store(tmp_path, workspace_id: str = "test-workspace") -> ConversationHistoryStore:
+def _make_history_store(
+    tmp_path,
+    workspace_id: str = "test-workspace",
+    **kwargs,
+) -> ConversationHistoryStore:
     workspace_data_dir = tmp_path / "workspaces"
     workspace_data_dir.mkdir(exist_ok=True)
     return ConversationHistoryStore(
         workspace_id=workspace_id,
         workspace_data_dir=str(workspace_data_dir),
+        **kwargs,
     )
 
 
@@ -79,6 +84,7 @@ def _request(
     client_conversation_id: str = "conv-1",
     scope_kind: str = "default",
     knowledge_base_ids: list[str] | None = None,
+    recover_lost_result: bool = False,
 ) -> TurnRequest:
     return TurnRequest(
         scope_key=scope_key,
@@ -88,6 +94,7 @@ def _request(
         request_fingerprint=fingerprint,
         parent_turn_id=parent_turn_id,
         selected_knowledge_base_ids=knowledge_base_ids,
+        recover_lost_result=recover_lost_result,
     )
 
 
@@ -195,10 +202,11 @@ class TestBeginTurn:
         ) is True
         outcome = service.begin_turn(_request())
         assert outcome.status == "ready"
+        assert outcome.lease_token == began.lease_token
         assert outcome.result == {"answer": "staged"}
         assert outcome.result_digest == digest
 
-    def test_ready_without_pending_falls_back_to_generating(self, tmp_path):
+    def test_ready_without_pending_requires_explicit_regeneration(self, tmp_path):
         service = _make_service(tmp_path)
         began = service.begin_turn(_request())
         digest = compute_result_digest({"answer": "staged"})
@@ -209,8 +217,38 @@ class TestBeginTurn:
             digest,
         )
         outcome = service.begin_turn(_request())
-        assert outcome.status == "generating"
-        assert outcome.retry_after >= 1
+        assert outcome.status == "volatile_result_lost"
+        assert outcome.code == "volatile_result_lost"
+        assert outcome.lease_token is None
+
+        persisted = service.history_store.get_turn(
+            "ws:default:conv-1",
+            "turn-1",
+        )
+        assert persisted["status"] == "ready"
+        assert persisted["lease_token"] == began.lease_token
+
+    def test_ready_without_pending_can_be_explicitly_regenerated(self, tmp_path):
+        service = _make_service(tmp_path)
+        began = service.begin_turn(_request())
+        digest = compute_result_digest({"answer": "lost"})
+        assert service.history_store.mark_turn_ready(
+            "ws:default:conv-1",
+            "turn-1",
+            began.lease_token,
+            digest,
+        ) is True
+
+        outcome = service.begin_turn(_request(recover_lost_result=True))
+
+        assert outcome.status == "new"
+        assert outcome.lease_token
+        assert outcome.lease_token != began.lease_token
+        persisted = service.history_store.get_turn(
+            "ws:default:conv-1", "turn-1"
+        )
+        assert persisted["status"] == "generating"
+        assert persisted["lease_token"] == outcome.lease_token
 
     def test_continuity_error_propagates_expected_parent_turn_id(self, tmp_path):
         service = _make_service(tmp_path)
@@ -227,7 +265,7 @@ class TestBeginTurn:
         outcome = service.begin_turn(
             _request(turn_id="t2", parent_turn_id="t1-wrong")
         )
-        assert outcome.status == "error"
+        assert outcome.status == "continuity_error"
         assert outcome.expected_parent_turn_id == "t1"
 
     def test_continuity_error_expected_parent_none_when_no_complete(self, tmp_path):
@@ -237,7 +275,7 @@ class TestBeginTurn:
         outcome = service.begin_turn(
             _request(turn_id="t1", parent_turn_id="bogus")
         )
-        assert outcome.status == "error"
+        assert outcome.status == "continuity_error"
         assert outcome.expected_parent_turn_id is None
 
 
@@ -322,6 +360,9 @@ class TestCompleteTurn:
         assert outcome.status == "complete"
         assert outcome.replayed is False
         assert outcome.message_count == 2
+        assert outcome.user_sequence == 1
+        assert outcome.assistant_sequence == 2
+        assert len(outcome.messages) == 2
         assert (
             service.pending_store.get("ws:default:conv-1", "turn-1") is None
         )
@@ -383,6 +424,37 @@ class TestCompleteTurn:
         prompt = memory.render_for_prompt("warm-conv-1")
         assert prompt.count("Domanda") == 1
 
+    def test_distinct_turns_with_identical_text_are_both_kept_warm(self, tmp_path):
+        memory = ConversationMemoryStore()
+        service = _make_service(tmp_path, memory_store=memory)
+
+        first = service.begin_turn(_request())
+        service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=first.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Ripeti",
+            assistant_content="Uguale",
+            warm_conversation_id="warm-conv-1",
+        )
+        second = service.begin_turn(
+            _request(turn_id="turn-2", parent_turn_id="turn-1")
+        )
+        service.complete_turn(
+            "ws:default:conv-1",
+            "turn-2",
+            lease_token=second.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Ripeti",
+            assistant_content="Uguale",
+            warm_conversation_id="warm-conv-1",
+        )
+
+        prompt = memory.render_for_prompt("warm-conv-1")
+        assert prompt.count("Ripeti") == 2
+        assert prompt.count("Uguale") == 2
+
     def test_complete_turn_uses_request_fields(self, tmp_path):
         service = _make_service(tmp_path)
         request = _request(knowledge_base_ids=["kb-a"])
@@ -401,7 +473,62 @@ class TestCompleteTurn:
         kbs = {kb["knowledge_base_id"] for kb in conv["knowledge_base_ids"]}
         assert "kb-a" in kbs
 
-    def test_complete_turn_conflict_clears_pending(self, tmp_path):
+    def test_complete_turn_preserves_message_type_sources_and_metadata(self, tmp_path):
+        service = _make_service(tmp_path)
+        began = service.begin_turn(_request())
+        outcome = service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=began.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Analizza",
+            assistant_content="Completato",
+            message_type="code_interpreter",
+            sources=[{"filename": "report.csv"}],
+            metadata={"success": True},
+        )
+
+        assistant = outcome.messages[-1]
+        assert assistant["message_type"] == "code_interpreter"
+        assert assistant["sources"] == [{"filename": "report.csv"}]
+        assert assistant["metadata"] == {"success": True}
+
+        replay = service.begin_turn(_request())
+        replayed_assistant = replay.messages[-1]
+        assert replay.status == "complete"
+        assert replayed_assistant["message_type"] == "code_interpreter"
+        assert replayed_assistant["sources"] == [{"filename": "report.csv"}]
+        assert replayed_assistant["metadata"] == {"success": True}
+
+    def test_complete_turn_returns_warm_memory_summary_job(self, tmp_path):
+        memory = ConversationMemoryStore(
+            summary_threshold_chars=1,
+            recent_turns_to_keep=1,
+        )
+        memory.append_turn(
+            "warm-conv-1",
+            user="Prima domanda",
+            assistant="Prima risposta",
+        )
+        service = _make_service(tmp_path, memory_store=memory)
+        began = service.begin_turn(_request())
+        outcome = service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=began.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Seconda domanda",
+            assistant_content="Seconda risposta",
+            warm_conversation_id="warm-conv-1",
+        )
+
+        assert outcome.summary_job is not None
+        assert outcome.summary_job.conversation_id == "warm-conv-1"
+        assert outcome.summary_job.turns_to_summarize == [
+            ConversationTurn(user="Prima domanda", assistant="Prima risposta")
+        ]
+
+    def test_stale_complete_conflict_preserves_current_pending_owner(self, tmp_path):
         service = _make_service(tmp_path)
         began = service.begin_turn(_request())
         digest = compute_result_digest({"answer": "staged"})
@@ -421,9 +548,9 @@ class TestCompleteTurn:
             assistant_content="Risposta",
         )
         assert outcome.status == "conflict"
-        assert (
-            service.pending_store.get("ws:default:conv-1", "turn-1") is None
-        )
+        pending = service.pending_store.get("ws:default:conv-1", "turn-1")
+        assert pending is not None
+        assert pending.lease_token == began.lease_token
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +592,16 @@ class TestFailTurn:
         assert outcome.status == "new"
         assert outcome.lease_token != began.lease_token
 
+    def test_service_renews_owned_lease(self, tmp_path):
+        service = _make_service(tmp_path)
+        began = service.begin_turn(_request())
+        assert service.renew_turn_lease(
+            "ws:default:conv-1", "turn-1", began.lease_token
+        ) is True
+        assert service.renew_turn_lease(
+            "ws:default:conv-1", "turn-1", "wrong"
+        ) is False
+
 
 # ---------------------------------------------------------------------------
 # hydrate_for_prompt
@@ -491,6 +628,81 @@ class TestHydrate:
         assert "Risposta" in prompt
         assert service.hydrate_for_prompt("ws:default:conv-1", "warm-conv-1") is False
 
+    def test_hydrate_excludes_messages_already_covered_by_summary(self, tmp_path):
+        memory = ConversationMemoryStore()
+        service = _make_service(tmp_path, memory_store=memory)
+        first = service.begin_turn(_request(turn_id="t1"))
+        first_outcome = service.complete_turn(
+            "ws:default:conv-1",
+            "t1",
+            lease_token=first.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Domanda già riassunta",
+            assistant_content="Risposta già riassunta",
+        )
+        assert service.update_summary(
+            "ws:default:conv-1",
+            "Contesto consolidato",
+            expected_version=0,
+            through_sequence=first_outcome.assistant_sequence,
+        ) is True
+
+        second = service.begin_turn(
+            _request(turn_id="t2", parent_turn_id="t1")
+        )
+        service.complete_turn(
+            "ws:default:conv-1",
+            "t2",
+            lease_token=second.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Domanda recente",
+            assistant_content="Risposta recente",
+        )
+
+        assert service.hydrate_for_prompt(
+            "ws:default:conv-1", "warm-with-summary"
+        ) is True
+        prompt = memory.render_for_prompt("warm-with-summary")
+        assert "Contesto consolidato" in prompt
+        assert "Domanda recente" in prompt
+        assert "Risposta recente" in prompt
+        assert "Domanda già riassunta" not in prompt
+        assert "Risposta già riassunta" not in prompt
+
+    def test_hydrate_compacts_unsummarized_tail_before_warming(self, tmp_path):
+        memory = ConversationMemoryStore(recent_turns_to_keep=2)
+        service = _make_service(tmp_path, memory_store=memory)
+        parent = None
+        for index in range(1, 7):
+            turn_id = f"t{index}"
+            began = service.begin_turn(
+                _request(turn_id=turn_id, parent_turn_id=parent)
+            )
+            completed = service.complete_turn(
+                "ws:default:conv-1",
+                turn_id,
+                lease_token=began.lease_token,
+                request_fingerprint=FINGERPRINT,
+                user_content=f"Domanda {index}",
+                assistant_content=f"Risposta {index}",
+            )
+            assert completed.status == "complete"
+            parent = turn_id
+
+        assert service.hydrate_for_prompt(
+            "ws:default:conv-1", "warm-compacted"
+        ) is True
+
+        state = memory._conversations["warm-compacted"]
+        assert len(state.turns) == 2
+        assert [turn.assistant_sequence for turn in state.turns] == [10, 12]
+        assert state.summary_through_sequence == 8
+        durable = service.history_store.get_by_scope_key(
+            "ws:default:conv-1"
+        )
+        assert durable["summary_through_sequence"] == 8
+        assert durable["summary_version"] == 1
+
     def test_hydrate_returns_false_for_unknown_scope(self, tmp_path):
         service = _make_service(tmp_path)
         assert service.hydrate_for_prompt("missing-scope", "warm-1") is False
@@ -498,6 +710,68 @@ class TestHydrate:
     def test_hydrate_returns_false_for_empty_conversation_id(self, tmp_path):
         service = _make_service(tmp_path)
         assert service.hydrate_for_prompt("ws:default:conv-1", "") is False
+
+    def test_sync_repairs_a_warm_sequence_gap_from_durable_history(self, tmp_path):
+        memory = ConversationMemoryStore()
+        service = _make_service(tmp_path, memory_store=memory)
+        parent = None
+        for index in range(1, 4):
+            turn_id = f"t{index}"
+            began = service.begin_turn(
+                _request(turn_id=turn_id, parent_turn_id=parent)
+            )
+            service.complete_turn(
+                "ws:default:conv-1",
+                turn_id,
+                lease_token=began.lease_token,
+                request_fingerprint=FINGERPRINT,
+                user_content=f"Domanda {index}",
+                assistant_content=f"Risposta {index}",
+            )
+            parent = turn_id
+
+        memory.append_turn(
+            "warm-gap",
+            user="Domanda 1",
+            assistant="Risposta 1",
+            assistant_sequence=2,
+        )
+        memory.append_turn(
+            "warm-gap",
+            user="Domanda 3",
+            assistant="Risposta 3",
+            assistant_sequence=6,
+        )
+        assert memory.durable_state_is_current("warm-gap", 6) is False
+
+        assert service.sync_for_prompt("ws:default:conv-1", "warm-gap") is True
+        prompt = memory.render_for_prompt("warm-gap")
+        assert prompt.index("Domanda 1") < prompt.index("Domanda 2")
+        assert prompt.index("Domanda 2") < prompt.index("Domanda 3")
+        assert memory.durable_state_is_current("warm-gap", 6) is True
+
+    def test_sync_replaces_unsequenced_volatile_turns(self, tmp_path):
+        memory = ConversationMemoryStore()
+        service = _make_service(tmp_path, memory_store=memory)
+        memory.append_turn(
+            "warm-legacy",
+            user="Domanda volatile precedente",
+            assistant="Risposta volatile precedente",
+        )
+        began = service.begin_turn(_request())
+        service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=began.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Domanda durevole",
+            assistant_content="Risposta durevole",
+        )
+
+        assert service.sync_for_prompt("ws:default:conv-1", "warm-legacy") is True
+        prompt = memory.render_for_prompt("warm-legacy")
+        assert "Domanda volatile precedente" not in prompt
+        assert "Domanda durevole" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +837,59 @@ class TestPassThrough:
         result = service.reset_continuity("missing-id")
         assert result == {"parent_turn_id": None, "cleaned_up_leases": 0}
 
+    def test_delete_clears_warm_and_all_pending_scope_entries(self, tmp_path):
+        memory = ConversationMemoryStore()
+        pending = PendingTurnResultStore()
+        service = _make_service(
+            tmp_path, memory_store=memory, pending_store=pending
+        )
+        began = service.begin_turn(_request())
+        service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=began.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Segreto",
+            assistant_content="Risposta",
+            warm_conversation_id="ws:default:conv-1",
+        )
+        pending.put(
+            "ws:default:conv-1",
+            "orphan",
+            lease_token="lease",
+            result_digest="digest",
+            result={"answer": "draft"},
+        )
+        history_id = service.get_conversation("ws:default:conv-1")["id"]
+
+        assert service.delete_conversation(history_id) is True
+        assert memory.render_for_prompt("ws:default:conv-1") == ""
+        assert pending.get("ws:default:conv-1", "orphan") is None
+
+    def test_update_summary_hook_persists_and_hydrates(self, tmp_path):
+        memory = ConversationMemoryStore()
+        service = _make_service(tmp_path, memory_store=memory)
+        began = service.begin_turn(_request())
+        outcome = service.complete_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            lease_token=began.lease_token,
+            request_fingerprint=FINGERPRINT,
+            user_content="Domanda",
+            assistant_content="Risposta",
+        )
+        assert service.update_summary(
+            "ws:default:conv-1",
+            "Riassunto durevole",
+            expected_version=0,
+            through_sequence=outcome.assistant_sequence,
+        ) is True
+
+        assert service.hydrate_for_prompt(
+            "ws:default:conv-1", "warm-summary"
+        ) is True
+        assert "Riassunto durevole" in memory.render_for_prompt("warm-summary")
+
 
 # ---------------------------------------------------------------------------
 # Service cache LRU eviction
@@ -575,6 +902,9 @@ class TestServiceCacheLRU:
 
         cs.reset_conversation_service()
         monkeypatch.setattr(cs, "_SERVICE_CACHE_MAX_SIZE", 3)
+        monkeypatch.setenv(
+            "RAG_WORKSPACE_DATA_DIR", str(tmp_path / "workspaces")
+        )
 
         cs.get_conversation_service_for_workspace("ws-1")
         cs.get_conversation_service_for_workspace("ws-2")
@@ -599,6 +929,9 @@ class TestServiceCacheLRU:
 
         cs.reset_conversation_service()
         monkeypatch.setattr(cs, "_SERVICE_CACHE_MAX_SIZE", 2)
+        monkeypatch.setenv(
+            "RAG_WORKSPACE_DATA_DIR", str(tmp_path / "workspaces")
+        )
 
         cs.get_conversation_service_for_workspace("ws-a")
         cs.get_conversation_service_for_workspace("ws-b")
@@ -640,6 +973,43 @@ class TestHelpers:
         fp2 = compute_request_fingerprint(query="Salve")
         assert fp1 != fp2
 
+    def test_fingerprint_canonicalizes_nested_mapping_order(self):
+        fp1 = compute_request_fingerprint(
+            query="Ciao", client_context={"a": 1, "nested": {"x": 2, "y": 3}}
+        )
+        fp2 = compute_request_fingerprint(
+            query="Ciao", client_context={"nested": {"y": 3, "x": 2}, "a": 1}
+        )
+        assert fp1 == fp2
+
+    def test_fingerprint_covers_prompt_agent_and_attachments(self):
+        base = compute_request_fingerprint(
+            query="Analizza",
+            system_prompt_id="prompt-1",
+            system_prompt_scope="personal",
+            agent_id="agent-1",
+            use_code_interpreter=True,
+            attached_files=[{"id": "file-a", "name": "a.csv"}],
+        )
+        changed_file = compute_request_fingerprint(
+            query="Analizza",
+            system_prompt_id="prompt-1",
+            system_prompt_scope="personal",
+            agent_id="agent-1",
+            use_code_interpreter=True,
+            attached_files=[{"id": "file-b", "name": "a.csv"}],
+        )
+        changed_scope = compute_request_fingerprint(
+            query="Analizza",
+            system_prompt_id="prompt-1",
+            system_prompt_scope="shared",
+            agent_id="agent-1",
+            use_code_interpreter=True,
+            attached_files=[{"id": "file-a", "name": "a.csv"}],
+        )
+        assert base != changed_file
+        assert base != changed_scope
+
     def test_compute_result_digest_is_stable(self):
         d1 = compute_result_digest({"a": 1, "b": 2})
         d2 = compute_result_digest({"b": 2, "a": 1})
@@ -664,6 +1034,7 @@ class TestHelpers:
         assert err.to_dict() == {
             "error": "Turn already generating",
             "status": "turn_in_progress",
+            "code": "turn_in_progress",
             "turn_id": "turn-1",
         }
 

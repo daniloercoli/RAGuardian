@@ -1,7 +1,7 @@
 """Tests for the durable :class:`ConversationHistoryStore`.
 
 Covers the "Store" section of the conversation-history roadmap test plan:
-versioned migrations and idempotent ``ensure_schema``, atomic user+assistant
+fresh schema validation and idempotent ``ensure_schema``, atomic user+assistant
 append, idempotent retries, turn reservations / lease / conflicts, linear
 parent continuity, monotonic Knowledge-Base union, title derivation, rename,
 archive/unarchive, hard-delete cascade, message cursor pagination, summary
@@ -19,8 +19,10 @@ import pytest
 
 from app.utils.conversation_history_store import (
     SCHEMA_VERSION,
+    ConversationArchivedError,
     ConversationHistoryError,
     ConversationHistoryStore,
+    IncompatibleConversationSchemaError,
     ConversationNotFoundError,
     ContinuityError,
     QuotaExceededError,
@@ -45,6 +47,7 @@ def _make_store(
     *,
     workspace_id: str = "test-workspace",
     max_conversations: int = 200,
+    max_pending_turns: int = 100,
     max_messages_per_conversation: int = 2000,
     max_conversation_bytes: int = 33_554_432,
     max_message_chars: int = 50_000,
@@ -52,6 +55,8 @@ def _make_store(
     max_metadata_bytes_per_turn: int = 65_536,
     max_history_bytes: int = 268_435_456,
     lease_seconds: int = 900,
+    retention_days: int = 90,
+    incomplete_turn_retention_days: int = 7,
 ) -> ConversationHistoryStore:
     workspace_data_dir = tmp_path / "workspaces"
     workspace_data_dir.mkdir(exist_ok=True)
@@ -59,6 +64,7 @@ def _make_store(
         workspace_id=workspace_id,
         workspace_data_dir=str(workspace_data_dir),
         max_conversations=max_conversations,
+        max_pending_turns=max_pending_turns,
         max_messages_per_conversation=max_messages_per_conversation,
         max_conversation_bytes=max_conversation_bytes,
         max_message_chars=max_message_chars,
@@ -66,6 +72,8 @@ def _make_store(
         max_metadata_bytes_per_turn=max_metadata_bytes_per_turn,
         max_history_bytes=max_history_bytes,
         lease_seconds=lease_seconds,
+        retention_days=retention_days,
+        incomplete_turn_retention_days=incomplete_turn_retention_days,
     )
 
 
@@ -112,7 +120,7 @@ def _do_turn(store, *, scope_key="ws:default:conv-1", turn_id="turn-1", parent=N
 
 
 # ---------------------------------------------------------------------------
-# Schema + migrations
+# Fresh schema initialization
 # ---------------------------------------------------------------------------
 
 class TestSchema:
@@ -123,13 +131,19 @@ class TestSchema:
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             names = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )}
         finally:
             conn.close()
         assert version == SCHEMA_VERSION
-        assert {"conversations", "conversation_knowledge_bases",
-                "turn_requests", "messages"} <= names
+        assert {
+            "conversations",
+            "conversation_knowledge_bases",
+            "turn_requests",
+            "messages",
+            "conversation_artifact_cleanup_outbox",
+        } == names
 
     def test_ensure_schema_is_idempotent(self, tmp_path):
         path = tmp_path / "conversations.db"
@@ -141,7 +155,7 @@ class TestSchema:
         finally:
             conn.close()
 
-    def test_store_constructor_runs_migrations(self, tmp_path):
+    def test_store_constructor_initializes_current_schema(self, tmp_path):
         store = _make_store(tmp_path)
         assert store.path.exists()
         conn = get_history_connection(store.path)
@@ -154,6 +168,15 @@ class TestSchema:
         store = _make_store(tmp_path)
         mode = os.stat(store.path).st_mode & 0o777
         assert mode == 0o600
+
+    def test_previous_schema_version_is_rejected_without_upgrade(self, tmp_path):
+        path = tmp_path / "conversations.db"
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE old_conversations (id TEXT)")
+            conn.execute("PRAGMA user_version = 2")
+
+        with pytest.raises(IncompatibleConversationSchemaError):
+            ensure_schema(path)
 
     def test_linear_parent_partial_unique_index_exists(self, tmp_path):
         store = _make_store(tmp_path)
@@ -244,6 +267,42 @@ class TestBeginTurn:
         assert replay["status"] == "ready"
         assert replay["replayed"] is True
         assert replay["result_digest"] == "digest-abc"
+        assert replay["lease_token"] == began["lease_token"]
+
+    def test_ready_turn_with_lost_payload_can_be_recovered(self, tmp_path):
+        store = _make_store(tmp_path)
+        began = _begin(store)
+        store.mark_turn_ready(
+            "ws:default:conv-1", "turn-1", began["lease_token"], "digest-abc"
+        )
+
+        recovered = store.recover_ready_turn(
+            "ws:default:conv-1",
+            "turn-1",
+            request_fingerprint=FINGERPRINT,
+            expected_lease_token=began["lease_token"],
+        )
+
+        assert recovered["status"] == "new"
+        assert recovered["lease_token"] != began["lease_token"]
+        turn = store.get_turn("ws:default:conv-1", "turn-1")
+        assert turn["status"] == "generating"
+        assert turn["result_digest"] is None
+
+    def test_failed_retry_rechecks_parent_after_replacement_completed(self, tmp_path):
+        store = _make_store(tmp_path)
+        first = _begin(store, turn_id="t1")
+        _complete(store, turn_id="t1", lease_token=first["lease_token"])
+        failed = _begin(store, turn_id="t2", parent="t1")
+        store.fail_turn(
+            "ws:default:conv-1", "t2", failed["lease_token"]
+        )
+        replacement = _begin(store, turn_id="t3", parent="t1")
+        _complete(store, turn_id="t3", lease_token=replacement["lease_token"])
+
+        with pytest.raises(ContinuityError) as exc_info:
+            _begin(store, turn_id="t2", parent="t1")
+        assert exc_info.value.expected_parent_turn_id == "t3"
 
     def test_failed_reservation_can_be_reopened_with_same_fingerprint(self, tmp_path):
         store = _make_store(tmp_path)
@@ -532,6 +591,22 @@ class TestKnowledgeBases:
         assert store.get_by_scope_key("ws:default:c2") is None
         assert store.count_by_knowledge_base("kb-b") == 0
 
+    def test_scope_keys_by_knowledge_base_supports_ephemeral_cleanup(self, tmp_path):
+        store = _make_store(tmp_path)
+        _do_turn(store, scope_key="ws:default:c2", client_id="c2",
+                 turn_id="t1", kb_ids=["kb-b"])
+        _do_turn(store, scope_key="ws:default:c1", client_id="c1",
+                 turn_id="t1", kb_ids=["kb-a", "kb-b"])
+        _do_turn(store, scope_key="ws:default:c3", client_id="c3",
+                 turn_id="t1", kb_ids=["kb-a"])
+
+        assert store.scope_keys_by_knowledge_base("kb-b") == [
+            "ws:default:c1",
+            "ws:default:c2",
+        ]
+        assert store.scope_keys_by_knowledge_base("missing") == []
+        assert store.scope_keys_by_knowledge_base("") == []
+
 
 # ---------------------------------------------------------------------------
 # Title, rename, archive, delete
@@ -602,6 +677,32 @@ class TestConversationMutations:
         active = store.unarchive(cid)
         assert active["status"] == "active"
         assert active["archived_at"] is None
+
+    def test_archived_conversation_rejects_new_turns(self, tmp_path):
+        store = _make_store(tmp_path)
+        _do_turn(store, turn_id="t1")
+        conversation = store.get_by_scope_key("ws:default:conv-1")
+        store.archive(conversation["id"])
+
+        with pytest.raises(ConversationArchivedError):
+            _begin(store, turn_id="t2", parent="t1")
+
+        assert store.get_by_scope_key("ws:default:conv-1")["message_count"] == 2
+
+    def test_archive_with_active_turn_rejects_atomic_rename(self, tmp_path):
+        store = _make_store(tmp_path)
+        began = _begin(store)
+
+        with pytest.raises(TurnInProgressError):
+            store.update_conversation(
+                began["conversation"]["id"],
+                title="Must not commit",
+                archived=True,
+            )
+
+        conversation = store.get(began["conversation"]["id"])
+        assert conversation["title"] == ""
+        assert conversation["status"] == "active"
 
     def test_delete_cascades_messages_and_turns(self, tmp_path):
         store = _make_store(tmp_path)
@@ -718,6 +819,34 @@ class TestReadApi:
         messages, _ = store.list_messages(cid, limit=9999)
         assert len(messages) == 2
 
+    def test_list_messages_after_sequence_pages_forward(self, tmp_path):
+        store = _make_store(tmp_path)
+        first_turn = _begin(store, turn_id="t1")
+        _complete(
+            store,
+            turn_id="t1",
+            lease_token=first_turn["lease_token"],
+        )
+        second_turn = _begin(store, turn_id="t2", parent="t1")
+        _complete(
+            store,
+            turn_id="t2",
+            lease_token=second_turn["lease_token"],
+        )
+        conversation = store.get_by_scope_key("ws:default:conv-1")
+
+        first, cursor = store.list_messages_after_sequence(
+            conversation["id"], after_sequence=0, limit=2
+        )
+        second, final_cursor = store.list_messages_after_sequence(
+            conversation["id"], after_sequence=cursor, limit=2
+        )
+
+        assert [message["sequence"] for message in first] == [1, 2]
+        assert cursor == 2
+        assert [message["sequence"] for message in second] == [3, 4]
+        assert final_cursor is None
+
 
 # ---------------------------------------------------------------------------
 # Summary compare-and-swap
@@ -814,10 +943,93 @@ class TestQuotaAndLimits:
                       metadata={"k": "v" * 100})
 
     def test_pending_turn_quota_enforced(self, tmp_path):
-        store = _make_store(tmp_path, max_conversations=1)
+        store = _make_store(tmp_path, max_pending_turns=1)
         _begin(store, scope_key="ws:default:c1", client_id="c1", turn_id="t1")
         with pytest.raises(QuotaExceededError):
             _begin(store, scope_key="ws:default:c2", client_id="c2", turn_id="t1")
+
+    def test_failed_stub_still_counts_toward_incomplete_quota(self, tmp_path):
+        store = _make_store(tmp_path, max_pending_turns=1)
+        began = _begin(
+            store,
+            scope_key="ws:default:c1",
+            client_id="c1",
+            turn_id="t1",
+        )
+        assert store.fail_turn(
+            "ws:default:c1", "t1", began["lease_token"]
+        ) is True
+
+        with pytest.raises(QuotaExceededError, match="pending turn quota"):
+            _begin(
+                store,
+                scope_key="ws:default:c2",
+                client_id="c2",
+                turn_id="t1",
+            )
+
+        # Retrying the same failed reservation remains possible and can free
+        # the quota by completing it.
+        retried = _begin(
+            store,
+            scope_key="ws:default:c1",
+            client_id="c1",
+            turn_id="t1",
+        )
+        _complete(
+            store,
+            scope_key="ws:default:c1",
+            turn_id="t1",
+            lease_token=retried["lease_token"],
+        )
+        assert _begin(
+            store,
+            scope_key="ws:default:c2",
+            client_id="c2",
+            turn_id="t1",
+        )["status"] == "new"
+
+    def test_completed_conversation_quota_is_separate_from_pending(self, tmp_path):
+        store = _make_store(
+            tmp_path, max_conversations=1, max_pending_turns=10
+        )
+        _do_turn(
+            store,
+            scope_key="ws:default:c1",
+            client_id="c1",
+            turn_id="t1",
+        )
+        with pytest.raises(QuotaExceededError, match="conversation quota"):
+            _begin(
+                store,
+                scope_key="ws:default:c2",
+                client_id="c2",
+                turn_id="t1",
+            )
+
+    def test_first_commit_serializes_concurrent_stub_quota(self, tmp_path):
+        store = _make_store(
+            tmp_path, max_conversations=1, max_pending_turns=10
+        )
+        first = _begin(
+            store, scope_key="ws:default:c1", client_id="c1", turn_id="t1"
+        )
+        second = _begin(
+            store, scope_key="ws:default:c2", client_id="c2", turn_id="t1"
+        )
+        _complete(
+            store,
+            scope_key="ws:default:c1",
+            turn_id="t1",
+            lease_token=first["lease_token"],
+        )
+        with pytest.raises(QuotaExceededError, match="conversation quota"):
+            _complete(
+                store,
+                scope_key="ws:default:c2",
+                turn_id="t1",
+                lease_token=second["lease_token"],
+            )
 
     def test_quota_status_reports_usage(self, tmp_path):
         store = _make_store(tmp_path, max_conversations=5, max_history_bytes=1000)
@@ -828,6 +1040,73 @@ class TestQuotaAndLimits:
         assert status["bytes"] > 0
         assert status["max_bytes"] == 1000
         assert status["pending_turns"] == 0
+        assert status["max_pending_turns"] == 100
+
+
+class TestRetentionCleanup:
+    def test_active_expired_conversation_deleted_but_archive_preserved(self, tmp_path):
+        store = _make_store(tmp_path, retention_days=1)
+        _do_turn(
+            store,
+            scope_key="ws:default:old",
+            client_id="old",
+            turn_id="t-old",
+        )
+        _do_turn(
+            store,
+            scope_key="ws:default:archive",
+            client_id="archive",
+            turn_id="t-archive",
+        )
+        archived = store.get_by_scope_key("ws:default:archive")
+        store.archive(archived["id"])
+        old_timestamp = time.time() - (2 * 86_400)
+        conn = get_history_connection(store.path)
+        try:
+            conn.execute("UPDATE conversations SET updated_at = ?", (old_timestamp,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = store.cleanup_expired(now=time.time())
+
+        assert result["conversations_deleted"] == 1
+        assert store.get_by_scope_key("ws:default:old") is None
+        assert store.get_by_scope_key("ws:default:archive") is not None
+
+    def test_expired_incomplete_turn_and_empty_stub_are_removed(self, tmp_path):
+        store = _make_store(tmp_path, incomplete_turn_retention_days=1)
+        began = _begin(store)
+        old_timestamp = time.time() - (2 * 86_400)
+        conn = get_history_connection(store.path)
+        try:
+            conn.execute(
+                """
+                UPDATE turn_requests
+                   SET updated_at = ?, lease_expires_at = ?
+                 WHERE conversation_id = ? AND turn_id = ?
+                """,
+                (
+                    old_timestamp,
+                    time.time() - 10,
+                    began["conversation"]["id"],
+                    "turn-1",
+                ),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (old_timestamp, began["conversation"]["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = store.cleanup_expired(now=time.time())
+
+        assert result["expired_leases_failed"] == 1
+        assert result["turns_deleted"] == 1
+        assert result["conversations_deleted"] == 1
+        assert store.get_by_scope_key("ws:default:conv-1") is None
 
 
 # ---------------------------------------------------------------------------

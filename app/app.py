@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional
@@ -34,8 +35,6 @@ from utils.auth import (
     api_key_has_scope,
     current_user,
     require_admin,
-    require_admin_or_api_any_scope,
-    require_admin_or_api_scope,
     require_admin_or_upload_api_key,
     require_api_scope,
     require_login,
@@ -132,6 +131,7 @@ CHAT_DATA_UPLOAD_EXTENSIONS = {"csv", "xlsx", "xls", "json", "parquet", "tsv", "
 CHAT_DISPLAY_UPLOAD_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "txt", "md"}
 CHAT_UPLOAD_EXTENSIONS = CHAT_DATA_UPLOAD_EXTENSIONS | CHAT_DISPLAY_UPLOAD_EXTENSIONS
 CHAT_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+CODE_RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{12}$")
 CODE_IMAGE_PATTERN = re.compile(r"^[0-9a-f]{12}_[A-Za-z0-9._-]+\.png$")
 _KNOWLEDGE_BASE_UNSET = object()
 
@@ -235,8 +235,6 @@ def create_app(test_config: dict | None = None) -> Flask:
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["WORKSPACE_DATA_DIR"], exist_ok=True)
     os.makedirs(app.config["WORKSPACE_UPLOAD_DIR"], exist_ok=True)
-    from utils.user_store import UserStore
-
     SettingsStore(app.config["SETTINGS_FILE"]).load()
     model_config_error = get_model_configuration_error()
     if model_config_error:
@@ -357,7 +355,6 @@ def create_app(test_config: dict | None = None) -> Flask:
                 store.update_api_key_usage(
                     user_id,
                     key_name,
-                    extra={"endpoint": endpoint, "status_code": status_code},
                 )
             except Exception:
                 pass
@@ -563,28 +560,33 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return limited
 
         try:
-            payload = _parse_query_payload(require_json=True)
+            payload = _parse_query_payload(
+                require_json=True,
+                default_persist_history=True,
+            )
             # Code interpreter mode
             if payload.get("use_code_interpreter") and payload.get("attached_files"):
                 if payload["stream"] and payload["stream_format"] == "ndjson":
+                    events = _prime_stream(
+                        run_code_interpreter_query_events(payload)
+                    )
                     return Response(
-                        stream_with_context(
-                            run_code_interpreter_query_events(payload)
-                        ),
+                        stream_with_context(events),
                         mimetype="application/x-ndjson",
                     )
                 return jsonify(run_code_interpreter_query(payload))
             if payload["stream"]:
                 if payload["stream_format"] == "ndjson":
+                    events = _prime_stream(run_rag_query_events(payload))
                     return Response(
-                        run_rag_query_events(payload),
+                        stream_with_context(events),
                         mimetype="application/x-ndjson",
                     )
                 stream = _prime_stream(
                     run_rag_query(payload, stream=True)
                 )
                 response = Response(
-                    stream,
+                    stream_with_context(stream),
                     mimetype="text/plain",
                 )
                 _set_query_knowledge_base_headers(response, payload)
@@ -1031,18 +1033,24 @@ def register_routes(app: Flask, rate_limiter: RateLimiter) -> None:
             return limited
 
         try:
-            payload = _parse_query_payload(require_json=True)
+            payload = _parse_query_payload(
+                require_json=True,
+                default_persist_history=False,
+            )
             if payload["stream"]:
                 if payload["stream_format"] == "ndjson":
+                    events = _prime_stream(
+                        run_rag_query_events(payload, public=True)
+                    )
                     return Response(
-                        run_rag_query_events(payload, public=True),
+                        stream_with_context(events),
                         mimetype="application/x-ndjson",
                     )
                 stream = _prime_stream(
                     run_rag_query(payload, stream=True, public=True)
                 )
                 response = Response(
-                    stream,
+                    stream_with_context(stream),
                     mimetype="text/plain",
                 )
                 _set_query_knowledge_base_headers(response, payload)
@@ -1202,6 +1210,11 @@ class TurnContext:
     replay_result: Optional[dict] = None
 
     @property
+    def history_id(self) -> Optional[str]:
+        conversation = getattr(self.outcome, "conversation", None) or {}
+        return conversation.get("id") if isinstance(conversation, dict) else None
+
+    @property
     def has_replay(self) -> bool:
         return self.replay_result is not None
 
@@ -1214,7 +1227,6 @@ def _begin_history_turn(
     """Begin a durable turn. Returns ``None`` for the legacy flow."""
 
     from utils.conversation_service import (
-        BeginTurnOutcome,
         ConversationTurnError,
         TurnRequest,
         compute_request_fingerprint,
@@ -1223,12 +1235,13 @@ def _begin_history_turn(
         get_conversation_service_for_workspace,
     )
 
-    # Check if history persistence is requested
     if not payload.get("persist_history", False):
+        payload["_history_status"] = "not_requested"
         return None
 
     turn_id = payload.get("turn_id")
     if not turn_id or not conversation_id:
+        payload["_history_status"] = "client_turn_id_required"
         return None
 
     # Extract workspace_id from configs or scope_key
@@ -1241,11 +1254,16 @@ def _begin_history_turn(
         except ConversationTurnError:
             return None
 
-    service = get_conversation_service_for_workspace(workspace_id)
+    service = get_conversation_service_for_workspace(
+        workspace_id,
+        app=current_app._get_current_object(),
+    )
     if not service.enabled:
+        payload["_history_status"] = "disabled"
         return None
 
     raw_conversation_id = payload.get("conversation_id")
+    prompt_ref = _history_prompt_ref(payload)
     fingerprint = compute_request_fingerprint(
         query=payload["query"],
         model=payload.get("model"),
@@ -1256,6 +1274,11 @@ def _begin_history_turn(
         system_prompt_id=payload.get("system_prompt_id"),
         response_language=payload.get("response_language"),
         client_context=payload.get("client_context"),
+        agent_id=payload.get("agent_id"),
+        system_prompt_scope=payload.get("system_prompt_scope"),
+        use_code_interpreter=payload.get("use_code_interpreter", False),
+        attached_files=payload.get("attached_files"),
+        extra={"parent_turn_id": payload.get("parent_turn_id")},
     )
     request = TurnRequest(
         scope_key=conversation_id,
@@ -1269,35 +1292,49 @@ def _begin_history_turn(
         agent_name=payload.get("agent_name") or "",
         provider_id=payload.get("provider") or "",
         model_id=payload.get("model") or "",
+        prompt_ref=prompt_ref,
         response_language=payload.get("response_language") or "auto",
         workspace_id=workspace_id,
+        recover_lost_result=bool(payload.get("regenerate_lost_result", False)),
     )
-
-    service.hydrate_for_prompt(conversation_id, conversation_id)
 
     outcome = service.begin_turn(request)
     if outcome.status == "disabled":
+        payload["_history_status"] = "disabled"
         return None
     if outcome.status == "new":
-        return TurnContext(
+        payload["_history_status"] = "pending"
+        turn_context = TurnContext(
             scope_key=conversation_id,
             turn_id=turn_id,
             lease_token=outcome.lease_token or "",
             request_fingerprint=fingerprint,
             outcome=outcome,
         )
+        with _history_lease_heartbeat(turn_context, conversation_id):
+            service.sync_for_prompt(conversation_id, conversation_id)
+        return turn_context
     if outcome.status == "ready":
         replay = _replay_result_from_staged(outcome.result, payload, configs)
-        return TurnContext(
+        payload["_history_status"] = "pending"
+        turn_context = TurnContext(
             scope_key=conversation_id,
             turn_id=turn_id,
-            lease_token="",
+            lease_token=outcome.lease_token or "",
             request_fingerprint=fingerprint,
             outcome=outcome,
             replay_result=replay,
         )
+        with _history_lease_heartbeat(turn_context, conversation_id):
+            service.sync_for_prompt(conversation_id, conversation_id)
+        return turn_context
     if outcome.status == "complete":
+        service.sync_for_prompt(conversation_id, conversation_id)
+        # Durable history is authoritative. A previous worker may have
+        # committed and crashed before updating its warm state.
+        _rehydrate_history_memory(service, conversation_id)
         replay = _replay_result_from_messages(outcome.messages, payload, configs)
+        payload["_history_status"] = "saved"
         return TurnContext(
             scope_key=conversation_id,
             turn_id=turn_id,
@@ -1319,40 +1356,71 @@ def _begin_history_turn(
             code="turn_id_conflict",
             status_code=409,
         )
+    if outcome.expected_parent_turn_id is not None or outcome.status in {
+        "continuity_error",
+        "continuity",
+    }:
+        raise ConversationTurnError(
+            outcome.error or "Continuità della conversazione non valida",
+            code="continuity_error",
+            status_code=409,
+            payload={
+                "expected_parent_turn_id": outcome.expected_parent_turn_id,
+            },
+        )
+    error_code = getattr(outcome, "code", None) or outcome.status or "turn_error"
     raise ConversationTurnError(
         outcome.error or "Impossibile avviare il turno",
-        code=outcome.status or "turn_error",
-        status_code=409,
+        code=error_code,
+        status_code=429 if "quota" in str(error_code) else 409,
     )
+
+
+def _history_prompt_ref(payload: dict) -> dict:
+    prompt_id = str(payload.get("system_prompt_id") or "").strip()
+    if not prompt_id:
+        return {}
+    return {
+        "id": prompt_id,
+        "scope": str(payload.get("system_prompt_scope") or "").strip(),
+    }
 
 
 def _replay_result_from_staged(result, payload, configs) -> dict:
     if not isinstance(result, dict):
         return {"answer": str(result), "context": [], "sources": []}
+    result = dict(result)
     if payload.get("conversation_id"):
         result["conversation_id"] = payload["conversation_id"]
     result.update(_query_knowledge_base_response_fields(configs))
+    result["replayed"] = True
     return result
 
 
 def _replay_result_from_messages(messages, payload, configs) -> dict:
-    answer = ""
-    model = payload.get("model") or ""
-    provider = payload.get("provider") or ""
+    assistant_message = {}
     for msg in reversed(messages or []):
         if msg.get("role") == "assistant":
-            answer = msg.get("content", "")
+            assistant_message = msg
             break
-    result = {
-        "answer": answer,
-        "model": model,
-        "provider": provider,
-        "provider_name": provider,
-        "context": [],
-        "sources": [],
-        "usage": None,
-        "replayed": True,
-    }
+    metadata = assistant_message.get("metadata") or {}
+    stored_payload = metadata.get("response_payload")
+    result = {}
+    if isinstance(stored_payload, dict):
+        result = dict(stored_payload)
+    result.setdefault("answer", assistant_message.get("content", ""))
+    result.setdefault("model", payload.get("model") or "")
+    result.setdefault("provider", payload.get("provider") or "")
+    result.setdefault("provider_name", result.get("provider") or "")
+    result.setdefault("context", [])
+    stored_sources = assistant_message.get("sources")
+    if not stored_sources:
+        stored_sources = result.get("sources")
+    result["sources"] = stored_sources or []
+    result.setdefault("usage", None)
+    result["replayed"] = True
+    result["history_status"] = "saved"
+    result["history_saved"] = True
     if payload.get("conversation_id"):
         result["conversation_id"] = payload["conversation_id"]
     result.update(_query_knowledge_base_response_fields(configs))
@@ -1365,8 +1433,13 @@ def _complete_history_turn(
     result,
     conversation_id: str,
     configs,
-) -> None:
+    *,
+    assistant_content: Optional[str] = None,
+    message_type: str = "text",
+    metadata: Optional[dict] = None,
+) -> dict:
     from utils.conversation_service import (
+        compute_result_digest,
         extract_workspace_id_from_scope,
         get_conversation_service_for_workspace,
     )
@@ -1376,29 +1449,270 @@ def _complete_history_turn(
     except Exception:
         workspace_id = ""
 
-    service = get_conversation_service_for_workspace(workspace_id)
+    service = get_conversation_service_for_workspace(
+        workspace_id,
+        app=current_app._get_current_object(),
+    )
     if not service.enabled:
-        return
-    assistant_content = ""
-    if isinstance(result, dict):
-        assistant_content = result.get("answer") or ""
+        return _apply_history_result(
+            result,
+            status="disabled",
+            saved=False,
+        )
+    if assistant_content is None:
+        assistant_content = ""
+        if isinstance(result, dict):
+            assistant_content = result.get("answer") or ""
     sources = result.get("sources") if isinstance(result, dict) else None
-    service.complete_turn(
-        scope_key=conversation_id,
-        turn_id=turn_ctx.turn_id,
-        lease_token=turn_ctx.lease_token,
-        request_fingerprint=turn_ctx.request_fingerprint,
-        user_content=payload["query"],
-        assistant_content=assistant_content,
-        selected_knowledge_base_ids=payload.get("knowledge_base_ids"),
-        agent_id=payload.get("agent_id") or "",
-        agent_name=payload.get("agent_name") or "",
-        provider_id=payload.get("provider") or "",
-        model_id=payload.get("model") or "",
-        response_language=payload.get("response_language") or "auto",
-        sources=sources,
-        warm_conversation_id=conversation_id,
-        warm_knowledge_base_ids=payload.get("knowledge_base_ids"),
+    history_metadata = _history_metadata_for_result(result)
+    if isinstance(payload.get("attached_files"), list):
+        history_metadata.setdefault("response_payload", {})[
+            "attachments"
+        ] = _history_attachment_payload(payload["attached_files"])
+    if metadata:
+        history_metadata.update(metadata)
+
+    result_payload = result if isinstance(result, dict) else {}
+    provider_id = result_payload.get("provider") or payload.get("provider") or ""
+    model_id = result_payload.get("model") or payload.get("model") or ""
+    response_language = (
+        result_payload.get("response_language")
+        or payload.get("response_language")
+        or "auto"
+    )
+
+    try:
+        if turn_ctx.lease_token:
+            staged = service.stage_result(
+                conversation_id,
+                turn_ctx.turn_id,
+                lease_token=turn_ctx.lease_token,
+                result=result,
+                result_digest=compute_result_digest(result),
+            )
+            if not staged:
+                log.warning("Unable to stage history turn %s", turn_ctx.turn_id)
+
+        outcome = service.complete_turn(
+            scope_key=conversation_id,
+            turn_id=turn_ctx.turn_id,
+            lease_token=turn_ctx.lease_token,
+            request_fingerprint=turn_ctx.request_fingerprint,
+            user_content=payload["query"],
+            assistant_content=assistant_content,
+            selected_knowledge_base_ids=payload.get("knowledge_base_ids"),
+            agent_id=payload.get("agent_id") or "",
+            agent_name=payload.get("agent_name") or "",
+            provider_id=provider_id,
+            model_id=model_id,
+            prompt_ref=_history_prompt_ref(payload),
+            response_language=response_language,
+            sources=sources,
+            metadata=history_metadata,
+            message_type=message_type,
+            warm_conversation_id=conversation_id,
+            warm_knowledge_base_ids=payload.get("knowledge_base_ids"),
+        )
+    except Exception:
+        log.exception("Unable to persist history turn %s", turn_ctx.turn_id)
+        service.fail_turn(
+            turn_ctx.scope_key,
+            turn_ctx.turn_id,
+            turn_ctx.lease_token or None,
+        )
+        payload["_history_status"] = "error"
+        return _apply_history_result(
+            result,
+            status="error",
+            saved=False,
+            history_id=turn_ctx.history_id,
+            error="history_persistence_failed",
+        )
+
+    if outcome.status != "complete":
+        payload["_history_status"] = outcome.status or "error"
+        return _apply_history_result(
+            result,
+            status=outcome.status or "error",
+            saved=False,
+            history_id=turn_ctx.history_id,
+            error=outcome.error,
+        )
+
+    _persist_history_summary(service, outcome, conversation_id)
+    payload["_history_status"] = "saved"
+    return _apply_history_result(
+        result,
+        status="saved",
+        saved=True,
+        history_id=turn_ctx.history_id,
+        replayed=outcome.replayed,
+    )
+
+
+def _history_metadata_for_result(result) -> dict:
+    if not isinstance(result, dict):
+        return {}
+    response_payload = {}
+    for key in (
+        "type",
+        "model",
+        "provider",
+        "provider_name",
+        "response_language",
+        "knowledge_base_id",
+        "agent_id",
+        "agent_name",
+    ):
+        if key in result:
+            response_payload[key] = _history_text(result.get(key), 500)
+    if "code" in result:
+        response_payload["code"] = _history_text(result.get("code"), 24_000)
+    if isinstance(result.get("result"), dict):
+        interpreter_result = result["result"]
+        persisted_interpreter_result = {
+            "success": bool(interpreter_result.get("success")),
+            "text": _history_text(interpreter_result.get("text"), 16_000),
+            "error": _history_text(interpreter_result.get("error"), 4_000),
+            "images": [
+                _history_text(image, 512)
+                for image in (interpreter_result.get("images") or [])[:32]
+                if isinstance(image, str)
+            ],
+        }
+        run_id = str(interpreter_result.get("run_id") or "").strip().lower()
+        if CODE_RUN_ID_PATTERN.fullmatch(run_id):
+            persisted_interpreter_result["run_id"] = run_id
+        response_payload["result"] = persisted_interpreter_result
+    if isinstance(result.get("attachments"), list):
+        response_payload["attachments"] = _history_attachment_payload(
+            result["attachments"]
+        )
+    for key in ("knowledge_base_ids", "usage"):
+        if key in result:
+            response_payload[key] = result.get(key)
+    return {"response_payload": response_payload} if response_payload else {}
+
+
+def _history_text(value, max_chars: int) -> str:
+    return str(value or "")[:max_chars]
+
+
+def _history_attachment_payload(items) -> list[dict]:
+    attachments = []
+    for item in list(items or [])[:32]:
+        if not isinstance(item, dict):
+            continue
+        attachment = {}
+        for key in ("id", "file_id", "name", "type", "size"):
+            if key not in item:
+                continue
+            value = item.get(key)
+            if key == "size" and isinstance(value, (int, float)):
+                attachment[key] = int(value)
+            else:
+                attachment[key] = _history_text(value, 500)
+        attachments.append(attachment)
+    return attachments
+
+
+def _persist_history_summary(service, outcome, scope_key: str) -> None:
+    """Persist warm-memory compaction without making a saved turn fail."""
+
+    summary_job = getattr(outcome, "summary_job", None)
+    if summary_job is None:
+        return
+    try:
+        from utils.conversation_memory import fallback_summary
+
+        conversation = service.get_conversation(scope_key)
+        if not conversation:
+            return
+        summary = fallback_summary(summary_job)
+        current_cursor = int(conversation.get("summary_through_sequence") or 0)
+        through_sequence = getattr(summary_job, "through_sequence", None)
+        if through_sequence is None:
+            _rehydrate_history_memory(service, scope_key)
+            return
+        through_sequence = int(through_sequence)
+        if through_sequence <= current_cursor:
+            _rehydrate_history_memory(service, scope_key)
+            return
+        summarized_sequences = [
+            int(turn.assistant_sequence)
+            for turn in summary_job.turns_to_summarize
+            if turn.assistant_sequence is not None
+        ]
+        expected_sequences = list(
+            range(current_cursor + 2, through_sequence + 1, 2)
+        )
+        if summarized_sequences != expected_sequences:
+            log.warning(
+                "Skipping non-contiguous durable summary for %s",
+                scope_key,
+            )
+            _rehydrate_history_memory(service, scope_key)
+            return
+        persisted = service.update_summary(
+            scope_key,
+            summary,
+            expected_version=int(conversation.get("summary_version") or 0),
+            through_sequence=through_sequence,
+        )
+        if not persisted:
+            _rehydrate_history_memory(service, scope_key)
+            return
+        if not service.memory_store.apply_summary(summary_job, summary):
+            _rehydrate_history_memory(service, scope_key)
+    except Exception as exc:
+        log.warning("Unable to persist conversation summary for %s: %s", scope_key, exc)
+
+
+def _rehydrate_history_memory(service, scope_key: str) -> None:
+    """Replace stale warm state with the authoritative durable snapshot."""
+
+    try:
+        service.rehydrate_for_prompt(scope_key, scope_key)
+    except Exception as exc:
+        log.warning("Unable to rehydrate conversation memory for %s: %s", scope_key, exc)
+
+
+def _apply_history_result(
+    result,
+    *,
+    status: str,
+    saved: bool,
+    history_id: Optional[str] = None,
+    error: Optional[str] = None,
+    replayed: bool = False,
+) -> dict:
+    if not isinstance(result, dict):
+        result = {
+            "history_status": status,
+            "history_saved": saved,
+        }
+    else:
+        result["history_status"] = status
+        result["history_saved"] = saved
+    if history_id:
+        result["history_id"] = history_id
+    if error:
+        result["history_error"] = error
+    if replayed:
+        result["replayed"] = True
+    return result
+
+
+def _apply_history_preflight_status(payload: dict, result) -> dict:
+    status = payload.get("_history_status")
+    if not status:
+        status = "disabled"
+        if not payload.get("persist_history"):
+            status = "not_requested"
+    return _apply_history_result(
+        result,
+        status=status,
+        saved=False,
     )
 
 
@@ -1417,13 +1731,82 @@ def _fail_history_turn(turn_ctx: Optional[TurnContext], conversation_id: Optiona
         except Exception:
             pass
 
-    service = get_conversation_service_for_workspace(workspace_id)
+    service = get_conversation_service_for_workspace(
+        workspace_id,
+        app=current_app._get_current_object(),
+    )
     if not service.enabled:
         return
     service.fail_turn(turn_ctx.scope_key, turn_ctx.turn_id, turn_ctx.lease_token or None)
 
 
+@contextmanager
+def _history_lease_heartbeat(
+    turn_ctx: Optional[TurnContext],
+    conversation_id: Optional[str],
+):
+    """Keep ownership of a durable turn during slow provider work."""
+
+    if turn_ctx is None or not turn_ctx.lease_token or not conversation_id:
+        yield
+        return
+
+    from utils.conversation_service import (
+        extract_workspace_id_from_scope,
+        get_conversation_service_for_workspace,
+    )
+
+    try:
+        workspace_id = extract_workspace_id_from_scope(conversation_id)
+        service = get_conversation_service_for_workspace(
+            workspace_id,
+            app=current_app._get_current_object(),
+        )
+        lease_seconds = float(
+            getattr(service.history_store, "lease_seconds", 900) or 900
+        )
+    except Exception:
+        yield
+        return
+
+    stop = threading.Event()
+
+    def renew() -> None:
+        interval = max(0.25, min(30.0, lease_seconds / 3.0))
+        while not stop.wait(interval):
+            if not service.renew_turn_lease(
+                turn_ctx.scope_key,
+                turn_ctx.turn_id,
+                turn_ctx.lease_token,
+            ):
+                log.warning(
+                    "Conversation lease ownership lost for turn %s",
+                    turn_ctx.turn_id,
+                )
+                return
+
+    worker = threading.Thread(
+        target=renew,
+        name=f"conversation-lease-{turn_ctx.turn_id[:16]}",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
+
+
 def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
+    """Dispatch to the explicit synchronous or text-stream implementation."""
+
+    if stream:
+        return _run_rag_text_stream(payload, public=public)
+    return _run_rag_query_once(payload, public=public)
+
+
+def _run_rag_query_once(payload: dict, *, public: bool = False):
     from utils.index_lock import (
         assert_distributed_locks_healthy,
         lifecycle_read_locks,
@@ -1451,15 +1834,6 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
             primary,
             plural_request=payload.get("knowledge_base_ids_explicit", False),
         )
-        turn_ctx = _begin_history_turn(payload, conversation_id, configs)
-        if turn_ctx is not None and turn_ctx.has_replay and not stream:
-            return turn_ctx.replay_result
-        if turn_ctx is not None and turn_ctx.has_replay and stream:
-            return _replay_stream(turn_ctx, payload, conversation_id, configs)
-        conversation_snapshot = _validate_conversation_knowledge_bases(
-            conversation_id,
-            configs,
-        )
         custom_system = _resolve_system_prompt(
             payload.get("system_prompt_id"),
             payload.get("system_prompt_scope"),
@@ -1469,71 +1843,91 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
         ):
             _raise_if_query_knowledge_bases_became_unavailable(configs)
             assert_distributed_locks_healthy()
-            _ensure_request_not_timed_out()
-            extra_context_docs = _temporary_attachment_context_docs(
-                payload,
-                primary,
-            )
-            result = query_rag(
-                payload["query"],
-                model=payload.get("model"),
-                provider=payload.get("provider"),
-                stream=stream,
-                temperature=payload.get("temperature"),
-                k=payload.get("k"),
-                settings_path=primary["SETTINGS_FILE"],
-                file_index_path=primary["FILE_INDEX"],
-                collection_name=primary["CHROMA_COLLECTION"],
-                knowledge_base_targets=targets,
-                conversation_knowledge_base_ids=selected_ids,
-                conversation_prompt_context=(
-                    conversation_snapshot.prompt_context
-                ),
-                conversation_retrieval_context=(
-                    conversation_snapshot.retrieval_context
-                ),
-                conversation_id=conversation_id,
-                client_context=payload.get("client_context"),
-                response_language=payload.get("response_language"),
-                public=public,
-                custom_system_prompt=custom_system,
-                extra_context_docs=extra_context_docs,
-            )
-            _ensure_request_not_timed_out()
-            if isinstance(result, dict) and raw_conversation_id:
-                result["conversation_id"] = raw_conversation_id
-            if isinstance(result, dict):
-                result.update(_query_knowledge_base_response_fields(configs))
-                _add_knowledge_base_to_download_urls(
-                    result.get("context"),
-                    primary["KNOWLEDGE_BASE_ID"],
+            # Reservation, authoritative warm catch-up, union-KB validation,
+            # replay and provider work share the same global lifecycle read
+            # gate. A KB hard-delete therefore cannot erase a multi-KB
+            # conversation between its snapshot and completion.
+            turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+            with _history_lease_heartbeat(turn_ctx, conversation_id):
+                conversation_snapshot = _validate_conversation_knowledge_bases(
+                    conversation_id,
+                    configs,
+                    strict=turn_ctx is not None,
                 )
-                if payload.get("agent_id"):
-                    result["agent_id"] = payload["agent_id"]
-                    result["agent_name"] = payload.get("agent_name")
-                
-                # Add history status
-                if turn_ctx is not None:
-                    result["history_status"] = "saved"
-                    result["history_saved"] = True
-                elif payload.get("persist_history"):
-                    result["history_status"] = "not_requested"
-                    result["history_saved"] = False
-                else:
-                    result["history_status"] = "disabled"
-                    result["history_saved"] = False
-                
-                if turn_ctx is not None:
-                    _complete_history_turn(
-                        turn_ctx, payload, result, conversation_id, configs
+                if turn_ctx is not None and turn_ctx.has_replay:
+                    if getattr(turn_ctx.outcome, "status", "") == "ready":
+                        _complete_history_turn(
+                            turn_ctx,
+                            payload,
+                            turn_ctx.replay_result,
+                            conversation_id,
+                            configs,
+                        )
+                    else:
+                        _apply_history_result(
+                            turn_ctx.replay_result,
+                            status="saved",
+                            saved=True,
+                            history_id=turn_ctx.history_id,
+                            replayed=True,
+                        )
+                    return turn_ctx.replay_result
+
+                _ensure_request_not_timed_out()
+                extra_context_docs = _temporary_attachment_context_docs(
+                    payload,
+                    primary,
+                )
+                result = query_rag(
+                    payload["query"],
+                    model=payload.get("model"),
+                    provider=payload.get("provider"),
+                    stream=False,
+                    temperature=payload.get("temperature"),
+                    k=payload.get("k"),
+                    settings_path=primary["SETTINGS_FILE"],
+                    file_index_path=primary["FILE_INDEX"],
+                    collection_name=primary["CHROMA_COLLECTION"],
+                    knowledge_base_targets=targets,
+                    conversation_knowledge_base_ids=selected_ids,
+                    conversation_prompt_context=(
+                        conversation_snapshot.prompt_context
+                    ),
+                    conversation_retrieval_context=(
+                        conversation_snapshot.retrieval_context
+                    ),
+                    append_conversation_turn=turn_ctx is None,
+                    conversation_id=conversation_id,
+                    client_context=payload.get("client_context"),
+                    response_language=payload.get("response_language"),
+                    public=public,
+                    custom_system_prompt=custom_system,
+                    extra_context_docs=extra_context_docs,
+                )
+                _ensure_request_not_timed_out()
+                if isinstance(result, dict) and raw_conversation_id:
+                    result["conversation_id"] = raw_conversation_id
+                if isinstance(result, dict):
+                    result.update(_query_knowledge_base_response_fields(configs))
+                    _add_knowledge_base_to_download_urls(
+                        result.get("context"),
+                        primary["KNOWLEDGE_BASE_ID"],
                     )
-            elif stream:
-                result = _guard_stream_for_knowledge_bases(result, configs)
-                if turn_ctx is not None:
-                    result = _wrap_stream_for_history(
-                        result, turn_ctx, payload, conversation_id, configs
-                    )
-            return result
+                    if payload.get("agent_id"):
+                        result["agent_id"] = payload["agent_id"]
+                        result["agent_name"] = payload.get("agent_name")
+
+                    if turn_ctx is not None:
+                        _complete_history_turn(
+                            turn_ctx,
+                            payload,
+                            result,
+                            conversation_id,
+                            configs,
+                        )
+                    else:
+                        _apply_history_preflight_status(payload, result)
+                return result
     except RequestTimeoutExceeded:
         status = "timeout"
         _fail_history_turn(turn_ctx, conversation_id)
@@ -1545,8 +1939,97 @@ def run_rag_query(payload: dict, stream: bool = False, public: bool = False):
         raise
     finally:
         metrics.end_query()
-        duration = time.time() - start
-        metrics.observe_query(duration=duration, status=status)
+        metrics.observe_query(duration=time.time() - start, status=status)
+
+
+def _run_rag_text_stream(payload: dict, *, public: bool = False):
+    """Yield text while one lifecycle lock and turn lease remain active."""
+
+    from utils.index_lock import (
+        assert_distributed_locks_healthy,
+        lifecycle_read_locks,
+    )
+    from utils.rag_engine import query_rag
+    from utils.metrics import get_metrics
+
+    def generate():
+        metrics = get_metrics()
+        metrics.begin_query()
+        start = time.time()
+        status = "success"
+        configs = ()
+        conversation_id: Optional[str] = None
+
+        try:
+            _ensure_request_not_timed_out()
+            selected_ids = _payload_query_knowledge_base_ids(payload)
+            configs = _query_configs_for_payload(current_app, payload)
+            primary = configs[0]
+            targets = _knowledge_base_query_targets(configs)
+            raw_conversation_id = payload.get("conversation_id")
+            conversation_id = _query_scoped_conversation_id(
+                raw_conversation_id,
+                primary,
+                plural_request=payload.get("knowledge_base_ids_explicit", False),
+            )
+            custom_system = _resolve_system_prompt(
+                payload.get("system_prompt_id"),
+                payload.get("system_prompt_scope"),
+            )
+
+            with lifecycle_read_locks(
+                config["CHROMA_COLLECTION"] for config in configs
+            ):
+                _raise_if_query_knowledge_bases_became_unavailable(configs)
+                assert_distributed_locks_healthy()
+                conversation_snapshot = _validate_conversation_knowledge_bases(
+                    conversation_id,
+                    configs,
+                )
+                _ensure_request_not_timed_out()
+                extra_context_docs = _temporary_attachment_context_docs(
+                    payload,
+                    primary,
+                )
+                stream = query_rag(
+                    payload["query"],
+                    model=payload.get("model"),
+                    provider=payload.get("provider"),
+                    stream=True,
+                    temperature=payload.get("temperature"),
+                    k=payload.get("k"),
+                    settings_path=primary["SETTINGS_FILE"],
+                    file_index_path=primary["FILE_INDEX"],
+                    collection_name=primary["CHROMA_COLLECTION"],
+                    knowledge_base_targets=targets,
+                    conversation_knowledge_base_ids=selected_ids,
+                    conversation_prompt_context=(
+                        conversation_snapshot.prompt_context
+                    ),
+                    conversation_retrieval_context=(
+                        conversation_snapshot.retrieval_context
+                    ),
+                    append_conversation_turn=True,
+                    conversation_id=conversation_id,
+                    client_context=payload.get("client_context"),
+                    response_language=payload.get("response_language"),
+                    public=public,
+                    custom_system_prompt=custom_system,
+                    extra_context_docs=extra_context_docs,
+                )
+                yield from stream
+        except RequestTimeoutExceeded:
+            status = "timeout"
+            raise
+        except Exception:
+            status = "error"
+            _raise_if_query_knowledge_bases_became_unavailable(configs)
+            raise
+        finally:
+            metrics.end_query()
+            metrics.observe_query(duration=time.time() - start, status=status)
+
+    return generate()
 
 
 def run_rag_query_events(payload: dict, public: bool = False):
@@ -1557,44 +2040,57 @@ def run_rag_query_events(payload: dict, public: bool = False):
     from utils.rag_engine import query_rag_stream_events
     from utils.metrics import get_metrics
 
-    metrics = get_metrics()
-    metrics.begin_query()
-    start = time.time()
-    status = "success"
-
-    selected_ids = _payload_query_knowledge_base_ids(payload)
-    configs = _query_configs_for_payload(current_app, payload)
-    primary = configs[0]
-    targets = _knowledge_base_query_targets(configs)
-    _ensure_request_not_timed_out()
-    raw_conversation_id = payload.get("conversation_id")
-    conversation_id = _query_scoped_conversation_id(
-        raw_conversation_id,
-        primary,
-        plural_request=payload.get("knowledge_base_ids_explicit", False),
-    )
-    turn_ctx = _begin_history_turn(payload, conversation_id, configs)
-    if turn_ctx is not None and turn_ctx.has_replay:
-        return _replay_events(turn_ctx, payload, conversation_id, configs)
-    conversation_snapshot = _validate_conversation_knowledge_bases(
-        conversation_id,
-        configs,
-    )
-    custom_system = _resolve_system_prompt(
-        payload.get("system_prompt_id"),
-        payload.get("system_prompt_scope"),
-    )
-
     def encode_events():
-        nonlocal status
-        final_answer = ""
-        turn_completed = False
+        metrics = get_metrics()
+        metrics.begin_query()
+        start = time.time()
+        status = "success"
+        configs = ()
+        turn_ctx = None
+        conversation_id: Optional[str] = None
+        history_finalized = False
         try:
-            with lifecycle_read_locks(
-                config["CHROMA_COLLECTION"] for config in configs
-            ):
+            selected_ids = _payload_query_knowledge_base_ids(payload)
+            configs = _query_configs_for_payload(current_app, payload)
+            primary = configs[0]
+            targets = _knowledge_base_query_targets(configs)
+            _ensure_request_not_timed_out()
+            raw_conversation_id = payload.get("conversation_id")
+            conversation_id = _query_scoped_conversation_id(
+                raw_conversation_id,
+                primary,
+                plural_request=payload.get("knowledge_base_ids_explicit", False),
+            )
+            custom_system = _resolve_system_prompt(
+                payload.get("system_prompt_id"),
+                payload.get("system_prompt_scope"),
+            )
+            with ExitStack() as request_resources:
+                request_resources.enter_context(
+                    lifecycle_read_locks(
+                        config["CHROMA_COLLECTION"] for config in configs
+                    )
+                )
                 _raise_if_query_knowledge_bases_became_unavailable(configs)
                 assert_distributed_locks_healthy()
+                turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+                request_resources.enter_context(
+                    _history_lease_heartbeat(turn_ctx, conversation_id)
+                )
+                conversation_snapshot = _validate_conversation_knowledge_bases(
+                    conversation_id,
+                    configs,
+                    strict=turn_ctx is not None,
+                )
+                if turn_ctx is not None and turn_ctx.has_replay:
+                    yield from _replay_events(
+                        turn_ctx,
+                        payload,
+                        conversation_id,
+                        configs,
+                    )
+                    history_finalized = True
+                    return
                 extra_context_docs = _temporary_attachment_context_docs(
                     payload,
                     primary,
@@ -1617,6 +2113,7 @@ def run_rag_query_events(payload: dict, public: bool = False):
                     conversation_retrieval_context=(
                         conversation_snapshot.retrieval_context
                     ),
+                    append_conversation_turn=turn_ctx is None,
                     conversation_id=conversation_id,
                     client_context=payload.get("client_context"),
                     response_language=payload.get("response_language"),
@@ -1658,8 +2155,19 @@ def run_rag_query_events(payload: dict, public: bool = False):
                         and event.get("type") == "done"
                         and isinstance(event.get("answer"), str)
                     ):
-                        final_answer = event["answer"]
-                        turn_completed = True
+                        if turn_ctx is not None:
+                            _complete_history_turn(
+                                turn_ctx,
+                                payload,
+                                event,
+                                conversation_id,
+                                configs,
+                            )
+                            history_finalized = True
+                        else:
+                            _apply_history_preflight_status(payload, event)
+                    elif isinstance(event, dict) and event.get("type") == "error":
+                        status = "error"
                     if (
                         raw_conversation_id
                         and isinstance(event, dict)
@@ -1690,44 +2198,13 @@ def run_rag_query_events(payload: dict, public: bool = False):
                 return
             raise
         finally:
-            if turn_ctx is not None:
-                if status == "success" and turn_completed:
-                    _complete_history_turn(
-                        turn_ctx,
-                        payload,
-                        {"answer": final_answer},
-                        conversation_id,
-                        configs,
-                    )
-                else:
-                    _fail_history_turn(turn_ctx, conversation_id)
+            if turn_ctx is not None and not history_finalized:
+                _fail_history_turn(turn_ctx, conversation_id)
             metrics.end_query()
             duration = time.time() - start
             metrics.observe_query(duration=duration, status=status)
 
     return encode_events()
-
-
-def _guard_stream_for_knowledge_bases(stream, configs):
-    def guarded():
-        from utils.index_lock import lifecycle_read_locks
-
-        try:
-            with lifecycle_read_locks(
-                config["CHROMA_COLLECTION"] for config in configs
-            ):
-                _raise_if_query_knowledge_bases_became_unavailable(configs)
-                yield from stream
-        except Exception:
-            _raise_if_query_knowledge_bases_became_unavailable(configs)
-            raise
-
-    return guarded()
-
-
-def _guard_stream_for_knowledge_base(stream, config: dict):
-    """Backward-compatible single-KB stream guard."""
-    return _guard_stream_for_knowledge_bases(stream, (config,))
 
 
 def _prime_stream(stream):
@@ -1745,23 +2222,6 @@ def _prime_stream(stream):
     return combined()
 
 
-def _replay_stream(turn_ctx, payload, conversation_id, configs):
-    """Yield a staged replay result as a text stream and complete the turn."""
-
-    answer = ""
-    if isinstance(turn_ctx.replay_result, dict):
-        answer = turn_ctx.replay_result.get("answer", "")
-    try:
-        yield answer
-    except Exception:
-        _fail_history_turn(turn_ctx, conversation_id)
-        raise
-    else:
-        _complete_history_turn(
-            turn_ctx, payload, {"answer": answer}, conversation_id, configs
-        )
-
-
 def _replay_events(turn_ctx, payload, conversation_id, configs):
     """Yield a staged replay result as NDJSON events and complete the turn."""
 
@@ -1771,68 +2231,62 @@ def _replay_events(turn_ctx, payload, conversation_id, configs):
     provider = replay.get("provider", payload.get("provider") or "")
     provider_name = replay.get("provider_name", provider)
     raw_conversation_id = payload.get("conversation_id")
-    try:
-        meta_event = {
-            "type": "meta",
-            "model": model,
-            "provider": provider,
-            "provider_name": provider_name,
-            "response_language": payload.get("response_language", "auto"),
-            "replayed": True,
-        }
-        if raw_conversation_id:
-            meta_event["conversation_id"] = raw_conversation_id
-        meta_event.update(_query_knowledge_base_response_fields(configs))
-        if payload.get("agent_id"):
-            meta_event["agent_id"] = payload["agent_id"]
-            meta_event["agent_name"] = payload.get("agent_name")
-        yield json.dumps(meta_event, ensure_ascii=False) + "\n"
+    meta_event = {
+        "type": "meta",
+        "model": model,
+        "provider": provider,
+        "provider_name": provider_name,
+        "response_language": payload.get("response_language", "auto"),
+        "replayed": True,
+    }
+    if raw_conversation_id:
+        meta_event["conversation_id"] = raw_conversation_id
+    meta_event.update(_query_knowledge_base_response_fields(configs))
+    if payload.get("agent_id"):
+        meta_event["agent_id"] = payload["agent_id"]
+        meta_event["agent_name"] = payload.get("agent_name")
 
-        done_event = {
-            "type": "done",
-            "answer": answer,
-            "model": model,
-            "provider": provider,
-            "provider_name": provider_name,
-            "replayed": True,
-        }
-        if raw_conversation_id:
-            done_event["conversation_id"] = raw_conversation_id
-        done_event.update(_query_knowledge_base_response_fields(configs))
-        if payload.get("agent_id"):
-            done_event["agent_id"] = payload["agent_id"]
-            done_event["agent_name"] = payload.get("agent_name")
+    done_event = {
+        "type": "done",
+        "answer": answer,
+        "model": model,
+        "provider": provider,
+        "provider_name": provider_name,
+        "replayed": True,
+        "context": replay.get("context") or [],
+        "sources": replay.get("sources") or [],
+    }
+    if raw_conversation_id:
+        done_event["conversation_id"] = raw_conversation_id
+    done_event.update(_query_knowledge_base_response_fields(configs))
+    if payload.get("agent_id"):
+        done_event["agent_id"] = payload["agent_id"]
+        done_event["agent_name"] = payload.get("agent_name")
+
+    try:
+        # Finalize a staged replay before exposing even the first event.  A
+        # slow client must not leave a ready lease open after seeing ``meta``.
+        if getattr(turn_ctx.outcome, "status", "") == "ready":
+            _complete_history_turn(
+                turn_ctx,
+                payload,
+                done_event,
+                conversation_id,
+                configs,
+            )
+        else:
+            _apply_history_result(
+                done_event,
+                status="saved",
+                saved=True,
+                history_id=turn_ctx.history_id,
+                replayed=True,
+            )
+        yield json.dumps(meta_event, ensure_ascii=False) + "\n"
         yield json.dumps(done_event, ensure_ascii=False) + "\n"
     except Exception:
         _fail_history_turn(turn_ctx, conversation_id)
         raise
-    else:
-        _complete_history_turn(
-            turn_ctx, payload, {"answer": answer}, conversation_id, configs
-        )
-
-
-def _wrap_stream_for_history(stream, turn_ctx, payload, conversation_id, configs):
-    """Wrap a text stream to complete/fail the durable turn on exhaustion."""
-
-    collected = []
-
-    try:
-        for chunk in stream:
-            if isinstance(chunk, str):
-                collected.append(chunk)
-            yield chunk
-    except Exception:
-        _fail_history_turn(turn_ctx, conversation_id)
-        raise
-    else:
-        _complete_history_turn(
-            turn_ctx,
-            payload,
-            {"answer": "".join(collected)},
-            conversation_id,
-            configs,
-        )
 
 
 def _raise_if_knowledge_base_became_unavailable(config: dict | None) -> None:
@@ -1934,12 +2388,56 @@ def run_code_interpreter_query(payload: dict) -> dict:
     metrics.begin_query()
     start = time.time()
     status = "success"
+    turn_ctx = None
+    conversation_id = None
     try:
         configs = _query_configs_for_payload(current_app, payload)
-        with lifecycle_read_locks(
-            config["CHROMA_COLLECTION"] for config in configs
-        ):
+        conversation_id = _query_scoped_conversation_id(
+            payload.get("conversation_id"),
+            configs[0],
+            plural_request=payload.get("knowledge_base_ids_explicit", False),
+        )
+        with ExitStack() as request_resources:
+            request_resources.enter_context(
+                lifecycle_read_locks(
+                    config["CHROMA_COLLECTION"] for config in configs
+                )
+            )
             _raise_if_query_knowledge_bases_became_unavailable(configs)
+            turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+            request_resources.enter_context(
+                _history_lease_heartbeat(turn_ctx, conversation_id)
+            )
+            # Validate the full remembered KB union while the global read
+            # gate is held, including replay-only requests.
+            _validate_conversation_knowledge_bases(
+                conversation_id,
+                configs,
+                strict=turn_ctx is not None,
+            )
+            if turn_ctx is not None and turn_ctx.has_replay:
+                replay = turn_ctx.replay_result or {}
+                if getattr(turn_ctx.outcome, "status", "") == "ready":
+                    _complete_history_turn(
+                        turn_ctx,
+                        payload,
+                        replay,
+                        conversation_id,
+                        configs,
+                        assistant_content=_code_interpreter_answer_summary(
+                            replay.get("result") or {}
+                        ),
+                        message_type="code_interpreter",
+                    )
+                else:
+                    _apply_history_result(
+                        replay,
+                        status="saved",
+                        saved=True,
+                        history_id=turn_ctx.history_id,
+                        replayed=True,
+                    )
+                return replay
             _ensure_request_not_timed_out()
             prepared = _prepare_code_interpreter_run(
                 payload,
@@ -1950,13 +2448,28 @@ def run_code_interpreter_query(payload: dict) -> dict:
             _ensure_request_not_timed_out()
             result = _execute_interpreter_code(prepared, code)
             _ensure_request_not_timed_out()
-            _append_code_interpreter_conversation_turn(payload, prepared, result)
-            return _code_interpreter_response(prepared, code, result)
+            response = _code_interpreter_response(prepared, code, result)
+            if turn_ctx is not None:
+                _complete_history_turn(
+                    turn_ctx,
+                    payload,
+                    response,
+                    conversation_id,
+                    configs,
+                    assistant_content=_code_interpreter_answer_summary(result),
+                    message_type="code_interpreter",
+                )
+            else:
+                _append_code_interpreter_conversation_turn(payload, prepared, result)
+                _apply_history_preflight_status(payload, response)
+            return response
     except RequestTimeoutExceeded:
         status = "timeout"
+        _fail_history_turn(turn_ctx, conversation_id)
         raise
     except Exception:
         status = "error"
+        _fail_history_turn(turn_ctx, conversation_id)
         raise
     finally:
         metrics.end_query()
@@ -1967,21 +2480,88 @@ def run_code_interpreter_query_events(payload: dict):
     """NDJSON event stream for code interpreter mode."""
     from utils.index_lock import lifecycle_read_locks
     from utils.metrics import get_metrics
+    from utils.conversation_service import ConversationTurnError
 
     metrics = get_metrics()
     metrics.begin_query()
     start = time.time()
     status = "success"
+    turn_ctx = None
+    conversation_id = None
+    history_finalized = False
 
     def encode(event: dict) -> str:
         return json.dumps(event, ensure_ascii=False) + "\n"
 
     try:
         configs = _query_configs_for_payload(current_app, payload)
-        with lifecycle_read_locks(
-            config["CHROMA_COLLECTION"] for config in configs
-        ):
+        conversation_id = _query_scoped_conversation_id(
+            payload.get("conversation_id"),
+            configs[0],
+            plural_request=payload.get("knowledge_base_ids_explicit", False),
+        )
+        with ExitStack() as request_resources:
+            request_resources.enter_context(
+                lifecycle_read_locks(
+                    config["CHROMA_COLLECTION"] for config in configs
+                )
+            )
             _raise_if_query_knowledge_bases_became_unavailable(configs)
+            turn_ctx = _begin_history_turn(payload, conversation_id, configs)
+            request_resources.enter_context(
+                _history_lease_heartbeat(turn_ctx, conversation_id)
+            )
+            _validate_conversation_knowledge_bases(
+                conversation_id,
+                configs,
+                strict=turn_ctx is not None,
+            )
+            if turn_ctx is not None and turn_ctx.has_replay:
+                replay = dict(turn_ctx.replay_result or {})
+                meta = {
+                    "type": "meta",
+                    "model": replay.get("model") or payload.get("model") or "",
+                    "provider": replay.get("provider")
+                    or payload.get("provider")
+                    or "",
+                    "provider_name": replay.get("provider_name")
+                    or replay.get("provider")
+                    or "",
+                    "response_language": replay.get("response_language")
+                    or payload.get("response_language")
+                    or "auto",
+                    "conversation_id": payload.get("conversation_id"),
+                    "replayed": True,
+                    **_query_knowledge_base_response_fields(configs),
+                }
+                replay["type"] = "done"
+                replay["replayed"] = True
+                if getattr(turn_ctx.outcome, "status", "") == "ready":
+                    _complete_history_turn(
+                        turn_ctx,
+                        payload,
+                        replay,
+                        conversation_id,
+                        configs,
+                        assistant_content=_code_interpreter_answer_summary(
+                            replay.get("result") or {}
+                        ),
+                        message_type="code_interpreter",
+                    )
+                else:
+                    _apply_history_result(
+                        replay,
+                        status="saved",
+                        saved=True,
+                        history_id=turn_ctx.history_id,
+                        replayed=True,
+                    )
+                history_finalized = True
+                # Commit a ready replay before exposing even the meta event.
+                yield encode(meta)
+                yield encode(replay)
+                return
+
             _ensure_request_not_timed_out()
             prepared = _prepare_code_interpreter_run(
                 payload,
@@ -1995,39 +2575,56 @@ def run_code_interpreter_query_events(payload: dict):
             result = _execute_interpreter_code(prepared, code)
             yield encode({"type": "execution", "result": result})
             _ensure_request_not_timed_out()
-            _append_code_interpreter_conversation_turn(payload, prepared, result)
-            yield encode(
-                {
-                    **_code_interpreter_response(prepared, code, result),
-                    "type": "done",
-                }
-            )
+            done_event = {
+                **_code_interpreter_response(prepared, code, result),
+                "type": "done",
+            }
+            if turn_ctx is not None:
+                _complete_history_turn(
+                    turn_ctx,
+                    payload,
+                    done_event,
+                    conversation_id,
+                    configs,
+                    assistant_content=_code_interpreter_answer_summary(result),
+                    message_type="code_interpreter",
+                )
+                history_finalized = True
+            else:
+                _append_code_interpreter_conversation_turn(payload, prepared, result)
+                _apply_history_preflight_status(payload, done_event)
+            yield encode(done_event)
     except RequestTimeoutExceeded:
         status = "timeout"
         yield encode({"type": "error", "error": "Richiesta scaduta", "status": "timeout"})
+    except ConversationTurnError as exc:
+        status = "error"
+        yield encode({"type": "error", **exc.to_dict()})
     except KnowledgeBaseValidationError as exc:
         status = "error"
-        yield encode(
-            {
-                "type": "error",
-                "error": exc.message,
-                "status": exc.code,
-                "knowledge_base_ids": _payload_query_knowledge_base_ids(payload),
-                **(
-                    {
-                        "knowledge_base_id":
-                        _payload_query_knowledge_base_ids(payload)[0]
-                    }
-                    if len(_payload_query_knowledge_base_ids(payload)) == 1
-                    else {}
-                ),
-            }
-        )
+        knowledge_base_ids = _payload_query_knowledge_base_ids(payload)
+        error_event = {
+            "type": "error",
+            "error": exc.message,
+            "status": exc.code,
+            "knowledge_base_ids": knowledge_base_ids,
+        }
+        if len(knowledge_base_ids) == 1:
+            error_event["knowledge_base_id"] = knowledge_base_ids[0]
+        yield encode(error_event)
     except Exception as exc:
         status = "error"
         log.error("Errore code interpreter: %s", exc)
-        yield encode({"type": "error", "error": str(exc), "status": "server_error"})
+        yield encode(
+            {
+                "type": "error",
+                "error": "Errore interno durante l'esecuzione",
+                "status": "server_error",
+            }
+        )
     finally:
+        if turn_ctx is not None and not history_finalized:
+            _fail_history_turn(turn_ctx, conversation_id)
         metrics.end_query()
         metrics.observe_query(duration=time.time() - start, status=status)
 
@@ -2387,7 +2984,6 @@ def _code_interpreter_meta_event(prepared: dict) -> dict:
                 "name": item["name"],
                 "type": item["type"],
                 "size": item["size"],
-                "container_path": item["container_path"],
             }
             for item in prepared["attached_files"]
         ],
@@ -2644,6 +3240,8 @@ def _query_scoped_conversation_id(
 def _validate_conversation_knowledge_bases(
     conversation_id: str | None,
     configs,
+    *,
+    strict: bool = False,
 ) -> object:
     """Return one authorized, immutable snapshot of conversation memory."""
 
@@ -2672,6 +3270,8 @@ def _validate_conversation_knowledge_bases(
             )
     except KnowledgeBaseValidationError:
         store.clear_if_version(conversation_id, snapshot.version)
+        if strict:
+            raise
         return ConversationSnapshot()
     return snapshot
 
@@ -4640,13 +5240,19 @@ def _resolve_agent_for_query(agent_id: str, data: dict) -> tuple[str, str | None
     return agent_id, agent.get("name")
 
 
-def _parse_query_payload(require_json: bool = True) -> dict:
+def _parse_query_payload(
+    require_json: bool = True,
+    *,
+    default_persist_history: bool = True,
+) -> dict:
     if require_json and not request.is_json:
         raise ValidationError("Content-Type deve essere application/json")
 
     data = request.get_json(silent=True)
     if data is None:
         raise ValidationError("Body vuoto")
+    if not isinstance(data, dict):
+        raise ValidationError("Il body JSON deve essere un oggetto")
 
     agent_id = data.get("agent_id")
     agent_name = None
@@ -4674,7 +5280,10 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     )
     provider = data.get("provider") or None
     model = data.get("model") or None
-    conversation_id = validate_conversation_id(data.get("conversation_id"), required=False)
+    conversation_id = validate_conversation_id(
+        data.get("conversation_id"),
+        required=False,
+    )
     turn_id = validate_string(
         data.get("turn_id"),
         "turn_id",
@@ -4689,14 +5298,29 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
         required=False,
     )
+    regenerate_lost_result = validate_boolean(
+        data.get("regenerate_lost_result", False),
+        field_name="regenerate_lost_result",
+    )
+    persist_history_default = default_persist_history
+    if stream and stream_format != "ndjson":
+        persist_history_default = False
     persist_history = validate_boolean(
-        data.get("persist_history", True),
+        data.get("persist_history", persist_history_default),
         field_name="persist_history",
     )
+    if persist_history and stream and stream_format != "ndjson":
+        raise ValidationError(
+            "La cronologia persistente richiede stream_format='ndjson'",
+            "stream_format",
+            "history_requires_ndjson",
+        )
     client_context = _validate_client_context(data.get("client_context"))
     response_language = _validate_response_language(data.get("response_language"))
     system_prompt_id = data.get("system_prompt_id") or None
-    system_prompt_scope = str(data.get("system_prompt_scope") or "").strip().lower() or None
+    system_prompt_scope = str(
+        data.get("system_prompt_scope") or ""
+    ).strip().lower() or None
     if system_prompt_scope is not None and system_prompt_scope not in {"personal", "shared"}:
         raise ValidationError(
             "system_prompt_scope deve essere 'personal' o 'shared'",
@@ -4714,18 +5338,25 @@ def _parse_query_payload(require_json: bool = True) -> dict:
     if attached_files:
         if not isinstance(attached_files, list):
             raise ValidationError("attached_files deve essere una lista", "attached_files")
-        for i, f in enumerate(attached_files):
-            if not isinstance(f, dict):
-                raise ValidationError(f"attached_files[{i}] deve essere un oggetto", "attached_files")
-            file_id = f.get("id") or f.get("file_id")
+        for index, attached_file in enumerate(attached_files):
+            if not isinstance(attached_file, dict):
+                raise ValidationError(
+                    f"attached_files[{index}] deve essere un oggetto",
+                    "attached_files",
+                )
+            file_id = attached_file.get("id") or attached_file.get("file_id")
             validate_string(
                 file_id,
-                f"attached_files[{i}].id",
+                f"attached_files[{index}].id",
                 max_length=32,
                 pattern=r"^[0-9a-f]{32}$",
                 required=True,
             )
-            validate_string(f.get("name"), f"attached_files[{i}].name", required=False)
+            validate_string(
+                attached_file.get("name"),
+                f"attached_files[{index}].name",
+                required=False,
+            )
     knowledge_base_ids, plural_selection = _parse_query_knowledge_base_ids(data)
     config = _workspace_shared_config(current_app)
     _validate_model_selection(model, provider, config=config)
@@ -4749,6 +5380,7 @@ def _parse_query_payload(require_json: bool = True) -> dict:
         "knowledge_base_ids_explicit": plural_selection,
         "turn_id": turn_id,
         "parent_turn_id": parent_turn_id,
+        "regenerate_lost_result": regenerate_lost_result,
         "persist_history": persist_history,
     }
     if agent_id:

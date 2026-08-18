@@ -16,7 +16,7 @@ from typing import Callable, Optional
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from db.connection import get_connection
-from db.migrations import init_schema
+from db.schema import initialize_schema
 from utils.settings_store import API_SCOPES, API_SCOPES_REQUIRING_KB
 
 
@@ -32,7 +32,7 @@ class UserStore:
     """SQLite-backed local user store for personal RAG accounts.
 
     Each UserStore instance points to a single ``.db`` file. The schema is
-    created automatically on first use via ``init_schema``.
+    created automatically on first use from the current clean schema.
 
     The store manages two kinds of records:
       * **Users**   - email/password accounts with a role (admin/user).
@@ -47,7 +47,7 @@ class UserStore:
         configured = path or os.getenv("RAG_USERS_DB", "app/data/users.db")
         self.path = Path(configured)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        init_schema(self.path)
+        initialize_schema(self.path)
 
     @contextmanager
     def _connect(self):
@@ -293,29 +293,21 @@ class UserStore:
                 return None
             return _public_api_key(_row_to_api_key(row), user_id=user_id, include_raw=include_raw)
 
-    def update_api_key_usage(self, user_id: str, key_name: str, *, extra: dict | None = None) -> None:
-        if not extra:
-            extra = {}
+    def update_api_key_usage(self, user_id: str, key_name: str) -> None:
+        """Atomically record successful use of an enabled API key."""
+
         now = _now()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM api_keys WHERE user_id = ? AND name = ? AND enabled = 1",
-                (user_id, key_name),
-            ).fetchone()
-            if row is None:
-                return
-            new_count = row["usage_count"] + 1
-            conn.execute(
-                "UPDATE api_keys SET last_used = ?, usage_count = ? WHERE id = ?",
-                (now, new_count, row["id"]),
+            updated = conn.execute(
+                """
+                UPDATE api_keys
+                SET last_used = ?, usage_count = usage_count + 1
+                WHERE user_id = ? AND name = ? AND enabled = 1
+                """,
+                (now, user_id, key_name),
             )
-            for k, v in extra.items():
-                if k in ("last_used", "usage_count"):
-                    continue
-                conn.execute(
-                    f"UPDATE api_keys SET {k} = ? WHERE id = ?",
-                    (v, row["id"]),
-                )
+            if updated.rowcount == 0:
+                return
             conn.execute(
                 "UPDATE users SET updated_at = ? WHERE id = ?",
                 (now, user_id),

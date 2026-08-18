@@ -1,4 +1,4 @@
-"""SQLite connection factory shared by UserStore and migration code.
+"""SQLite connection factory shared by local database stores.
 
 Centralizing connection setup here keeps SQLite pragmas consistent across
 the whole application. Every connection uses the same configuration:
@@ -15,17 +15,48 @@ the whole application. Every connection uses the same configuration:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
+
+
+def _restrict_sqlite_permissions(path: Path) -> None:
+    """Keep the user database and any live WAL sidecars owner-only."""
+
+    for candidate in (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+    ):
+        try:
+            if candidate.exists():
+                candidate.chmod(0o600)
+        except OSError:
+            # SQLite remains usable on filesystems that do not expose POSIX
+            # permission bits (for example some Windows mounts).
+            pass
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open a new SQLite connection with the standard pragmas applied."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        try:
+            descriptor = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+    _restrict_sqlite_permissions(path)
     conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
+    _restrict_sqlite_permissions(path)
     return conn

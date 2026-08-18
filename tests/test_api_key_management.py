@@ -1,12 +1,33 @@
 import concurrent.futures
 import json
+import sqlite3
+import stat
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from app.utils.api_key_logger import ApiKeyLogger
+from app.db.schema import IncompatibleUserSchemaError, USER_SCHEMA_VERSION
 from app.utils.user_store import UserStore
+
+
+def test_user_store_initializes_only_the_current_clean_schema(tmp_path):
+    path = tmp_path / "users.db"
+    UserStore(path)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
+            USER_SCHEMA_VERSION
+        )
+
+
+def test_user_store_rejects_an_unversioned_existing_database(tmp_path):
+    path = tmp_path / "users.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE legacy_users (id TEXT)")
+
+    with pytest.raises(IncompatibleUserSchemaError):
+        UserStore(path)
 
 
 def _make_user(path: Path, user_id: str, *, role: str = "user") -> dict:
@@ -153,6 +174,50 @@ def test_update_usage_counts():
         keys = store.get_api_keys(user["id"])
         assert keys[0]["usage_count"] == 3
         assert keys[0]["last_used"] is not None
+
+
+def test_update_usage_is_atomic_across_concurrent_requests(tmp_path):
+    store_path = tmp_path / "users.db"
+    user = _make_user(store_path, "user-1")
+    store = UserStore(store_path)
+    store.create_api_key(user_id=user["id"], name="metered", scopes=["query"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                lambda _index: store.update_api_key_usage(
+                    user_id=user["id"],
+                    key_name="metered",
+                ),
+                range(32),
+            )
+        )
+
+    assert store.get_api_keys(user["id"])[0]["usage_count"] == 32
+
+
+def test_users_database_and_live_sidecars_are_owner_only(tmp_path):
+    store_path = tmp_path / "users.db"
+    user = _make_user(store_path, "user-1")
+    store = UserStore(store_path)
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE users SET display_name = ? WHERE id = ?",
+            ("Updated", user["id"]),
+        )
+        conn.commit()
+        candidates = [
+            store_path,
+            Path(f"{store_path}-wal"),
+            Path(f"{store_path}-shm"),
+        ]
+        assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o600
+            for path in candidates
+            if path.exists()
+        )
 
 
 def test_get_api_keys_returns_empty_for_unknown_user():
